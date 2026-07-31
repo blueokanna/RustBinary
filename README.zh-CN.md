@@ -437,4 +437,4 @@ RustBinary 使用[Apache License 2.0（Apache 软件许可证 2.0）](LICENSE)
 当明确标注。Apache License 2.0 中的专利授权条款和免责声明同样适用。
 
 完整法律文本位于 [`LICENSE`](LICENSE)。本项目不提供任何明示或默示的
-担保或条件；许可证也不授予项目商标的使用权，不构成版权持有者的背书。
+担保或条件。

@@ -513,5 +513,4 @@ text, and required attribution notices. Changes to the source should be
 identified clearly, and the Apache License patent terms and disclaimer apply.
 
 The complete legal text is in [`LICENSE`](LICENSE). This project is provided
-without warranties or conditions of any kind. The license does not grant rights
-to use project trademarks or imply endorsement by the copyright holders.
+without warranties or conditions of any kind. 
