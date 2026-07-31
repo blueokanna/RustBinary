@@ -1,0 +1,21 @@
+[package]
+name = "rustbinary-derive"
+version = "0.1.0"
+edition = "2021"
+authors = ["blueokanna", "HyphenTeam"]
+license = "AGPL-3.0"
+description = "Derive macros for rustbinary schema metadata"
+homepage = "https://github.com/HyphenTeam/RustBinary"
+repository = "https://github.com/HyphenTeam/RustBinary"
+documentation = "https://docs.rs/rustbinary-derive"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["derive", "parsing", "printing"] }

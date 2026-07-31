@@ -1,0 +1,87 @@
+[workspace]
+members = ["rustbinary-derive"]
+resolver = "2"
+
+[package]
+name = "rustbinary"
+version = "0.1.0"
+edition = "2021"
+authors = ["blueokanna", "HyphenTeam"]
+keywords = ["binary", "serialization", "rust", "networking"]
+categories = ["encoding", "serialization", "data-structures", "network-programming"]
+license = "AGPL-3.0"
+readme = "README.md"
+exclude = ["target/", "target-*/", ".agents/", ".codex/"]
+homepage = "https://github.com/HyphenTeam/RustBinary"
+repository = "https://github.com/HyphenTeam/RustBinary"
+documentation = "https://docs.rs/rustbinary"
+description = "A bounded Serde binary codec with adaptive frames, zero-allocation paths, schema evolution, and authenticated pipelines"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["derive", "fingerprint", "reflection", "static-size", "simd"]
+derive = ["dep:rustbinary-derive"]
+fingerprint = ["derive"]
+reflection = ["derive"]
+static-size = ["derive"]
+cbor = ["dep:ciborium"]
+compression = ["dep:zstd"]
+encryption = ["dep:chacha20poly1305", "dep:getrandom", "dep:zeroize"]
+bit-packing = ["derive"]
+adaptive = ["bit-packing", "simd"]
+parallel = []
+schema-evolution = []
+simd = []
+
+[[example]]
+name = "complete"
+required-features = [
+    "adaptive",
+    "bit-packing",
+    "cbor",
+    "compression",
+    "encryption",
+    "fingerprint",
+    "parallel",
+    "reflection",
+    "schema-evolution",
+    "simd",
+    "static-size",
+]
+
+[[example]]
+name = "adaptive_zero_alloc"
+required-features = ["adaptive"]
+
+[[example]]
+name = "secure_pipeline"
+required-features = ["cbor", "compression", "encryption"]
+
+[[example]]
+name = "schema_evolution"
+required-features = ["schema-evolution"]
+
+[[example]]
+name = "parallel_batch"
+required-features = ["parallel"]
+
+[[example]]
+name = "metadata"
+required-features = ["bit-packing", "fingerprint", "reflection", "static-size"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["std"] }
+rustbinary-derive = { version = "0.1.0", path = "rustbinary-derive", optional = true }
+ciborium = { version = "0.2.2", optional = true }
+zstd = { version = "0.13.3", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = [
+    "alloc",
+] }
+getrandom = { version = "0.4.3", optional = true }
+zeroize = { version = "1.9.0", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
