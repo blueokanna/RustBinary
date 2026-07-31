@@ -498,5 +498,13 @@ configuration, keep golden vectors, and use explicit schema IDs.
 
 ## License
 
-AGPL-3.0. Review its obligations before embedding RustBinary in a service or
-distributed product.
+RustBinary is licensed under the [Apache License, Version 2.0](LICENSE).
+
+You may use, reproduce, modify, and redistribute the project under the terms
+of that license. Redistributions must preserve the copyright notice, license
+text, and required attribution notices. Changes to the source should be
+identified clearly, and the Apache License patent terms and disclaimer apply.
+
+The complete legal text is in [`LICENSE`](LICENSE). This project is provided
+without warranties or conditions of any kind. The license does not grant rights
+to use project trademarks or imply endorsement by the copyright holders.

@@ -424,4 +424,12 @@ cargo doc --workspace --all-features --no-deps
 
 ## 许可证
 
-AGPL-3.0。在服务或分布式产品中嵌入 RustBinary 前，应审查相应许可证义务。
+RustBinary 使用[Apache License 2.0（Apache 软件许可证 2.0）](LICENSE)
+授权。
+
+你可以在该许可证条款下使用、复制、修改和再分发本项目。再分发时必须
+保留版权声明、许可证文本以及许可证要求的归属声明；对源代码的修改应
+当明确标注。Apache License 2.0 中的专利授权条款和免责声明同样适用。
+
+完整法律文本位于 [`LICENSE`](LICENSE)。本项目不提供任何明示或默示的
+担保或条件；许可证也不授予项目商标的使用权，不构成版权持有者的背书。
