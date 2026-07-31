@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rustbinary"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["blueokanna", "HyphenTeam"]
 keywords = ["binary", "serialization", "rust", "networking"]
@@ -73,7 +73,7 @@ required-features = ["bit-packing", "fingerprint", "reflection", "static-size"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["std"] }
-rustbinary-derive = { version = "0.1.0", path = "rustbinary-derive", optional = true }
+rustbinary-derive = { version = "0.1.1", path = "rustbinary-derive", optional = true }
 ciborium = { version = "0.2.2", optional = true }
 zstd = { version = "0.13.3", optional = true }
 chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = [
