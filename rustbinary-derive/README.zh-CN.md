@@ -29,7 +29,7 @@ CBOR、压缩、加密或 Schema 演进时，应把它们和 Serde derive 组合
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rustbinary = { version = "0.1.1", features = [
+rustbinary = { version = "0.1.2", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -48,13 +48,13 @@ rustbinary = { version = "0.1.1", features = [
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.1", features = [
+rustbinary = { version = "0.1.2", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.1"
+rustbinary-derive = "0.1.2"
 ```
 
 workspace 中同时写 `path` 和 `version` 是有意设计的。本地构建使用路径，
@@ -385,5 +385,4 @@ cargo package -p rustbinary-derive --allow-dirty --no-verify --list
 ## 许可证
 
 本 package 使用[Apache License 2.0](../LICENSE)授权。完整法律文本在仓库根目录。
-再分发时必须保留许可证和归属声明；项目不提供任何担保，许可证也不授予商标
-使用权或暗示版权持有者背书。
+再分发时必须保留许可证和归属声明。
