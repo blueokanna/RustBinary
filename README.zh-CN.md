@@ -269,6 +269,11 @@ padding 位。`StaticSize` 提供静态类型最坏上界；动态集合有意�
 这些元数据在编译期生成、运行时可读且无需分配。完整使用见
 [metadata.rs](examples/metadata.rs)。
 
+derive package 提供独立的[中文详细指南](https://github.com/blueokanna/RustBinary/blob/main/rustbinary-derive/README.zh-CN.md)
+和[英文详细指南](https://github.com/blueokanna/RustBinary/blob/main/rustbinary-derive/README.md)。
+其中说明生成的 trait 契约、支持的数据形状、泛型约束、`#[bits = N]` 校验、
+编译期错误以及生产环境集成方式。
+
 ## CBOR、压缩和加密
 
 流水线顺序固定且显式：先序列化，再可选压缩，最后加密。Deterministic CBOR 会

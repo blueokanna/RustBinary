@@ -323,6 +323,13 @@ declared type tokens, declaration indexes, enum variants, and variant indexes.
 It is runtime-readable metadata generated at compile time and requires no
 registry. See [metadata.rs](examples/metadata.rs).
 
+The derive package has a dedicated
+[English guide](https://github.com/blueokanna/RustBinary/blob/main/rustbinary-derive/README.md)
+and [Chinese guide](https://github.com/blueokanna/RustBinary/blob/main/rustbinary-derive/README.zh-CN.md).
+They document the generated contracts, accepted data shapes, generic bounds,
+`#[bits = N]` validation, compile-fail cases, and production integration
+patterns.
+
 ## CBOR, Compression, and Encryption
 
 The pipeline is explicit and ordered: serialize, optionally compress, then

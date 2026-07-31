@@ -7,6 +7,21 @@
 //! derives re-exported by the main crate. Generated paths intentionally refer
 //! to `::rustbinary`, keeping the runtime traits and wire implementation owned
 //! by one crate.
+//!
+//! # Macro selection
+//!
+//! - [`Fingerprint`](derive@Fingerprint) generates a compatibility identifier
+//!   for type structure and codec configuration.
+//! - [`StaticSize`](derive@StaticSize) generates finite normal and bit-packed
+//!   size bounds for statically sized values.
+//! - [`Reflect`](derive@Reflect) generates allocation-free structural metadata.
+//! - [`BitPacked`](derive@BitPacked) generates a checked bit-level codec for
+//!   bounded fields and nested `BitPack` values.
+//!
+//! The generated implementations are not a replacement for Serde derives.
+//! Add `Serialize` and `Deserialize` when the value also crosses a normal
+//! `rustbinary` or CBOR wire profile. For the complete syntax and production
+//! constraints, see the package README and the re-exported runtime traits.
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
