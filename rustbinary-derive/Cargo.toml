@@ -5,8 +5,8 @@ edition = "2021"
 authors = ["blueokanna", "HyphenTeam"]
 license = "Apache-2.0"
 description = "Derive macros for rustbinary schema metadata"
-homepage = "https://github.com/HyphenTeam/RustBinary"
-repository = "https://github.com/HyphenTeam/RustBinary"
+homepage = "https://github.com/blueokanna/RustBinary"
+repository = "https://github.com/blueokanna/RustBinary"
 documentation = "https://docs.rs/rustbinary-derive"
 
 [package.metadata.docs.rs]

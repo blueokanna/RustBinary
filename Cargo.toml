@@ -11,8 +11,8 @@ keywords = ["binary", "serialization", "rust", "networking"]
 categories = ["encoding", "serialization", "data-structures", "network-programming"]
 license = "Apache-2.0"
 readme = "README.md"
-homepage = "https://github.com/HyphenTeam/RustBinary"
-repository = "https://github.com/HyphenTeam/RustBinary"
+homepage = "https://github.com/blueokanna/RustBinary"
+repository = "https://github.com/blueokanna/RustBinary"
 documentation = "https://docs.rs/rustbinary"
 description = "A bounded Serde binary codec with adaptive frames, zero-allocation paths, schema evolution, and authenticated pipelines"
 
