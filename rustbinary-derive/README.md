@@ -33,7 +33,7 @@ macros:
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rustbinary = { version = "0.1.1", features = [
+rustbinary = { version = "0.1.2", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -54,13 +54,13 @@ refer to `::rustbinary`:
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.1", features = [
+rustbinary = { version = "0.1.2", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.1"
+rustbinary-derive = "0.1.2"
 ```
 
 The `path` plus `version` dependency in the workspace is intentional. Local
@@ -419,5 +419,4 @@ the runtime `schema-evolution` feature for stable field IDs and migrations.
 
 Licensed under the [Apache License, Version 2.0](../LICENSE). The complete
 license text is at the repository root. Redistributions must preserve the
-license and attribution notices. The project is provided without warranties;
-the license does not grant trademark rights or imply endorsement.
+license and attribution notices. 
