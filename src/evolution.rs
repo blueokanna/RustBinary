@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use alloc::vec::Vec;
+
 use crate::{Config, Error, Result, TrailingBytes};
 
 const MAGIC: &[u8; 4] = b"RBE1";

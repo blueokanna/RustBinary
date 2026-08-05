@@ -42,8 +42,10 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 | 确定性序列化 | 显式模式已实现 | 位打包、Schema frame、并行 batch、deterministic CBOR |
 | 并行序列化 | 已实现 | scoped worker，输出顺序稳定 |
 | 运行时反射 | 已实现 | `Reflect` 生成无注册、无分配的静态元数据 |
-| `std::io` 流 | 已实现 | Reader/Writer API 及资源限制 |
-| `no_std` | 未实现 | 核心 serializer 当前仍依赖 `std::io` |
+| `std::io` 流 | 已实现 | Reader/Writer API 位于 `adapters`，并保留资源限制 |
+| `no_std` | 已实现 | Compact V1 slice 编解码和调用方缓冲区无需默认 feature |
+| `no_std + alloc` | 已实现 | 保留 `Vec`、`String`、owned data、指纹、演进和标量 adaptive codec |
+| bincode 兼容 | 可选 | 自主实现的 `bincode-compat` profile，并使用仓库自有 golden vectors |
 | Async Fiber/UFA | 未实现 | 不用阻塞 I/O 包装成假的 async API |
 
 这里严格区分“已探测”和“已加速”，也严格区分借用式零复制与相对指针对象归档。
@@ -77,18 +79,31 @@ serde = { version = "1", features = ["derive"] }
 
 | Feature | 默认启用 | 用途与依赖 |
 | --- | --- | --- |
+| `std` | 是 | I/O adapters、线程、OS RNG、Zstandard 和运行时 SIMD |
+| `alloc` | 通过 `std` | 不依赖 `std` 的 owned `Vec`/`String` API |
 | `derive` | 是 | 导出过程宏 |
-| `fingerprint` | 是 | 结构指纹 frame；隐含 `derive` |
-| `reflection` | 是 | 运行时可读的生成元数据；隐含 `derive` |
-| `static-size` | 是 | 编译期上界；隐含 `derive` |
+| `fingerprint` | 是 | 结构指纹 runtime 和 frame |
+| `reflection` | 是 | 零分配反射 runtime |
+| `static-size` | 是 | 编译期上界 runtime |
 | `simd` | 是 | 运行时能力探测与热扫描分派 |
-| `bit-packing` | 否 | 位级布局；隐含 `derive` |
-| `adaptive` | 否 | 自适应字符串/集合；隐含 `bit-packing`、`simd` |
+| `bit-packing` | 否 | 核心位级 trait 和调用方缓冲区 codec |
+| `adaptive` | 否 | 调用方缓冲区自适应字符串/集合；隐含 `bit-packing`；`alloc` 增加 owned API |
 | `cbor` | 否 | 基于 Ciborium 的 RFC 8949 |
 | `compression` | 否 | 自适应 Zstandard frame |
 | `encryption` | 否 | XChaCha20-Poly1305、系统随机数、密钥清零 |
 | `parallel` | 否 | scoped thread 有序批处理 |
 | `schema-evolution` | 否 | 稳定字段 ID 版本化 frame |
+| `bincode-compat` | 否 | RustBinary 自主实现的 bincode-compatible standard profile |
+
+主架构是 RustBinary Compact V1：纯 `no_std` slice core、用于 owned data 的
+`alloc` extension，以及承载流和平台服务的 `std` adapters。bincode bridge 是独立
+profile，不是主线格式。
+
+```powershell
+cargo build --no-default-features
+cargo build --no-default-features --features alloc
+cargo build --features std
+```
 
 ## 二进制配置
 

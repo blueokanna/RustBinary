@@ -1,8 +1,6 @@
-use std::io::Read;
-
 use serde::de::{
-    self, value::U32Deserializer, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess,
-    SeqAccess, VariantAccess, Visitor,
+    self, value::U32Deserializer, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
+    Visitor,
 };
 use serde::Deserialize;
 
@@ -17,32 +15,26 @@ const U64_MARKER: u8 = 253;
 const U128_MARKER: u8 = 254;
 
 pub(crate) fn from_slice<'de, T: Deserialize<'de>>(input: &'de [u8], config: Config) -> Result<T> {
+    let (value, consumed) = from_slice_with_consumed(input, config)?;
+    if config.trailing == TrailingBytes::Reject && consumed != input.len() {
+        return Err(Error::TrailingBytes {
+            remaining: input.len() - consumed,
+        });
+    }
+    Ok(value)
+}
+
+pub(crate) fn from_slice_with_consumed<'de, T: Deserialize<'de>>(
+    input: &'de [u8],
+    config: Config,
+) -> Result<(T, usize)> {
     let mut decoder = Decoder {
         input,
         cursor: 0,
         config,
     };
     let value = T::deserialize(&mut decoder)?;
-    if config.trailing == TrailingBytes::Reject && decoder.cursor != input.len() {
-        return Err(Error::TrailingBytes {
-            remaining: input.len() - decoder.cursor,
-        });
-    }
-    Ok(value)
-}
-
-pub(crate) fn from_reader<R: Read, T: DeserializeOwned>(
-    mut reader: R,
-    config: Config,
-) -> Result<T> {
-    let max = config.limit.unwrap_or(u64::MAX);
-    let read_cap = max.saturating_add(1);
-    let mut bytes = Vec::new();
-    reader.by_ref().take(read_cap).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        return Err(Error::SizeLimit { limit: max });
-    }
-    from_slice(&bytes, config)
+    Ok((value, decoder.cursor))
 }
 
 struct Decoder<'de> {
@@ -348,14 +340,14 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         if width > 1 {
             bytes[1..width].copy_from_slice(self.take(width - 1).map_err(|_| Error::InvalidChar)?);
         }
-        let text = std::str::from_utf8(&bytes[..width]).map_err(|_| Error::InvalidChar)?;
+        let text = core::str::from_utf8(&bytes[..width]).map_err(|_| Error::InvalidChar)?;
         let value = text.chars().next().ok_or(Error::InvalidChar)?;
         visitor.visit_char(value)
     }
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         let len = self.length()?;
         let bytes = self.take(len)?;
-        let value = std::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
+        let value = core::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
         visitor.visit_borrowed_str(value)
     }
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {

@@ -1,13 +1,15 @@
-use std::io::{self, Write};
-
 use serde::ser::{
     self, Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
     SerializeTuple, SerializeTupleStruct, SerializeTupleVariant,
 };
 
+#[cfg(feature = "alloc")]
+use alloc::{string::ToString, vec::Vec};
+
 use crate::{
     config::{Config, IntEncoding},
     error::{Error, Result},
+    writer::{CountWriter, EncodeWriter, SliceWriter},
 };
 
 const U16_MARKER: u8 = 251;
@@ -15,13 +17,14 @@ const U32_MARKER: u8 = 252;
 const U64_MARKER: u8 = 253;
 const U128_MARKER: u8 = 254;
 
+#[cfg(feature = "alloc")]
 pub(crate) fn to_vec<T: Serialize + ?Sized>(value: &T, config: Config) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
+    let mut output = alloc::vec::Vec::new();
     to_writer(&mut output, value, config)?;
     Ok(output)
 }
 
-pub(crate) fn to_writer<W: Write, T: Serialize + ?Sized>(
+pub(crate) fn to_writer<W: EncodeWriter, T: Serialize + ?Sized>(
     writer: W,
     value: &T,
     config: Config,
@@ -40,59 +43,13 @@ pub(crate) fn to_slice<T: Serialize + ?Sized>(
     value: &T,
     config: Config,
 ) -> Result<usize> {
-    let available = output.len();
-    let mut sink = SliceSink {
-        output,
-        required: 0,
-    };
-    let encoded = to_writer(&mut sink, value, config)?;
-    let required =
-        usize::try_from(encoded).map_err(|_| Error::IntegerOverflow { target: "usize" })?;
-    if required > available {
-        Err(Error::BufferTooSmall {
-            required,
-            available,
-        })
-    } else {
-        Ok(required)
-    }
+    let mut writer = SliceWriter::new(output);
+    to_writer(&mut writer, value, config)?;
+    writer.finish()
 }
 
 pub(crate) fn size<T: Serialize + ?Sized>(value: &T, config: Config) -> Result<u64> {
-    to_writer(Counter, value, config)
-}
-
-struct Counter;
-
-impl Write for Counter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct SliceSink<'a> {
-    output: &'a mut [u8],
-    required: usize,
-}
-
-impl Write for SliceSink<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let start = self.required.min(self.output.len());
-        let writable = (self.output.len() - start).min(bytes.len());
-        self.output[start..start + writable].copy_from_slice(&bytes[..writable]);
-        self.required = self
-            .required
-            .checked_add(bytes.len())
-            .ok_or_else(|| io::Error::other("encoded length exceeds usize"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    to_writer(CountWriter::new(), value, config)
 }
 
 struct Encoder<W> {
@@ -101,7 +58,7 @@ struct Encoder<W> {
     written: u64,
 }
 
-impl<W: Write> Encoder<W> {
+impl<W: EncodeWriter> Encoder<W> {
     fn emit(&mut self, bytes: &[u8]) -> Result<()> {
         let amount =
             u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow { target: "u64" })?;
@@ -193,7 +150,7 @@ struct Compound<'a, W> {
     map_value_pending: bool,
 }
 
-impl<W: Write> Compound<'_, W> {
+impl<W: EncodeWriter> Compound<'_, W> {
     fn item<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
         if self.remaining == 0 {
             return Err(Error::Custom("too many compound elements".into()));
@@ -221,7 +178,7 @@ macro_rules! primitive {
     };
 }
 
-impl<'a, W: Write> ser::Serializer for &'a mut Encoder<W> {
+impl<'a, W: EncodeWriter> ser::Serializer for &'a mut Encoder<W> {
     type Ok = ();
     type Error = Error;
     type SerializeSeq = Compound<'a, W>;
@@ -372,11 +329,23 @@ impl<'a, W: Write> ser::Serializer for &'a mut Encoder<W> {
         self.serialize_u32(variant_index)?;
         self.serialize_tuple(len)
     }
+
+    fn collect_str<T: ?Sized + core::fmt::Display>(self, value: &T) -> Result<()> {
+        #[cfg(feature = "alloc")]
+        {
+            self.serialize_str(&value.to_string())
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            let _ = value;
+            Err(Error::Unsupported("collect_str requires the alloc feature"))
+        }
+    }
 }
 
 macro_rules! compound_trait {
     ($trait:ident, $method:ident) => {
-        impl<W: Write> $trait for Compound<'_, W> {
+        impl<W: EncodeWriter> $trait for Compound<'_, W> {
             type Ok = ();
             type Error = Error;
             fn $method<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
@@ -393,7 +362,7 @@ compound_trait!(SerializeTuple, serialize_element);
 compound_trait!(SerializeTupleStruct, serialize_field);
 compound_trait!(SerializeTupleVariant, serialize_field);
 
-impl<W: Write> SerializeMap for Compound<'_, W> {
+impl<W: EncodeWriter> SerializeMap for Compound<'_, W> {
     type Ok = ();
     type Error = Error;
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<()> {
@@ -418,7 +387,7 @@ impl<W: Write> SerializeMap for Compound<'_, W> {
     }
 }
 
-impl<W: Write> SerializeStruct for Compound<'_, W> {
+impl<W: EncodeWriter> SerializeStruct for Compound<'_, W> {
     type Ok = ();
     type Error = Error;
     fn serialize_field<T: Serialize + ?Sized>(
@@ -433,7 +402,7 @@ impl<W: Write> SerializeStruct for Compound<'_, W> {
     }
 }
 
-impl<W: Write> SerializeStructVariant for Compound<'_, W> {
+impl<W: EncodeWriter> SerializeStructVariant for Compound<'_, W> {
     type Ok = ();
     type Error = Error;
     fn serialize_field<T: Serialize + ?Sized>(

@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 //! `RustBinary` is a bounded Serde binary codec with explicit wire profiles.
 //!
@@ -61,9 +62,19 @@
 
 extern crate self as rustbinary;
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "std")]
+/// Bridges between the slice-based core and `std::io` readers and writers.
+pub mod adapters;
+
 #[cfg(feature = "adaptive")]
 /// Canonical data-aware encodings for strings and integer collections.
 pub mod adaptive;
+#[cfg(feature = "bincode-compat")]
+/// Independently implemented, isolated bincode-compatible profile.
+pub mod bincode_compat;
 #[cfg(feature = "bit-packing")]
 /// Bit-level caller-buffer codecs and the [`BitPack`] contract.
 pub mod bitpack;
@@ -101,12 +112,22 @@ pub mod simd;
 #[cfg(feature = "static-size")]
 /// Compile-time upper bounds for statically sized data.
 pub mod static_size;
+/// Core output sinks for caller-owned and counting serialization.
+pub mod writer;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use serde::de::DeserializeOwned;
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 #[cfg(feature = "adaptive")]
 pub use adaptive::{AdaptiveConfig, CollectionStrategy, StringStrategy};
+#[cfg(feature = "bincode-compat")]
+pub use bincode_compat::{bincode_compat, BincodeCompat};
 #[cfg(feature = "bit-packing")]
 pub use bitpack::{BitPack, BitPackedConfig, BitReader, BitValue, BitWriter};
 #[cfg(feature = "cbor")]
@@ -133,6 +154,7 @@ pub use schema::{Fingerprint, FingerprintedConfig};
 pub use simd::{hardware_capabilities, simd_backend, HardwareCapabilities, SimdBackend};
 #[cfg(feature = "static-size")]
 pub use static_size::StaticSize;
+pub use writer::{CountWriter, EncodeWriter, SliceWriter};
 
 #[cfg(all(feature = "derive", feature = "bit-packing"))]
 pub use rustbinary_derive::BitPacked;
@@ -164,11 +186,13 @@ pub const fn legacy_options() -> Config {
 }
 
 /// Serializes a value with the legacy compatibility profile.
+#[cfg(feature = "alloc")]
 pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Config::legacy().serialize(value)
 }
 
 /// Serializes a value directly into a writer with the legacy profile.
+#[cfg(feature = "std")]
 pub fn serialize_into<W: Write, T: Serialize + ?Sized>(writer: W, value: &T) -> Result<()> {
     Config::legacy().serialize_into(writer, value)
 }
@@ -195,11 +219,12 @@ pub fn deserialize<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T> {
 }
 
 /// Deserializes an owned value from a reader with the legacy profile.
+#[cfg(feature = "std")]
 pub fn deserialize_from<R: Read, T: DeserializeOwned>(reader: R) -> Result<T> {
     Config::legacy().deserialize_from(reader)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use std::{
         cell::Cell,
@@ -418,6 +443,42 @@ mod tests {
         }
         assert_eq!(config.serialize(&250u64).unwrap(), [250]);
         assert_eq!(config.serialize(&251u64).unwrap(), [251, 251, 0]);
+    }
+
+    #[test]
+    fn compact_v1_golden_vectors_are_stable() {
+        let compact = options();
+        let unsigned: &[(u64, &[u8])] = &[
+            (0, &[0]),
+            (250, &[250]),
+            (251, &[251, 251, 0]),
+            (65_535, &[251, 255, 255]),
+            (65_536, &[252, 0, 0, 1, 0]),
+            (4_294_967_296, &[253, 0, 0, 0, 0, 1, 0, 0, 0]),
+        ];
+        for &(value, golden) in unsigned {
+            assert_eq!(compact.serialize(&value).unwrap(), golden);
+            assert_eq!(compact.deserialize::<u64>(golden).unwrap(), value);
+        }
+
+        let record = Record {
+            id: 42,
+            delta: -7,
+            name: "zero-copy",
+            payload: vec![0, 1, 255],
+            enabled: Some(true),
+        };
+        let golden = [
+            42, 13, 9, b'z', b'e', b'r', b'o', b'-', b'c', b'o', b'p', b'y', 3, 0, 1, 255, 1, 1,
+        ];
+        assert_eq!(compact.serialize(&record).unwrap(), golden);
+        assert_eq!(compact.deserialize::<Record<'_>>(&golden).unwrap(), record);
+
+        let big_fixed = compact.with_big_endian().with_fixint_encoding();
+        assert_eq!(
+            big_fixed.serialize(&(0x0102u16, -2i32, 1.5f32)).unwrap(),
+            [1, 2, 255, 255, 255, 254, 0x3f, 0xc0, 0, 0]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 /// Compile-time worst-case encoded size for statically bounded types.
 ///

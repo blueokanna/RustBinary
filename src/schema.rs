@@ -1,10 +1,19 @@
+use alloc::{
+    collections::{BTreeMap, BTreeSet, LinkedList, VecDeque},
+    string::String,
+    vec::Vec,
+};
+
+#[cfg(feature = "std")]
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque},
+    collections::{HashMap, HashSet},
     hash::BuildHasher,
     io::{Read, Write},
 };
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(feature = "std")]
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     frame::{encode_header, validate_header, HEADER_LEN},
@@ -128,10 +137,12 @@ impl<K: Fingerprint, V: Fingerprint> Fingerprint for BTreeMap<K, V> {
     );
 }
 
+#[cfg(feature = "std")]
 impl<T: Fingerprint, S: BuildHasher> Fingerprint for HashSet<T, S> {
     const TYPE_FINGERPRINT: u64 = hash_u64(tagged("HashSet"), T::TYPE_FINGERPRINT);
 }
 
+#[cfg(feature = "std")]
 impl<K: Fingerprint, V: Fingerprint, S: BuildHasher> Fingerprint for HashMap<K, V, S> {
     const TYPE_FINGERPRINT: u64 = hash_u64(
         hash_u64(tagged("HashMap"), K::TYPE_FINGERPRINT),
@@ -183,12 +194,15 @@ impl FingerprintedConfig {
 
     /// Serializes a fingerprint header followed by the configured binary payload.
     pub fn serialize<T: Serialize + Fingerprint + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        self.serialize_into(&mut output, value)?;
+        let payload = self.config.serialize(value)?;
+        let mut output = Vec::with_capacity(HEADER_LEN.saturating_add(payload.len()));
+        output.extend_from_slice(&encode_header(FRAME_MAGIC, T::fingerprint(self.config)));
+        output.extend_from_slice(&payload);
         Ok(output)
     }
 
     /// Writes a fingerprint header and payload directly into `writer`.
+    #[cfg(feature = "std")]
     pub fn serialize_into<W: Write, T: Serialize + Fingerprint + ?Sized>(
         self,
         mut writer: W,
@@ -241,6 +255,7 @@ impl FingerprintedConfig {
     }
 
     /// Reads, validates, and decodes an owned fingerprinted value.
+    #[cfg(feature = "std")]
     pub fn deserialize_from<R: Read, T: DeserializeOwned + Fingerprint>(
         self,
         mut reader: R,

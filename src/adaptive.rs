@@ -1,6 +1,9 @@
-use std::borrow::Cow;
+#[cfg(feature = "alloc")]
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(feature = "alloc")]
+use serde::Serialize;
 
 use crate::{BitReader, BitWriter, Config, Error, Result, TrailingBytes};
 
@@ -47,6 +50,7 @@ impl AdaptiveConfig {
     }
 
     /// Uses value-width adaptive varints for a regular Serde payload.
+    #[cfg(feature = "alloc")]
     pub fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         self.base.serialize(value)
     }
@@ -57,6 +61,7 @@ impl AdaptiveConfig {
     }
 
     /// Encodes a string using raw UTF-8 or 7-bit ASCII packing, whichever is smaller.
+    #[cfg(feature = "alloc")]
     pub fn encode_string(self, value: &str) -> Result<Vec<u8>> {
         let required = self.encoded_string_size(value)?;
         let mut output = Vec::new();
@@ -118,6 +123,7 @@ impl AdaptiveConfig {
     }
 
     /// Decodes and validates an adaptively encoded string.
+    #[cfg(feature = "alloc")]
     pub fn decode_string(self, input: &[u8]) -> Result<String> {
         Ok(self.decode_string_borrowed(input)?.into_owned())
     }
@@ -151,7 +157,7 @@ impl AdaptiveConfig {
         match strategy {
             RAW_UTF8 => {
                 let bytes = cursor.take(length)?;
-                std::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
+                core::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
                 output[..length].copy_from_slice(bytes);
             }
             ASCII7 => {
@@ -178,13 +184,14 @@ impl AdaptiveConfig {
             _ => return Err(Error::Adaptive("unknown string strategy")),
         }
         cursor.finish(self.base.trailing)?;
-        std::str::from_utf8(&output[..length]).map_err(Error::InvalidUtf8)
+        core::str::from_utf8(&output[..length]).map_err(Error::InvalidUtf8)
     }
 
     /// Decodes a string while borrowing raw UTF-8 payloads directly from `input`.
     ///
     /// ASCII7 payloads require expansion and are therefore returned as owned
     /// strings. The returned [`Cow`] makes that distinction explicit.
+    #[cfg(feature = "alloc")]
     pub fn decode_string_borrowed<'a>(self, input: &'a [u8]) -> Result<Cow<'a, str>> {
         self.enforce_byte_limit(input.len())?;
         let mut cursor = Cursor::new(input);
@@ -194,7 +201,7 @@ impl AdaptiveConfig {
         let value = match strategy {
             RAW_UTF8 => {
                 let bytes = cursor.take(length)?;
-                Cow::Borrowed(std::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?)
+                Cow::Borrowed(core::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?)
             }
             ASCII7 => {
                 let meaningful_bits = length
@@ -229,6 +236,7 @@ impl AdaptiveConfig {
     }
 
     /// Encodes an `i64` slice using raw, delta, or run-length varints.
+    #[cfg(feature = "alloc")]
     pub fn encode_i64_slice(self, values: &[i64]) -> Result<Vec<u8>> {
         let required = self.encoded_i64_slice_size(values)?;
         let mut output = Vec::new();
@@ -309,6 +317,7 @@ impl AdaptiveConfig {
     }
 
     /// Decodes an adaptive `i64` collection with checked delta reconstruction.
+    #[cfg(feature = "alloc")]
     pub fn decode_i64_vec(self, input: &[u8]) -> Result<Vec<i64>> {
         let length = self.decoded_i64_slice_len(input)?;
         let mut values = Vec::new();
@@ -357,8 +366,7 @@ impl AdaptiveConfig {
             RAW_INTEGERS => {
                 while written < length {
                     let remaining_values = length - written;
-                    let plain = crate::simd::plain_varint_prefix(cursor.remaining_slice())
-                        .min(remaining_values);
+                    let plain = plain_varint_prefix(cursor.remaining_slice()).min(remaining_values);
                     for byte in cursor.take(plain)? {
                         output[written] = decode_i128(*byte as u128) as i64;
                         written += 1;
@@ -433,7 +441,7 @@ fn validate_ascii_padding(bytes: &[u8], meaningful_bits: usize) -> Result<()> {
 
 fn string_layout(value: &str) -> Result<(StringStrategy, usize, usize)> {
     let raw_size = value.len();
-    let packed_size = if crate::simd::is_ascii(value.as_bytes()) {
+    let packed_size = if is_ascii(value.as_bytes()) {
         Some(
             value
                 .len()
@@ -459,6 +467,20 @@ fn string_layout(value: &str) -> Result<(StringStrategy, usize, usize)> {
         .and_then(|size| size.checked_add(payload_size))
         .ok_or(Error::Adaptive("encoded size overflow"))?;
     Ok((strategy, payload_size, required))
+}
+
+fn is_ascii(input: &[u8]) -> bool {
+    #[cfg(feature = "simd")]
+    return crate::simd::is_ascii(input);
+    #[cfg(not(feature = "simd"))]
+    input.is_ascii()
+}
+
+fn plain_varint_prefix(input: &[u8]) -> usize {
+    #[cfg(feature = "simd")]
+    return crate::simd::plain_varint_prefix(input);
+    #[cfg(not(feature = "simd"))]
+    input.iter().take_while(|&&byte| byte <= 250).count()
 }
 
 fn collection_layout(values: &[i64]) -> Result<(CollectionStrategy, usize, usize)> {

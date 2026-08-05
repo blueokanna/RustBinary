@@ -1,44 +1,116 @@
-use std::{error, fmt, io, str::Utf8Error};
+use core::{error, fmt, str::Utf8Error};
+
+#[cfg(feature = "alloc")]
+use alloc::string::{String, ToString};
+#[cfg(feature = "std")]
+use std::io;
 
 /// Result type returned by all codec operations.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// Serde-provided diagnostic text.
+///
+/// The text is retained when `alloc` is enabled. Pure core builds retain the
+/// error category without requiring dynamic memory.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct CustomMessage {
+    #[cfg(feature = "alloc")]
+    message: String,
+}
+
+impl CustomMessage {
+    fn from_display(message: impl fmt::Display) -> Self {
+        #[cfg(feature = "alloc")]
+        {
+            Self {
+                message: message.to_string(),
+            }
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            let _ = message;
+            Self {}
+        }
+    }
+}
+
+impl From<&str> for CustomMessage {
+    fn from(message: &str) -> Self {
+        Self::from_display(message)
+    }
+}
+
+impl fmt::Display for CustomMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "alloc")]
+        {
+            f.write_str(&self.message)
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            f.write_str("custom Serde error")
+        }
+    }
+}
 
 /// Serialization, deserialization, validation, or I/O failure.
 #[derive(Debug)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum Error {
+    #[cfg(feature = "std")]
     Io(io::Error),
-    SizeLimit { limit: u64 },
-    CollectionLimit { limit: u64 },
-    BufferTooSmall { required: usize, available: usize },
+    SizeLimit {
+        limit: u64,
+    },
+    CollectionLimit {
+        limit: u64,
+    },
+    BufferTooSmall {
+        required: usize,
+        available: usize,
+    },
     InvalidFrame(&'static str),
-    SchemaMismatch { expected: u64, actual: u64 },
+    SchemaMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    #[cfg(feature = "cbor")]
     Cbor(String),
+    #[cfg(feature = "compression")]
     Compression(String),
+    #[cfg(feature = "encryption")]
     Encryption,
+    #[cfg(feature = "encryption")]
     Randomness(String),
     BitPacking(&'static str),
     Adaptive(&'static str),
+    #[cfg(feature = "parallel")]
     ParallelWorkerPanic,
     SchemaEvolution(&'static str),
     UnexpectedEnd,
-    TrailingBytes { remaining: usize },
+    TrailingBytes {
+        remaining: usize,
+    },
     InvalidBool(u8),
     InvalidOption(u8),
     InvalidChar,
     InvalidUtf8(Utf8Error),
-    IntegerOverflow { target: &'static str },
+    IntegerOverflow {
+        target: &'static str,
+    },
     InvalidVarintMarker(u8),
     NonCanonicalVarint,
     SequenceMustHaveLength,
     Unsupported(&'static str),
-    Custom(String),
+    Custom(CustomMessage),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "std")]
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::SizeLimit { limit } => write!(f, "codec size limit of {limit} bytes exceeded"),
             Self::CollectionLimit { limit } => {
@@ -56,12 +128,17 @@ impl fmt::Display for Error {
                 f,
                 "schema fingerprint mismatch: expected {expected:#018x}, found {actual:#018x}"
             ),
+            #[cfg(feature = "cbor")]
             Self::Cbor(message) => write!(f, "CBOR error: {message}"),
+            #[cfg(feature = "compression")]
             Self::Compression(message) => write!(f, "compression error: {message}"),
+            #[cfg(feature = "encryption")]
             Self::Encryption => f.write_str("authenticated encryption failed"),
+            #[cfg(feature = "encryption")]
             Self::Randomness(message) => write!(f, "system randomness error: {message}"),
             Self::BitPacking(message) => write!(f, "bit-packing error: {message}"),
             Self::Adaptive(message) => write!(f, "adaptive encoding error: {message}"),
+            #[cfg(feature = "parallel")]
             Self::ParallelWorkerPanic => f.write_str("parallel codec worker panicked"),
             Self::SchemaEvolution(message) => write!(f, "schema evolution error: {message}"),
             Self::UnexpectedEnd => f.write_str("unexpected end of input"),
@@ -79,7 +156,7 @@ impl fmt::Display for Error {
                 f.write_str("binary sequences and maps must declare their length")
             }
             Self::Unsupported(operation) => write!(f, "unsupported Serde operation: {operation}"),
-            Self::Custom(message) => f.write_str(message),
+            Self::Custom(message) => fmt::Display::fmt(message, f),
         }
     }
 }
@@ -87,6 +164,7 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
+            #[cfg(feature = "std")]
             Self::Io(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             _ => None,
@@ -94,6 +172,7 @@ impl error::Error for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -102,12 +181,12 @@ impl From<io::Error> for Error {
 
 impl serde::ser::Error for Error {
     fn custom<T: fmt::Display>(message: T) -> Self {
-        Self::Custom(message.to_string())
+        Self::Custom(CustomMessage::from_display(message))
     }
 }
 
 impl serde::de::Error for Error {
     fn custom<T: fmt::Display>(message: T) -> Self {
-        Self::Custom(message.to_string())
+        Self::Custom(CustomMessage::from_display(message))
     }
 }

@@ -10,6 +10,10 @@
 `rustbinary` 所有的运行时 trait，因此线格式、资源限制、错误类型和配置
 仍然由一个 runtime crate 管理。
 
+过程宏本身按 Rust 机制运行在带 `std` 的 host 上，但生成代码兼容 `no_std`：
+只使用 core 语法和 RustBinary runtime trait，不生成 `std`、`Vec` 或 `String`
+引用。runtime feature 与 `derive` feature 均为相互独立的加法能力。
+
 ## 提供的能力
 
 | Derive | 生成的契约 | 典型用途 |
@@ -29,7 +33,7 @@ CBOR、压缩、加密或 Schema 演进时，应把它们和 Serde derive 组合
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rustbinary = { version = "0.1.2", features = [
+rustbinary = { version = "0.1.3", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -38,8 +42,8 @@ rustbinary = { version = "0.1.2", features = [
 ] }
 ```
 
-各 feature 相互独立，只启用应用真正使用的生成契约即可。启用对应 feature
-后，`rustbinary` 会重新导出宏，因此应用代码通常使用
+各 feature 相互独立：`derive` 启用宏重新导出，`fingerprint`、`reflection`、
+`static-size` 和 `bit-packing` 分别启用 runtime 契约。应用代码通常使用
 `rustbinary::Fingerprint`、`rustbinary::StaticSize`、`rustbinary::Reflect` 和
 `rustbinary::BitPacked`。
 
@@ -48,13 +52,13 @@ rustbinary = { version = "0.1.2", features = [
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.2", features = [
+rustbinary = { version = "0.1.3", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.2"
+rustbinary-derive = "0.1.3"
 ```
 
 workspace 中同时写 `path` 和 `version` 是有意设计的。本地构建使用路径，

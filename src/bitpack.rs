@@ -1,5 +1,8 @@
 use crate::{Config, Error, Result, TrailingBytes};
 
+#[cfg(feature = "alloc")]
+use alloc::{vec, vec::Vec};
+
 /// Bit-level output over caller-owned memory, least-significant bit first.
 pub struct BitWriter<'a> {
     output: &'a mut [u8],
@@ -148,6 +151,7 @@ impl BitPackedConfig {
     }
 
     /// Packs a value into an exactly sized vector.
+    #[cfg(feature = "alloc")]
     pub fn serialize<T: BitPack>(self, value: &T) -> Result<Vec<u8>> {
         let maximum = bytes_for_bits(T::MAX_BITS);
         if self.base.limit.is_some_and(|limit| maximum as u64 > limit) {

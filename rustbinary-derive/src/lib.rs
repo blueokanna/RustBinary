@@ -7,6 +7,9 @@
 //! derives re-exported by the main crate. Generated paths intentionally refer
 //! to `::rustbinary`, keeping the runtime traits and wire implementation owned
 //! by one crate.
+//! The procedural macro runs on the host with `std`, but generated code uses
+//! only core syntax and the selected RustBinary runtime traits, so consumers
+//! may expand these derives in `no_std` crates.
 //!
 //! # Macro selection
 //!
@@ -305,13 +308,19 @@ fn reflect_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 }
 
 fn declared_bits(field: &syn::Field) -> syn::Result<Option<usize>> {
-    let Some(attribute) = field
+    let mut attributes = field
         .attrs
         .iter()
-        .find(|attribute| attribute.path().is_ident("bits"))
-    else {
+        .filter(|attribute| attribute.path().is_ident("bits"));
+    let Some(attribute) = attributes.next() else {
         return Ok(None);
     };
+    if let Some(duplicate) = attributes.next() {
+        return Err(syn::Error::new_spanned(
+            duplicate,
+            "duplicate #[bits] attribute",
+        ));
+    }
     let value = match &attribute.meta {
         Meta::NameValue(name_value) => match &name_value.value {
             Expr::Lit(expression) => match &expression.lit {
@@ -558,4 +567,25 @@ fn bit_packed_enum(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::declared_bits;
+    use syn::parse_quote;
+
+    #[test]
+    fn bits_attribute_accepts_supported_forms() {
+        let named: syn::Field = parse_quote!(#[bits = 7] value: u8);
+        let listed: syn::Field = parse_quote!(#[bits(9)] value: u16);
+        assert_eq!(declared_bits(&named).unwrap(), Some(7));
+        assert_eq!(declared_bits(&listed).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn bits_attribute_rejects_duplicates() {
+        let field: syn::Field = parse_quote!(#[bits = 3] #[bits = 4] value: u8);
+        let error = declared_bits(&field).unwrap_err();
+        assert!(error.to_string().contains("duplicate #[bits] attribute"));
+    }
 }

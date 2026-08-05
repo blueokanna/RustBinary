@@ -1,6 +1,11 @@
-use std::io::{Read, Write};
+use serde::{Deserialize, Serialize};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use serde::de::DeserializeOwned;
+#[cfg(feature = "std")]
+use std::io::{Read, Write};
 
 use crate::{decoder, error::Result, ser};
 
@@ -183,16 +188,18 @@ impl Config {
         self
     }
     /// Serializes a value into a new vector.
+    #[cfg(feature = "alloc")]
     pub fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         ser::to_vec(value, self)
     }
     /// Serializes a value directly into `writer`.
+    #[cfg(feature = "std")]
     pub fn serialize_into<W: Write, T: Serialize + ?Sized>(
         self,
         writer: W,
         value: &T,
     ) -> Result<()> {
-        ser::to_writer(writer, value, self).map(|_| ())
+        crate::adapters::serialize_into(self, writer, value)
     }
     /// Serializes into a caller-owned slice without codec-owned heap allocation.
     ///
@@ -215,8 +222,9 @@ impl Config {
         decoder::from_slice(input, self)
     }
     /// Reads and deserializes an owned value.
+    #[cfg(feature = "std")]
     pub fn deserialize_from<R: Read, T: DeserializeOwned>(self, reader: R) -> Result<T> {
-        decoder::from_reader(reader, self)
+        crate::adapters::deserialize_from(self, reader)
     }
 }
 
@@ -257,9 +265,11 @@ pub trait Options: Sized {
     fn allow_trailing_bytes(self) -> Config {
         self.config().allow_trailing_bytes()
     }
+    #[cfg(feature = "alloc")]
     fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         self.config().serialize(value)
     }
+    #[cfg(feature = "std")]
     fn serialize_into<W: Write, T: Serialize + ?Sized>(self, writer: W, value: &T) -> Result<()> {
         self.config().serialize_into(writer, value)
     }
@@ -276,6 +286,7 @@ pub trait Options: Sized {
     fn deserialize<'de, T: Deserialize<'de>>(self, input: &'de [u8]) -> Result<T> {
         self.config().deserialize(input)
     }
+    #[cfg(feature = "std")]
     fn deserialize_from<R: Read, T: DeserializeOwned>(self, reader: R) -> Result<T> {
         self.config().deserialize_from(reader)
     }

@@ -12,6 +12,11 @@ not a second serialization engine. The generated implementation calls traits
 owned by `rustbinary`, so wire behavior, resource limits, error types, and
 configuration remain in one runtime crate.
 
+The macro crate itself runs on the host with `std`, as procedural macros do.
+Its generated code is `no_std`: it uses core syntax and RustBinary runtime
+traits without emitting `std`, `Vec`, or `String` references. Runtime features
+and the `derive` feature are additive and independent.
+
 ## What It Provides
 
 | Derive | Generated contract | Typical use |
@@ -33,7 +38,7 @@ macros:
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rustbinary = { version = "0.1.2", features = [
+rustbinary = { version = "0.1.3", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -42,9 +47,9 @@ rustbinary = { version = "0.1.2", features = [
 ] }
 ```
 
-The feature names are independent. Enable only the generated contracts that
-the application uses. `rustbinary` re-exports the macros when the matching
-features are enabled, so application code normally writes
+The feature names are independent. `derive` enables macro re-exports, while
+`fingerprint`, `reflection`, `static-size`, and `bit-packing` enable their
+runtime contracts. Application code normally writes
 `rustbinary::Fingerprint`, `rustbinary::StaticSize`, `rustbinary::Reflect`,
 and `rustbinary::BitPacked`.
 
@@ -54,13 +59,13 @@ refer to `::rustbinary`:
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.2", features = [
+rustbinary = { version = "0.1.3", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.2"
+rustbinary-derive = "0.1.3"
 ```
 
 The `path` plus `version` dependency in the workspace is intentional. Local
