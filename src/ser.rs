@@ -115,20 +115,48 @@ impl<W: EncodeWriter> Encoder<W> {
         match value {
             0..=250 => self.emit(&[value as u8]),
             251..=0xffff => {
-                self.emit(&[U16_MARKER])?;
-                self.fixed((value as u16).to_le_bytes(), (value as u16).to_be_bytes())
+                let payload = if self.config.endian.little() {
+                    (value as u16).to_le_bytes()
+                } else {
+                    (value as u16).to_be_bytes()
+                };
+                let mut encoded = [0_u8; 3];
+                encoded[0] = U16_MARKER;
+                encoded[1..].copy_from_slice(&payload);
+                self.emit(&encoded)
             }
             0x1_0000..=0xffff_ffff => {
-                self.emit(&[U32_MARKER])?;
-                self.fixed((value as u32).to_le_bytes(), (value as u32).to_be_bytes())
+                let payload = if self.config.endian.little() {
+                    (value as u32).to_le_bytes()
+                } else {
+                    (value as u32).to_be_bytes()
+                };
+                let mut encoded = [0_u8; 5];
+                encoded[0] = U32_MARKER;
+                encoded[1..].copy_from_slice(&payload);
+                self.emit(&encoded)
             }
             0x1_0000_0000..=0xffff_ffff_ffff_ffff => {
-                self.emit(&[U64_MARKER])?;
-                self.fixed((value as u64).to_le_bytes(), (value as u64).to_be_bytes())
+                let payload = if self.config.endian.little() {
+                    (value as u64).to_le_bytes()
+                } else {
+                    (value as u64).to_be_bytes()
+                };
+                let mut encoded = [0_u8; 9];
+                encoded[0] = U64_MARKER;
+                encoded[1..].copy_from_slice(&payload);
+                self.emit(&encoded)
             }
             _ => {
-                self.emit(&[U128_MARKER])?;
-                self.fixed(value.to_le_bytes(), value.to_be_bytes())
+                let payload = if self.config.endian.little() {
+                    value.to_le_bytes()
+                } else {
+                    value.to_be_bytes()
+                };
+                let mut encoded = [0_u8; 17];
+                encoded[0] = U128_MARKER;
+                encoded[1..].copy_from_slice(&payload);
+                self.emit(&encoded)
             }
         }
     }

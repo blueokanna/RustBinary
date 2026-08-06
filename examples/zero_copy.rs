@@ -26,7 +26,9 @@ fn main() -> rustbinary::Result<()> {
         payload: b"sensor-frame",
         nested: Metadata { source: "edge-07" },
     };
-    let config = rustbinary::options().with_limit(4096);
+    let config = rustbinary::core::options()
+        .with_limit(4096)
+        .with_collection_limit(64);
 
     let required = config.serialized_size(&value)? as usize;
     let mut frame = vec![0; required];
@@ -37,5 +39,8 @@ fn main() -> rustbinary::Result<()> {
     assert!(points_into(&frame, decoded.topic.as_bytes()));
     assert!(points_into(&frame, decoded.payload));
     assert!(points_into(&frame, decoded.nested.source.as_bytes()));
+    assert_eq!(written, required);
+
+    println!("decoded 3 borrowed fields from a {written}-byte caller-owned frame");
     Ok(())
 }

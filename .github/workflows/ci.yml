@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  feature-matrix:
+    name: ${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: core-no-std
+            command: cargo test --no-default-features
+          - profile: core-alloc
+            command: cargo test --no-default-features --features alloc
+          - profile: protocol
+            command: cargo test --no-default-features --features protocol
+          - profile: pipeline
+            command: cargo test --no-default-features --features pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ${{ matrix.command }}
+
+  msrv-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - run: cargo check -p rustbinary --lib --no-default-features
+      - run: cargo check -p rustbinary --lib --no-default-features --features alloc
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features --release
+      - name: Run executable examples
+        run: |
+          cargo run --quiet --example core_codec
+          cargo run --quiet --example zero_copy
+          cargo run --quiet --example adaptive_zero_alloc --features adaptive
+          cargo run --quiet --example metadata --features bit-packing,derive,fingerprint,reflection,static-size
+          cargo run --quiet --example schema_evolution --features schema-evolution
+          cargo run --quiet --example secure_pipeline --features cbor,compression,encryption
+          cargo run --quiet --example parallel_batch --features parallel
+          cargo run --quiet --example complete --all-features
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

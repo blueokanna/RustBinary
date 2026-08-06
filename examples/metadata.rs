@@ -1,4 +1,7 @@
-use rustbinary::{Error, Fingerprint as _, Reflect as _, StaticSize as _, TypeShape};
+use rustbinary::{
+    core::{Error, ErrorCategory},
+    protocol::{Fingerprint as _, Reflect as _, StaticSize as _, TypeShape},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -6,9 +9,9 @@ use serde::{Deserialize, Serialize};
     PartialEq,
     Serialize,
     Deserialize,
-    rustbinary::Fingerprint,
-    rustbinary::Reflect,
-    rustbinary::StaticSize,
+    rustbinary::protocol::Fingerprint,
+    rustbinary::protocol::Reflect,
+    rustbinary::protocol::StaticSize,
 )]
 struct Header {
     online: bool,
@@ -16,14 +19,14 @@ struct Header {
     coordinates: [i32; 2],
 }
 
-#[derive(Serialize, Deserialize, rustbinary::Fingerprint)]
+#[derive(Serialize, Deserialize, rustbinary::protocol::Fingerprint)]
 struct ReorderedHeader {
     partition: u16,
     online: bool,
     coordinates: [i32; 2],
 }
 
-#[derive(Debug, PartialEq, rustbinary::BitPacked)]
+#[derive(Debug, PartialEq, rustbinary::protocol::BitPacked)]
 struct PackedFlags {
     online: bool,
     #[bits = 3]
@@ -73,6 +76,29 @@ fn main() -> rustbinary::Result<()> {
         base.with_bit_packing()
             .deserialize::<PackedFlags>(&packed)?,
         flags
+    );
+
+    let invalid = PackedFlags {
+        online: true,
+        priority: 8,
+        sequence: 1,
+    };
+    let width_error = base.with_bit_packing().serialize(&invalid).unwrap_err();
+    assert!(matches!(
+        &width_error,
+        Error::BitPacking("unsigned field value is out of range")
+    ));
+    assert_eq!(width_error.category(), ErrorCategory::Protocol);
+
+    println!(
+        "metadata: {} fields, max {} bytes, packed {} bytes, fingerprint {:#018x}",
+        match Header::SHAPE {
+            TypeShape::Struct(fields) => fields.len(),
+            TypeShape::Enum(_) => 0,
+        },
+        Header::MAX_SIZE,
+        packed.len(),
+        Header::fingerprint(base)
     );
 
     Ok(())

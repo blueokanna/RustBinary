@@ -8,6 +8,23 @@ use std::io;
 /// Result type returned by all codec operations.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Stable responsibility category for a codec failure.
+///
+/// Applications can use this value for metrics and response policy without
+/// matching the evolving, non-exhaustive [`Error`] enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ErrorCategory {
+    /// The supplied bytes or value are invalid, incomplete, or disallowed.
+    UserInput,
+    /// The bytes violate a selected RustBinary protocol or schema contract.
+    Protocol,
+    /// The caller's limits, buffer, I/O, or selected operation cannot satisfy the request.
+    Configuration,
+    /// RustBinary or a worker violated an internal invariant.
+    InternalBug,
+}
+
 /// Serde-provided diagnostic text.
 ///
 /// The text is retained when `alloc` is enabled. Pure core builds retain the
@@ -105,6 +122,46 @@ pub enum Error {
     SequenceMustHaveLength,
     Unsupported(&'static str),
     Custom(CustomMessage),
+}
+
+impl Error {
+    /// Returns the stable responsibility category for this error.
+    pub const fn category(&self) -> ErrorCategory {
+        match self {
+            #[cfg(feature = "std")]
+            Self::Io(_) => ErrorCategory::Configuration,
+            Self::SizeLimit { .. }
+            | Self::CollectionLimit { .. }
+            | Self::BufferTooSmall { .. }
+            | Self::SequenceMustHaveLength
+            | Self::Unsupported(_) => ErrorCategory::Configuration,
+            Self::InvalidFrame(_)
+            | Self::SchemaMismatch { .. }
+            | Self::BitPacking(_)
+            | Self::Adaptive(_)
+            | Self::SchemaEvolution(_)
+            | Self::NonCanonicalVarint => ErrorCategory::Protocol,
+            #[cfg(feature = "cbor")]
+            Self::Cbor(_) => ErrorCategory::Protocol,
+            #[cfg(feature = "compression")]
+            Self::Compression(_) => ErrorCategory::Protocol,
+            #[cfg(feature = "encryption")]
+            Self::Randomness(_) => ErrorCategory::Configuration,
+            #[cfg(feature = "encryption")]
+            Self::Encryption => ErrorCategory::UserInput,
+            #[cfg(feature = "parallel")]
+            Self::ParallelWorkerPanic => ErrorCategory::InternalBug,
+            Self::UnexpectedEnd
+            | Self::TrailingBytes { .. }
+            | Self::InvalidBool(_)
+            | Self::InvalidOption(_)
+            | Self::InvalidChar
+            | Self::InvalidUtf8(_)
+            | Self::IntegerOverflow { .. }
+            | Self::InvalidVarintMarker(_)
+            | Self::Custom(_) => ErrorCategory::UserInput,
+        }
+    }
 }
 
 impl fmt::Display for Error {

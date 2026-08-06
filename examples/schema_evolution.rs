@@ -1,4 +1,7 @@
-use rustbinary::{FieldDecoder, FieldEncoder, SchemaDecode, SchemaEncode};
+use rustbinary::{
+    core::{Error, ErrorCategory},
+    protocol::{FieldDecoder, FieldEncoder, SchemaDecode, SchemaEncode},
+};
 
 const TELEMETRY_SCHEMA_ID: u64 = 0x4859_5048_5445_4c45;
 
@@ -6,6 +9,8 @@ const TELEMETRY_SCHEMA_ID: u64 = 0x4859_5048_5445_4c45;
 struct TelemetryV1 {
     device_name: String,
     sample_count: u32,
+    encoded_version: u32,
+    unknown_field_ids: Vec<u32>,
 }
 
 impl SchemaEncode for TelemetryV1 {
@@ -24,11 +29,17 @@ impl<'de> SchemaDecode<'de> for TelemetryV1 {
 
     fn decode_fields(
         decoder: &mut FieldDecoder<'de>,
-        _encoded_version: u32,
+        encoded_version: u32,
     ) -> rustbinary::Result<Self> {
+        validate_version(encoded_version)?;
+        let device_name = decoder.required(10)?;
+        let sample_count = decoder.required(20)?;
+        let unknown_field_ids = decoder.unknown_fields().map(|field| field.id).collect();
         Ok(Self {
-            device_name: decoder.required(10)?,
-            sample_count: decoder.required(20)?,
+            device_name,
+            sample_count,
+            encoded_version,
+            unknown_field_ids,
         })
     }
 }
@@ -61,6 +72,7 @@ impl<'de> SchemaDecode<'de> for TelemetryV2<'de> {
         decoder: &mut FieldDecoder<'de>,
         encoded_version: u32,
     ) -> rustbinary::Result<Self> {
+        validate_version(encoded_version)?;
         let display_name = decoder.required(10)?;
         let sample_count = decoder.required(20)?;
         let enabled = decoder.or_default(30)?;
@@ -75,6 +87,28 @@ impl<'de> SchemaDecode<'de> for TelemetryV2<'de> {
     }
 }
 
+fn validate_version(encoded_version: u32) -> rustbinary::Result<()> {
+    if (1..=2).contains(&encoded_version) {
+        Ok(())
+    } else {
+        Err(Error::SchemaEvolution("unsupported telemetry revision"))
+    }
+}
+
+#[derive(Debug)]
+struct OtherSchema;
+
+impl<'de> SchemaDecode<'de> for OtherSchema {
+    const SCHEMA_ID: u64 = 0xdead_beef;
+
+    fn decode_fields(
+        _decoder: &mut FieldDecoder<'de>,
+        _encoded_version: u32,
+    ) -> rustbinary::Result<Self> {
+        Ok(Self)
+    }
+}
+
 fn main() -> rustbinary::Result<()> {
     let codec = rustbinary::options()
         .with_limit(64 * 1024)
@@ -84,6 +118,8 @@ fn main() -> rustbinary::Result<()> {
     let old = TelemetryV1 {
         device_name: "edge-07".into(),
         sample_count: 91,
+        encoded_version: 1,
+        unknown_field_ids: Vec::new(),
     };
     let old_frame = codec.serialize(&old)?;
     let upgraded: TelemetryV2<'_> = codec.deserialize(&old_frame)?;
@@ -91,6 +127,7 @@ fn main() -> rustbinary::Result<()> {
     assert_eq!(upgraded.sample_count, 91);
     assert!(!upgraded.enabled); // Field 30 was absent, so Default is used.
     assert_eq!(upgraded.encoded_version, 1);
+    assert!(upgraded.unknown_field_ids.is_empty());
 
     let current = TelemetryV2 {
         display_name: "edge-09",
@@ -103,6 +140,21 @@ fn main() -> rustbinary::Result<()> {
     let downgraded: TelemetryV1 = codec.deserialize(&current_frame)?;
     assert_eq!(downgraded.device_name, "edge-09");
     assert_eq!(downgraded.sample_count, 144);
+    assert_eq!(downgraded.encoded_version, 2);
+    assert_eq!(downgraded.unknown_field_ids, [30]);
+
+    let mismatch = codec
+        .deserialize::<OtherSchema>(&current_frame)
+        .unwrap_err();
+    assert!(matches!(&mismatch, Error::SchemaMismatch { .. }));
+    assert_eq!(mismatch.category(), ErrorCategory::Protocol);
+
+    println!(
+        "schema evolution: V1 {} bytes, V2 {} bytes, skipped field {:?}",
+        old_frame.len(),
+        current_frame.len(),
+        downgraded.unknown_field_ids
+    );
 
     Ok(())
 }

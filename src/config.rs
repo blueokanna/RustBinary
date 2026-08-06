@@ -9,6 +9,12 @@ use std::io::{Read, Write};
 
 use crate::{decoder, error::Result, ser};
 
+/// Conservative default byte limit for one encoded or decoded Core value.
+pub const DEFAULT_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Conservative default element limit for one sequence or map.
+pub const DEFAULT_COLLECTION_LIMIT: u64 = 1_000_000;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Byte order for fixed-width values and varint payloads.
 pub enum Endian {
@@ -74,11 +80,11 @@ impl Config {
             endian: Endian::Little,
             integers: IntEncoding::Variable,
             trailing: TrailingBytes::Reject,
-            limit: None,
-            collection_limit: Some(1_000_000),
+            limit: Some(DEFAULT_SIZE_LIMIT),
+            collection_limit: Some(DEFAULT_COLLECTION_LIMIT),
         }
     }
-    /// Creates the fixed-width bincode 1.x compatibility profile.
+    /// Creates the historical unbounded fixed-width RustBinary profile.
     pub const fn legacy() -> Self {
         Self {
             endian: Endian::Little,

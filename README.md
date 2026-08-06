@@ -4,6 +4,14 @@ RustBinary is a bounded binary codec for Serde with explicit wire profiles and
 opt-in systems for adaptive encoding, bit packing, schema identity, CBOR,
 compression, authenticated encryption, schema evolution, and parallel batches.
 
+The product surface is deliberately split into three layers:
+
+| Layer | Public surface | Default | Scope |
+| --- | --- | --- | --- |
+| **Core** | `rustbinary::core` | Yes | Compact V1 encode/decode, limits, trailing policy, deterministic primitive encoding, caller buffers, `no_std` |
+| **Protocol** | `rustbinary::protocol` | No | evolution, fingerprints, reflection, static bounds, bit packing, compatibility profiles |
+| **Pipeline** | `rustbinary::pipeline` | No | CBOR, compression, encryption, ordered parallel transforms |
+
 [中文文档](README.zh-CN.md)
 
 ## Design Identity
@@ -50,7 +58,6 @@ format is not implied unless a profile explicitly documents it.
 | `std::io` streams | Implemented | Reader/writer APIs live in `adapters` with resource limits |
 | `no_std` | Implemented | Compact V1 slice encode/decode and caller-owned buffers require no default features |
 | `no_std + alloc` | Implemented | `Vec`, `String`, owned values, fingerprinting, evolution, and scalar adaptive codecs |
-| bincode compatibility | Optional | Independently implemented `bincode-compat` profile with repository-owned golden vectors |
 | Async fiber/UFA | Not implemented | No fake async wrapper is exposed over blocking I/O |
 
 The distinction is deliberate: hardware detection is not described as hardware
@@ -61,39 +68,37 @@ archive.
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1", features = [
-    "adaptive",
-    "bit-packing",
-    "cbor",
-    "compression",
-    "encryption",
-    "fingerprint",
-    "parallel",
-    "reflection",
-    "schema-evolution",
-    "simd",
-    "static-size",
-] }
+rustbinary = "0.1.3"
 serde = { version = "1", features = ["derive"] }
+```
+
+Enable a complete optional layer only when it is actually needed:
+
+```toml
+rustbinary = { version = "0.1.3", features = ["protocol"] }
+# or select only the exact capability:
+rustbinary = { version = "0.1.3", features = ["fingerprint", "derive"] }
 ```
 
 The minimum supported Rust version is declared in `Cargo.toml`. Optional
 systems only compile when their feature is enabled.
 
-RustBinary requires Rust 1.87 or newer and this workspace uses Rust 2024
-edition. The optional Zstandard dependency requires a platform C toolchain.
+RustBinary requires Rust 1.87 or newer and uses Rust 2021 edition. The optional
+Zstandard dependency requires a platform C toolchain.
 
 ### Feature Matrix
 
 | Feature | Default | Purpose and dependency |
 | --- | --- | --- |
-| `std` | Yes | I/O adapters, threads, OS RNG, Zstandard, and runtime SIMD |
+| `std` | Yes | Owned Core and I/O APIs; required by Pipeline and runtime SIMD features |
 | `alloc` | Via `std` | Owned `Vec`/`String` APIs without requiring `std` |
-| `derive` | Yes | Re-exports procedural macros |
-| `fingerprint` | Yes | Structural fingerprint runtime and frames |
-| `reflection` | Yes | Allocation-free reflection runtime |
-| `static-size` | Yes | Compile-time bounds runtime |
-| `simd` | Yes | Runtime detection and hot-scan dispatch |
+| `protocol` | No | Complete Protocol layer convenience bundle |
+| `pipeline` | No | Complete Pipeline layer convenience bundle |
+| `derive` | No | Re-exports procedural macros selected with their runtime feature |
+| `fingerprint` | No | Structural fingerprint runtime and frames |
+| `reflection` | No | Allocation-free reflection runtime |
+| `static-size` | No | Compile-time bounds runtime |
+| `simd` | No | Runtime detection and hot-scan dispatch; never changes bytes |
 | `bit-packing` | No | Core bit-level traits and caller-buffer codec |
 | `adaptive` | No | Caller-buffer adaptive strings/collections; implies `bit-packing`; `alloc` adds owned APIs |
 | `cbor` | No | RFC 8949 through Ciborium |
@@ -101,11 +106,10 @@ edition. The optional Zstandard dependency requires a platform C toolchain.
 | `encryption` | No | XChaCha20-Poly1305, OS randomness, zeroization |
 | `parallel` | No | Scoped-thread ordered batch frames |
 | `schema-evolution` | No | Stable-field-ID versioned frames |
-| `bincode-compat` | No | RustBinary's independent bincode-compatible standard profile |
 
 The primary architecture is RustBinary Compact V1: a pure `no_std` slice core,
 an `alloc` extension for owned data, and `std` adapters for streams and platform
-services. The bincode bridge is a separate profile, not the main wire format.
+services.
 
 ```powershell
 cargo build --no-default-features
@@ -115,11 +119,11 @@ cargo build --features std
 
 ## Binary Profiles
 
-The top-level `serialize` and `deserialize` functions use the migration
-profile: little-endian fixed-width integers, `u64` lengths, `u32` enum tags,
-and allowed trailing bytes. `options()` returns the strict compact profile:
-little endian, canonical marker varints, ZigZag signed integers, a default
-1,000,000-element collection limit, and rejected trailing bytes.
+The top-level `serialize` and `deserialize` functions and `options()` use the
+strict compact profile: little endian, canonical marker varints, ZigZag signed
+integers, a 64 MiB byte limit, a 1,000,000-element collection limit, and
+rejected trailing bytes. `legacy_options()` explicitly selects the former
+unbounded fixed-width profile and allowed trailing bytes.
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -471,6 +475,9 @@ values. It is `#[non_exhaustive]`; downstream exhaustive matches need a fallback
 arm. Frame offsets, length sums, delta reconstruction, and integer narrowing
 are checked instead of relying on panic recovery.
 
+`Error::category()` provides the stable operational mapping to `UserInput`,
+`Protocol`, `Configuration`, or `InternalBug`.
+
 ## Verification
 
 ```text
@@ -479,19 +486,25 @@ cargo test --workspace --all-targets --all-features
 cargo test --workspace --all-features --release
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --all-features --no-deps
+cargo bench --bench codec_comparison
 ```
+
+The benchmark compares RustBinary's owned and caller-buffer Compact V1 paths
+over the same Serde shapes. It validates each round trip before collecting nine
+calibrated samples and prints the median as raw Markdown.
 
 ### Executable Examples
 
 | Example | Scope | Command |
 | --- | --- | --- |
 | [complete.rs](examples/complete.rs) | End-to-end all-feature composition | `cargo run --example complete --all-features` |
+| [core_codec.rs](examples/core_codec.rs) | Bounded Core, caller buffers, borrowing, trailing and error policy | `cargo run --example core_codec` |
 | [zero_copy.rs](examples/zero_copy.rs) | Nested borrowing and pointer proof | `cargo run --example zero_copy` |
 | [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | Adaptive decisions and caller buffers | `cargo run --example adaptive_zero_alloc --features adaptive` |
 | [secure_pipeline.rs](examples/secure_pipeline.rs) | Deterministic CBOR, compression, AEAD | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
 | [schema_evolution.rs](examples/schema_evolution.rs) | Bidirectional schema V1/V2 | `cargo run --example schema_evolution --features schema-evolution` |
 | [parallel_batch.rs](examples/parallel_batch.rs) | Ordered multi-worker batches | `cargo run --example parallel_batch --features parallel` |
-| [metadata.rs](examples/metadata.rs) | Fingerprint, reflection, bounds, packing | `cargo run --example metadata --features bit-packing` |
+| [metadata.rs](examples/metadata.rs) | Fingerprint, reflection, bounds, packing | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 
 ## docs.rs and Compatibility
 
@@ -506,8 +519,9 @@ cargo doc --workspace --all-features --no-deps
 
 Versioned wrappers reject unknown versions and reserved flags instead of
 guessing. Before 1.0, wire changes may occur between minor releases and must be
-documented. Long-lived deployments should pin the version, record the complete
-configuration, keep golden vectors, and use explicit schema IDs.
+called out in release notes. Long-lived deployments should pin the version,
+record the complete configuration, keep golden vectors, and use explicit schema
+IDs.
 
 ## Current Non-Goals
 

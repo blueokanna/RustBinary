@@ -1,31 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use rustbinary::ErrorCategory;
+
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct Borrowed<'a> {
     id: u64,
     delta: i32,
-    name: &'a str,
-    #[serde(borrow)]
-    payload: &'a [u8],
-}
-
-#[cfg(feature = "bincode-compat")]
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-enum CompatEvent {
-    Idle,
-    Data(u32),
-    Point { x: i16, y: i16 },
-}
-
-#[cfg(feature = "bincode-compat")]
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-struct CompatFrame<'a> {
-    tag: u16,
-    active: bool,
-    scalar: char,
-    ratio: f32,
-    event: CompatEvent,
-    optional: Option<i64>,
     name: &'a str,
     #[serde(borrow)]
     payload: &'a [u8],
@@ -85,6 +65,45 @@ fn public_slice_and_count_writers_report_exact_capacity() {
     assert_eq!(counter.written(), 6);
 }
 
+#[test]
+fn defaults_are_bounded_and_errors_have_stable_responsibility() {
+    assert_eq!(
+        rustbinary::options(),
+        rustbinary::Config::default(),
+        "the documented Core profile must remain the Rust default"
+    );
+    assert_eq!(rustbinary::DEFAULT_SIZE_LIMIT, 64 * 1024 * 1024);
+    assert_eq!(rustbinary::DEFAULT_COLLECTION_LIMIT, 1_000_000);
+    assert_eq!(
+        rustbinary::Error::UnexpectedEnd.category(),
+        ErrorCategory::UserInput
+    );
+    assert_eq!(
+        rustbinary::Error::InvalidFrame("bad magic").category(),
+        ErrorCategory::Protocol
+    );
+    assert_eq!(
+        rustbinary::Error::BufferTooSmall {
+            required: 2,
+            available: 1,
+        }
+        .category(),
+        ErrorCategory::Configuration
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn top_level_api_uses_the_compact_core_profile() {
+    let value = (251_u64, -2_i32, "A");
+    let expected = rustbinary::options().serialize(&value).unwrap();
+    assert_eq!(rustbinary::serialize(&value).unwrap(), expected);
+    assert_eq!(
+        rustbinary::deserialize::<(u64, i32, String)>(&expected).unwrap(),
+        (251, -2, "A".to_owned())
+    );
+}
+
 #[cfg(feature = "adaptive")]
 #[test]
 fn adaptive_profile_has_pure_no_std_caller_buffer_paths() {
@@ -125,79 +144,4 @@ fn alloc_profile_preserves_owned_values() {
     let bytes = rustbinary::options().serialize(&value).unwrap();
     let decoded: (String, Vec<u32>) = rustbinary::options().deserialize(&bytes).unwrap();
     assert_eq!(decoded, value);
-}
-
-#[cfg(feature = "bincode-compat")]
-#[test]
-fn bincode_compat_primitive_golden_vectors_are_stable() {
-    type GoldenVector<'a> = ((u64, i64, &'a str, &'a [u8]), &'a [u8]);
-    let values: &[GoldenVector<'_>] = &[
-        ((0, -1, "", &[0]), &[0, 1, 0, 1, 0]),
-        (
-            (250, 251, "edge", &[1, 2, 3]),
-            &[250, 251, 246, 1, 4, b'e', b'd', b'g', b'e', 3, 1, 2, 3],
-        ),
-        (
-            (65_536, -65_536, "telemetry", &[0, 255]),
-            &[
-                252, 0, 0, 1, 0, 252, 255, 255, 1, 0, 9, b't', b'e', b'l', b'e', b'm', b'e', b't',
-                b'r', b'y', 2, 0, 255,
-            ],
-        ),
-    ];
-    for &(value, golden) in values {
-        let mut compact = [0u8; 128];
-        let compact_written = rustbinary::options()
-            .serialize_into_slice(&mut compact, &value)
-            .unwrap();
-        let mut own = vec![
-            0u8;
-            rustbinary::bincode_compat()
-                .serialized_size(&value)
-                .unwrap() as usize
-        ];
-        let written = rustbinary::bincode_compat()
-            .serialize_into_slice(&mut own, &value)
-            .unwrap();
-        own.truncate(written);
-        assert_eq!(own, golden);
-        assert_eq!(&compact[..compact_written], golden);
-
-        let (decoded, consumed): ((u64, i64, &str, &[u8]), usize) =
-            rustbinary::bincode_compat().deserialize(&own).unwrap();
-        assert_eq!(decoded, value);
-        assert_eq!(consumed, own.len());
-    }
-}
-
-#[cfg(feature = "bincode-compat")]
-#[test]
-fn independent_bincode_profile_matches_structural_golden() {
-    let value = CompatFrame {
-        tag: 65_535,
-        active: true,
-        scalar: '\u{754c}',
-        ratio: 1.5,
-        event: CompatEvent::Point { x: -9, y: 17 },
-        optional: Some(-251),
-        name: "rustbinary",
-        payload: b"borrowed",
-    };
-    let golden = [
-        251, 255, 255, 1, 0xe7, 0x95, 0x8c, 0, 0, 0xc0, 0x3f, 2, 17, 34, 1, 251, 245, 1, 10, b'r',
-        b'u', b's', b't', b'b', b'i', b'n', b'a', b'r', b'y', 8, b'b', b'o', b'r', b'r', b'o',
-        b'w', b'e', b'd',
-    ];
-    let mut output = [0u8; 128];
-    let written = rustbinary::bincode_compat()
-        .serialize_into_slice(&mut output, &value)
-        .unwrap();
-    assert_eq!(&output[..written], golden);
-
-    output[written] = 0xaa;
-    let (decoded, consumed): (CompatFrame<'_>, usize) = rustbinary::bincode_compat()
-        .deserialize(&output[..written + 1])
-        .unwrap();
-    assert_eq!(decoded, value);
-    assert_eq!(consumed, written);
 }

@@ -4,6 +4,14 @@ RustBinary 是一个面向 Serde 的有界二进制编解码库。线格式配�
 自适应编码、位打包、Schema 指纹、CBOR、压缩、认证加密、Schema 演进和并行
 批处理均通过 feature 独立启用。
 
+产品面明确分为三层：
+
+| 层 | 公开入口 | 默认启用 | 职责 |
+| --- | --- | --- | --- |
+| **Core** | `rustbinary::core` | 是 | Compact V1 编解码、limit、尾随策略、确定性基础表示、调用方缓冲区、`no_std` |
+| **Protocol** | `rustbinary::protocol` | 否 | 演进、指纹、反射、静态上界、位打包、兼容 profile |
+| **Pipeline** | `rustbinary::pipeline` | 否 | CBOR、压缩、加密、有序并行变换 |
+
 [English](README.md)
 
 ## 设计身份
@@ -45,7 +53,6 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 | `std::io` 流 | 已实现 | Reader/Writer API 位于 `adapters`，并保留资源限制 |
 | `no_std` | 已实现 | Compact V1 slice 编解码和调用方缓冲区无需默认 feature |
 | `no_std + alloc` | 已实现 | 保留 `Vec`、`String`、owned data、指纹、演进和标量 adaptive codec |
-| bincode 兼容 | 可选 | 自主实现的 `bincode-compat` profile，并使用仓库自有 golden vectors |
 | Async Fiber/UFA | 未实现 | 不用阻塞 I/O 包装成假的 async API |
 
 这里严格区分“已探测”和“已加速”，也严格区分借用式零复制与相对指针对象归档。
@@ -54,38 +61,35 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1", features = [
-    "adaptive",
-    "bit-packing",
-    "cbor",
-    "compression",
-    "encryption",
-    "fingerprint",
-    "parallel",
-    "reflection",
-    "schema-evolution",
-    "simd",
-    "static-size",
-] }
+rustbinary = "0.2"
 serde = { version = "1", features = ["derive"] }
+```
+
+只在确实需要时启用整层，也可只选择单项能力：
+
+```toml
+rustbinary = { version = "0.2", features = ["protocol"] }
+rustbinary = { version = "0.2", features = ["fingerprint", "derive"] }
 ```
 
 最低 Rust 版本由 `Cargo.toml` 的 `rust-version` 声明。可选模块未启用时不会参与编译。
 
-当前要求 Rust 1.87 或更高版本，workspace 使用 Rust 2024 edition。可选 Zstandard
+当前要求 Rust 1.87 或更高版本，workspace 使用 Rust 2021 edition。可选 Zstandard
 依赖还需要目标平台具备可用的 C 工具链。
 
 ### Feature 矩阵
 
 | Feature | 默认启用 | 用途与依赖 |
 | --- | --- | --- |
-| `std` | 是 | I/O adapters、线程、OS RNG、Zstandard 和运行时 SIMD |
+| `std` | 是 | Core owned/I/O API；Pipeline 与运行时 SIMD feature 以它为前提 |
 | `alloc` | 通过 `std` | 不依赖 `std` 的 owned `Vec`/`String` API |
-| `derive` | 是 | 导出过程宏 |
-| `fingerprint` | 是 | 结构指纹 runtime 和 frame |
-| `reflection` | 是 | 零分配反射 runtime |
-| `static-size` | 是 | 编译期上界 runtime |
-| `simd` | 是 | 运行时能力探测与热扫描分派 |
+| `protocol` | 否 | 完整 Protocol 层聚合 feature |
+| `pipeline` | 否 | 完整 Pipeline 层聚合 feature |
+| `derive` | 否 | 与对应 runtime feature 一起导出过程宏 |
+| `fingerprint` | 否 | 结构指纹 runtime 和 frame |
+| `reflection` | 否 | 零分配反射 runtime |
+| `static-size` | 否 | 编译期上界 runtime |
+| `simd` | 否 | 运行时能力探测与热扫描分派，不改变线格式 |
 | `bit-packing` | 否 | 核心位级 trait 和调用方缓冲区 codec |
 | `adaptive` | 否 | 调用方缓冲区自适应字符串/集合；隐含 `bit-packing`；`alloc` 增加 owned API |
 | `cbor` | 否 | 基于 Ciborium 的 RFC 8949 |
@@ -93,11 +97,9 @@ serde = { version = "1", features = ["derive"] }
 | `encryption` | 否 | XChaCha20-Poly1305、系统随机数、密钥清零 |
 | `parallel` | 否 | scoped thread 有序批处理 |
 | `schema-evolution` | 否 | 稳定字段 ID 版本化 frame |
-| `bincode-compat` | 否 | RustBinary 自主实现的 bincode-compatible standard profile |
 
 主架构是 RustBinary Compact V1：纯 `no_std` slice core、用于 owned data 的
-`alloc` extension，以及承载流和平台服务的 `std` adapters。bincode bridge 是独立
-profile，不是主线格式。
+`alloc` extension，以及承载流和平台服务的 `std` adapters。
 
 ```powershell
 cargo build --no-default-features
@@ -107,9 +109,9 @@ cargo build --features std
 
 ## 二进制配置
 
-顶层 `serialize`/`deserialize` 使用迁移兼容模式：小端、定宽整数、`u64`
-长度、`u32` 枚举 tag，并允许尾随字节。`options()` 使用严格紧凑模式：小端、
-规范 marker-varint、ZigZag 有符号整数、默认一百万元素集合上限，并拒绝尾随字节。
+顶层 `serialize`/`deserialize` 与 `options()` 都使用严格紧凑模式：小端、规范
+marker-varint、ZigZag 有符号整数、默认 64 MiB 字节上限、一百万元素集合上限，
+并拒绝尾随字节。`legacy_options()` 显式选择旧的无界定宽模式并允许尾随字节。
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -412,12 +414,13 @@ cargo doc --workspace --all-features --no-deps
 | Example | 覆盖内容 | 命令 |
 | --- | --- | --- |
 | [complete.rs](examples/complete.rs) | 全 feature 端到端组合 | `cargo run --example complete --all-features` |
+| [core_codec.rs](examples/core_codec.rs) | 有界 Core、调用方缓冲区、借用、尾随与错误策略 | `cargo run --example core_codec` |
 | [zero_copy.rs](examples/zero_copy.rs) | 嵌套借用和指针范围证明 | `cargo run --example zero_copy` |
 | [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | 自适应决策和调用方缓冲区 | `cargo run --example adaptive_zero_alloc --features adaptive` |
 | [secure_pipeline.rs](examples/secure_pipeline.rs) | 确定性 CBOR、压缩、AEAD | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
 | [schema_evolution.rs](examples/schema_evolution.rs) | Schema V1/V2 双向演进 | `cargo run --example schema_evolution --features schema-evolution` |
 | [parallel_batch.rs](examples/parallel_batch.rs) | 有序多 worker batch | `cargo run --example parallel_batch --features parallel` |
-| [metadata.rs](examples/metadata.rs) | 指纹、反射、上界、位打包 | `cargo run --example metadata --features bit-packing` |
+| [metadata.rs](examples/metadata.rs) | 指纹、反射、上界、位打包 | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 
 ## docs.rs 与兼容性
 

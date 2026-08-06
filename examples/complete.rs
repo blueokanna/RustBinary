@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use rustbinary::{hardware_capabilities, options, EncryptionKey, Reflect, StaticSize, TypeShape};
+use rustbinary::{
+    core::options,
+    hardware_capabilities,
+    pipeline::EncryptionKey,
+    protocol::{Reflect, StaticSize, TypeShape},
+};
 
 #[derive(
     Clone,
@@ -8,9 +13,9 @@ use rustbinary::{hardware_capabilities, options, EncryptionKey, Reflect, StaticS
     PartialEq,
     Serialize,
     Deserialize,
-    rustbinary::Fingerprint,
-    rustbinary::Reflect,
-    rustbinary::StaticSize,
+    rustbinary::protocol::Fingerprint,
+    rustbinary::protocol::Reflect,
+    rustbinary::protocol::StaticSize,
 )]
 struct Telemetry {
     sequence: u64,
@@ -18,7 +23,7 @@ struct Telemetry {
     samples: [i16; 4],
 }
 
-#[derive(Debug, PartialEq, rustbinary::BitPacked)]
+#[derive(Debug, PartialEq, rustbinary::protocol::BitPacked)]
 struct WireFlags {
     #[bits = 3]
     kind: u8,
@@ -111,6 +116,14 @@ fn main() -> rustbinary::Result<()> {
         "SIMD: {:?} ({:?})",
         rustbinary::simd_backend(),
         hardware_capabilities()
+    );
+    println!(
+        "complete flow: Core {} bytes, fingerprinted {} bytes, packed {} bytes, encrypted {} bytes, batch {} bytes",
+        written,
+        frame.len(),
+        packed.len(),
+        encrypted.len(),
+        batch_frame.len()
     );
     Ok(())
 }
