@@ -93,7 +93,7 @@ required-features = [
 
 [dependencies]
 serde = { version = "1", default-features = false }
-rustbinary-derive = { version = "0.2.0", path = "rustbinary-derive", optional = true }
+rustbinary-derive = { version = "0.1.3", path = "rustbinary-derive", optional = true }
 ciborium = { version = "0.2.2", optional = true }
 zstd = { version = "0.13.3", optional = true }
 chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = [

@@ -26,14 +26,14 @@ jobs:
           - profile: pipeline
             command: cargo test --no-default-features --features pipeline
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: ${{ matrix.command }}
 
   msrv-core:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.87.0
       - run: cargo check -p rustbinary --lib --no-default-features
       - run: cargo check -p rustbinary --lib --no-default-features --features alloc
@@ -41,7 +41,7 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
