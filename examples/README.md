@@ -8,6 +8,7 @@ exit status means its success and failure-path contracts both held.
 | --- | --- | --- |
 | `core_codec` | Core | `cargo run --example core_codec` |
 | `zero_copy` | Core | `cargo run --example zero_copy` |
+| `mmap_archive` | Archive | `cargo run --example mmap_archive --features archive` |
 | `adaptive_zero_alloc` | Protocol | `cargo run --example adaptive_zero_alloc --features adaptive` |
 | `metadata` | Protocol | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 | `schema_evolution` | Protocol | `cargo run --example schema_evolution --features schema-evolution` |

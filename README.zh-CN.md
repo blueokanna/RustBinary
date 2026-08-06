@@ -12,6 +12,10 @@ RustBinary 是一个面向 Serde 的有界二进制编解码库。线格式配�
 | **Protocol** | `rustbinary::protocol` | 否 | 演进、指纹、反射、静态上界、位打包、兼容 profile |
 | **Pipeline** | `rustbinary::pipeline` | 否 | CBOR、压缩、加密、有序并行变换 |
 
+只读内存映射对象存储是独立、显式启用的 `rustbinary::archive` 产品面。Core、
+Protocol、Pipeline 聚合 feature 都不会启用它，它也不会改变三层现有线格式或
+`no_std` 边界。
+
 [English](README.md)
 
 ## 设计身份
@@ -39,7 +43,7 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 | AVX-512、SVE、SME | 仅能力探测 | `hardware_capabilities` 可报告，尚无对应 codec 内核 |
 | 零分配编解码路径 | 已实现 | 精确长度 Serde 输出及调用方缓冲区自适应解码 |
 | 借用式零复制反序列化 | 已实现 | 嵌套 `&str`、`&[u8]` 直接指向输入 frame |
-| 相对指针对象归档 | 未实现 | 当前格式是安全检查的 Serde 字节流，不是 mmap 对象布局 |
+| 只读相对指针对象归档 | 已实现，需 `archive` | 版本化包头、显式 schema ID、有界校验和 mmap 原地访问 |
 | 位打包 | 已实现 | `BitPacked` derive、宽度检查、规范零 padding |
 | Schema 指纹 | 已实现 | 覆盖类型结构及完整 binary/CBOR 配置 |
 | 编译期内存上界 | 已实现 | `MAX_SIZE`、`PACKED_MAX_BITS`、`PACKED_MAX_SIZE` |
@@ -55,26 +59,26 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 | `no_std + alloc` | 已实现 | 保留 `Vec`、`String`、owned data、指纹、演进和标量 adaptive codec |
 | Async Fiber/UFA | 未实现 | 不用阻塞 I/O 包装成假的 async API |
 
-这里严格区分“已探测”和“已加速”，也严格区分借用式零复制与相对指针对象归档。
+这里严格区分“已探测”和“已加速”；Serde codec 与相对指针对象归档也是两套独立的
+格式和 API。
 
 ## 安装
 
 ```toml
 [dependencies]
-rustbinary = "0.2"
+rustbinary = "0.1.4"
 serde = { version = "1", features = ["derive"] }
 ```
 
 只在确实需要时启用整层，也可只选择单项能力：
 
 ```toml
-rustbinary = { version = "0.2", features = ["protocol"] }
-rustbinary = { version = "0.2", features = ["fingerprint", "derive"] }
+rustbinary = { version = "0.1.4", features = ["protocol"] }
+rustbinary = { version = "0.1.4", features = ["fingerprint", "derive"] }
+rustbinary = { version = "0.1.4", features = ["archive"] }
 ```
 
-最低 Rust 版本由 `Cargo.toml` 的 `rust-version` 声明。可选模块未启用时不会参与编译。
-
-当前要求 Rust 1.87 或更高版本，workspace 使用 Rust 2021 edition。可选 Zstandard
+最低 Rust 版本由 `Cargo.toml` 的 `rust-version` 声明。可选模块未启用时不会参与编译。当前可选 Zstandard
 依赖还需要目标平台具备可用的 C 工具链。
 
 ### Feature 矩阵
@@ -85,6 +89,7 @@ rustbinary = { version = "0.2", features = ["fingerprint", "derive"] }
 | `alloc` | 通过 `std` | 不依赖 `std` 的 owned `Vec`/`String` API |
 | `protocol` | 否 | 完整 Protocol 层聚合 feature |
 | `pipeline` | 否 | 完整 Pipeline 层聚合 feature |
+| `archive` | 否 | 经校验的只读 mmap 归档；依赖 `std`、rkyv 和 memmap2 |
 | `derive` | 否 | 与对应 runtime feature 一起导出过程宏 |
 | `fingerprint` | 否 | 结构指纹 runtime 和 frame |
 | `reflection` | 否 | 零分配反射 runtime |
@@ -212,9 +217,24 @@ adaptive `encode_*_into_slice`、`decode_i64_slice_into`、
 `decode_string_into_slice` 以及位打包调用方缓冲区。Reader 解码要求
 `DeserializeOwned`；返回指向临时 reader buffer 的引用在 Rust 中并不安全。
 
-借用解析对字符串/字节 payload 是真正零复制，但不是相对指针 mmap 归档，也不会把
-不可信字节直接强转成任意 struct。指针范围断言见
-[zero_copy.rs](examples/zero_copy.rs)。
+借用解析对字符串/字节 payload 是真正零复制，它属于 Serde 字节流路径；指针范围
+断言见 [zero_copy.rs](examples/zero_copy.rs)。映射对象图使用独立的 archive 产品面。
+
+## 内存映射归档
+
+可选 `archive` feature 是基于 rkyv 经校验相对指针布局的独立存储格式。`build`
+生成 64 字节 RustBinary 包头，后接小端、32 位相对指针归档。包头记录格式版本、固定
+格式 flag、非零应用 schema ID，以及经过检查的 payload/文件长度。rkyv 版本已固定；
+归档布局依赖若发生不兼容升级，必须重新审查并升级 RustBinary 格式版本。
+
+`MappedArchive::open` 先检查文件大小上限，再一次性校验包头、schema、对齐及完整
+相对指针图；之后 `root()` 不分配、不反序列化。打开操作是 `unsafe`：映射存活期间，
+所有进程都必须保证文件不被修改或截断。生产发布应创建新文件并原子切换应用引用，
+绝不能原地更新已映射文件。schema ID 由应用管理，不兼容根布局变更后必须更新；它是
+身份检查，不是密码学认证。
+
+完整 [mmap_archive.rs](examples/mmap_archive.rs) 会创建新文件、释放构建缓冲区、只读
+映射、校验嵌套数据，并证明字符串、向量和子记录都直接位于映射区间内。
 
 ## 自适应编码
 
@@ -416,6 +436,7 @@ cargo doc --workspace --all-features --no-deps
 | [complete.rs](examples/complete.rs) | 全 feature 端到端组合 | `cargo run --example complete --all-features` |
 | [core_codec.rs](examples/core_codec.rs) | 有界 Core、调用方缓冲区、借用、尾随与错误策略 | `cargo run --example core_codec` |
 | [zero_copy.rs](examples/zero_copy.rs) | 嵌套借用和指针范围证明 | `cargo run --example zero_copy` |
+| [mmap_archive.rs](examples/mmap_archive.rs) | 经校验只读 mmap 对象图及指针证明 | `cargo run --example mmap_archive --features archive` |
 | [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | 自适应决策和调用方缓冲区 | `cargo run --example adaptive_zero_alloc --features adaptive` |
 | [secure_pipeline.rs](examples/secure_pipeline.rs) | 确定性 CBOR、压缩、AEAD | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
 | [schema_evolution.rs](examples/schema_evolution.rs) | Schema V1/V2 双向演进 | `cargo run --example schema_evolution --features schema-evolution` |
@@ -439,7 +460,7 @@ cargo doc --workspace --all-features --no-deps
 ## 当前非目标
 
 - 从序列化字节直接强转任意 Rust struct
-- 相对指针或自引用 mmap 对象图
+- 可变共享内存对象图或原地更新已映射文件
 - 把阻塞 I/O 包装成误导性的 async facade
 - 在核心 binary profile 中自动排序随机化 map
 - 在没有已实现且经硬件测试的内核时宣称 AVX-512/SVE 加速

@@ -73,6 +73,9 @@ pub mod adapters;
 #[cfg(feature = "adaptive")]
 /// Canonical data-aware encodings for strings and integer collections.
 pub mod adaptive;
+#[cfg(feature = "archive")]
+/// Validated relative-pointer archives for read-only memory mapping.
+pub mod archive;
 #[cfg(feature = "bit-packing")]
 /// Bit-level caller-buffer codecs and the [`BitPack`] contract.
 pub mod bitpack;

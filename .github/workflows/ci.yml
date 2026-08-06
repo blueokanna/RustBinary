@@ -25,6 +25,8 @@ jobs:
             command: cargo test --no-default-features --features protocol
           - profile: pipeline
             command: cargo test --no-default-features --features pipeline
+          - profile: archive
+            command: cargo test --no-default-features --features archive
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -37,6 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.87.0
       - run: cargo check -p rustbinary --lib --no-default-features
       - run: cargo check -p rustbinary --lib --no-default-features --features alloc
+      - run: cargo check -p rustbinary --lib --no-default-features --features archive
 
   quality:
     runs-on: ubuntu-latest
@@ -52,6 +55,7 @@ jobs:
         run: |
           cargo run --quiet --example core_codec
           cargo run --quiet --example zero_copy
+          cargo run --quiet --example mmap_archive --features archive
           cargo run --quiet --example adaptive_zero_alloc --features adaptive
           cargo run --quiet --example metadata --features bit-packing,derive,fingerprint,reflection,static-size
           cargo run --quiet --example schema_evolution --features schema-evolution

@@ -38,7 +38,7 @@ macros:
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rustbinary = { version = "0.1.3", features = [
+rustbinary = { version = "0.1.4", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -59,13 +59,13 @@ refer to `::rustbinary`:
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.3", features = [
+rustbinary = { version = "0.1.4", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.3"
+rustbinary-derive = "0.1.4"
 ```
 
 The `path` plus `version` dependency in the workspace is intentional. Local

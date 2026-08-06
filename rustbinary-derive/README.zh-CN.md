@@ -33,7 +33,7 @@ CBOR、压缩、加密或 Schema 演进时，应把它们和 Serde derive 组合
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rustbinary = { version = "0.1.3", features = [
+rustbinary = { version = "0.1.4", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -52,13 +52,13 @@ rustbinary = { version = "0.1.3", features = [
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.3", features = [
+rustbinary = { version = "0.1.4", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.3"
+rustbinary-derive = "0.1.4"
 ```
 
 workspace 中同时写 `path` 和 `version` 是有意设计的。本地构建使用路径，

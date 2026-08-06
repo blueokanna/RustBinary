@@ -12,6 +12,10 @@ The product surface is deliberately split into three layers:
 | **Protocol** | `rustbinary::protocol` | No | evolution, fingerprints, reflection, static bounds, bit packing, compatibility profiles |
 | **Pipeline** | `rustbinary::pipeline` | No | CBOR, compression, encryption, ordered parallel transforms |
 
+Read-only memory-mapped object storage is an independent, opt-in
+`rustbinary::archive` surface. It is not enabled by the Core, Protocol, or
+Pipeline bundles and does not change their wire formats or `no_std` boundary.
+
 [中文文档](README.zh-CN.md)
 
 ## Design Identity
@@ -44,7 +48,7 @@ format is not implied unless a profile explicitly documents it.
 | AVX-512, SVE, SME | Detection only | Reported by `hardware_capabilities`; no codec kernels are claimed |
 | Zero-allocation codec paths | Implemented | Exact-size Serde output and caller-owned adaptive decode buffers |
 | Borrowed zero-copy decoding | Implemented | Nested `&str` and `&[u8]` point directly into the input frame |
-| Relative-pointer object archive | Not implemented | The current wire format is a checked Serde stream, not an mmap object layout |
+| Read-only relative-pointer archive | Implemented behind `archive` | Versioned envelope, explicit schema ID, bounded validation, and in-place mmap access |
 | Bit packing | Implemented | `BitPacked` derive, checked widths, canonical zero padding |
 | Schema fingerprinting | Implemented | Type structure plus complete binary/CBOR configuration |
 | Compile-time bounds | Implemented | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}` |
@@ -61,23 +65,25 @@ format is not implied unless a profile explicitly documents it.
 | Async fiber/UFA | Not implemented | No fake async wrapper is exposed over blocking I/O |
 
 The distinction is deliberate: hardware detection is not described as hardware
-acceleration, and borrowed decoding is not described as a relative-pointer
-archive.
+acceleration, and the Serde codec and relative-pointer archive remain separate
+formats and APIs.
 
 ## Install
 
 ```toml
 [dependencies]
-rustbinary = "0.1.3"
+rustbinary = "0.1.4"
 serde = { version = "1", features = ["derive"] }
 ```
 
 Enable a complete optional layer only when it is actually needed:
 
 ```toml
-rustbinary = { version = "0.1.3", features = ["protocol"] }
+rustbinary = { version = "0.1.4", features = ["protocol"] }
 # or select only the exact capability:
-rustbinary = { version = "0.1.3", features = ["fingerprint", "derive"] }
+rustbinary = { version = "0.1.4", features = ["fingerprint", "derive"] }
+# or select immutable memory-mapped archives without the other layers:
+rustbinary = { version = "0.1.4", features = ["archive"] }
 ```
 
 The minimum supported Rust version is declared in `Cargo.toml`. Optional
@@ -94,6 +100,7 @@ Zstandard dependency requires a platform C toolchain.
 | `alloc` | Via `std` | Owned `Vec`/`String` APIs without requiring `std` |
 | `protocol` | No | Complete Protocol layer convenience bundle |
 | `pipeline` | No | Complete Pipeline layer convenience bundle |
+| `archive` | No | Validated read-only mmap archives; requires `std`, rkyv, and memmap2 |
 | `derive` | No | Re-exports procedural macros selected with their runtime feature |
 | `fingerprint` | No | Structural fingerprint runtime and frames |
 | `reflection` | No | Allocation-free reflection runtime |
@@ -232,9 +239,32 @@ buffers. Reader-based decoding requires `DeserializeOwned`; returning a
 reference into a temporary reader buffer would be unsound.
 
 Borrowed parsing is true zero-copy for borrowed string and byte payloads. It is
-not a relative-pointer mmap archive and does not cast arbitrary structs from
-untrusted memory. See [zero_copy.rs](examples/zero_copy.rs) for pointer-range
-assertions.
+the Serde stream path; [zero_copy.rs](examples/zero_copy.rs) contains its
+pointer-range assertions. Use the separate archive surface for mapped object
+graphs.
+
+## Memory-Mapped Archives
+
+The optional `archive` feature is a distinct storage format based on rkyv's
+validated relative-pointer layout. `build` creates a 64-byte RustBinary
+envelope followed by a little-endian archive with 32-bit relative pointers.
+The envelope records a format version, fixed format flags, a non-zero
+application schema ID, and checked payload/file lengths. rkyv is pinned because
+an incompatible archive-layout dependency update requires a RustBinary format
+version review.
+
+`MappedArchive::open` enforces the file-size limit, validates the envelope,
+schema, alignment, and complete relative-pointer graph once, then `root()`
+performs no allocation or deserialization. Opening is `unsafe`: every process
+must keep the mapped file immutable and untruncated for the mapping lifetime.
+Publish a new file and atomically switch application references; never update a
+mapped file in place. The schema ID is application-owned and must change after
+an incompatible root layout change. It is an identity check, not cryptographic
+authentication.
+
+The complete [mmap_archive.rs](examples/mmap_archive.rs) program writes a new
+file, drops the construction buffer, maps it read-only, validates nested data,
+and proves that strings, vectors, and child records point inside the mapping.
 
 ## Adaptive Encoding
 
@@ -500,6 +530,7 @@ calibrated samples and prints the median as raw Markdown.
 | [complete.rs](examples/complete.rs) | End-to-end all-feature composition | `cargo run --example complete --all-features` |
 | [core_codec.rs](examples/core_codec.rs) | Bounded Core, caller buffers, borrowing, trailing and error policy | `cargo run --example core_codec` |
 | [zero_copy.rs](examples/zero_copy.rs) | Nested borrowing and pointer proof | `cargo run --example zero_copy` |
+| [mmap_archive.rs](examples/mmap_archive.rs) | Validated read-only mmap object graph and pointer proof | `cargo run --example mmap_archive --features archive` |
 | [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | Adaptive decisions and caller buffers | `cargo run --example adaptive_zero_alloc --features adaptive` |
 | [secure_pipeline.rs](examples/secure_pipeline.rs) | Deterministic CBOR, compression, AEAD | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
 | [schema_evolution.rs](examples/schema_evolution.rs) | Bidirectional schema V1/V2 | `cargo run --example schema_evolution --features schema-evolution` |
@@ -526,7 +557,7 @@ IDs.
 ## Current Non-Goals
 
 - Casting arbitrary Rust structs directly from serialized memory
-- Relative-pointer or self-referential mmap object graphs
+- Mutable shared-memory object graphs or in-place updates to mapped files
 - Wrapping blocking I/O in a misleading async facade
 - Automatically sorting randomized maps in the core profile
 - Claiming AVX-512/SVE acceleration without tested kernels
