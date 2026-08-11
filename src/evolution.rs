@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 use alloc::vec::Vec;
 
 use crate::{Config, Error, Result, TrailingBytes};
@@ -162,7 +160,7 @@ impl FieldEncoder {
     }
 
     /// Serializes one field under its permanent numeric identifier.
-    pub fn field<T: Serialize + ?Sized>(&mut self, id: u32, value: &T) -> Result<()> {
+    pub fn field<T: nextjson::NsonSerialize + ?Sized>(&mut self, id: u32, value: &T) -> Result<()> {
         if self.fields.iter().any(|field| field.id == id) {
             return Err(Error::SchemaEvolution("duplicate field ID"));
         }
@@ -239,13 +237,13 @@ pub struct FieldDecoder<'de> {
 
 impl<'de> FieldDecoder<'de> {
     /// Decodes a required field and reports a missing-field error.
-    pub fn required<T: Deserialize<'de>>(&mut self, id: u32) -> Result<T> {
+    pub fn required<T: nextjson::NsonDeserialize<'de>>(&mut self, id: u32) -> Result<T> {
         self.optional(id)?
             .ok_or(Error::SchemaEvolution("required field is missing"))
     }
 
     /// Decodes an optional field, returning `None` when it is absent.
-    pub fn optional<T: Deserialize<'de>>(&mut self, id: u32) -> Result<Option<T>> {
+    pub fn optional<T: nextjson::NsonDeserialize<'de>>(&mut self, id: u32) -> Result<Option<T>> {
         let Ok(index) = self.fields.binary_search_by_key(&id, |field| field.id) else {
             return Ok(None);
         };
@@ -258,7 +256,10 @@ impl<'de> FieldDecoder<'de> {
     }
 
     /// Decodes a field or returns its type's default when absent.
-    pub fn or_default<T: Deserialize<'de> + Default>(&mut self, id: u32) -> Result<T> {
+    pub fn or_default<T: nextjson::NsonDeserialize<'de> + Default>(
+        &mut self,
+        id: u32,
+    ) -> Result<T> {
         Ok(self.optional(id)?.unwrap_or_default())
     }
 

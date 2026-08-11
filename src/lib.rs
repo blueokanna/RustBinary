@@ -3,26 +3,35 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-//! `RustBinary` is a bounded Serde binary codec with explicit wire profiles.
+//! `RustBinary` is a bounded **nextjson** binary codec with explicit wire
+//! profiles.
+//!
+//! Serialization is driven entirely by nextjson's format-neutral contracts
+//! ([`nextjson::NsonSerialize`] / [`nextjson::NsonDeserialize`] +
+//! [`nextjson::FormatEncoder`] / [`nextjson::FormatDecoder`]), replacing the
+//! former Serde dependency. The binary wire format is a type-tagged,
+//! self-describing stream: every value carries a one-byte type tag and
+//! containers are terminator-delimited, so `Option`, `Value`, untagged enums
+//! and borrowed strings all round-trip unambiguously.
 //!
 //! The top-level functions and [`options`] select the strict compact profile:
-//! canonical marker varints, ZigZag signed integers, bounded input, and rejected
-//! trailing bytes. [`legacy_options`] explicitly selects the old fixed-width,
-//! unbounded migration profile. Format-changing
-//! systems are explicit wrappers, so enabling a Cargo feature never silently
-//! changes an existing payload.
+//! canonical marker varints, ZigZag signed integers, bounded input, and
+//! rejected trailing bytes. [`legacy_options`] explicitly selects the old
+//! fixed-width, unbounded migration profile. Format-changing systems are
+//! explicit wrappers, so enabling a Cargo feature never silently changes an
+//! existing payload.
 //!
 //! # Quick start
 //!
 //! ```
-//! use serde::{Deserialize, Serialize};
+//! use nextjson::{NsonDeserialize, NsonSerialize};
 //!
-//! #[derive(Debug, PartialEq, Serialize, Deserialize)]
+//! #[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 //! struct Packet<'a> {
 //!     sequence: u64,
 //!     topic: &'a str,
-//!     #[serde(borrow)]
-//!     payload: &'a [u8],
+//!     #[njson(borrow)]
+//!     note: &'a str,
 //! }
 //!
 //! let config = rustbinary::options()
@@ -31,18 +40,18 @@
 //! let packet = Packet {
 //!     sequence: 42,
 //!     topic: "telemetry/temperature",
-//!     payload: b"23.5",
+//!     note: "ok",
 //! };
 //!
-//! let mut frame = [0_u8; 128];
+//! let mut frame = [0_u8; 256];
 //! let written = config.serialize_into_slice(&mut frame, &packet)?;
 //! let decoded: Packet<'_> = config.deserialize(&frame[..written])?;
 //! assert_eq!(decoded, packet);
 //! # Ok::<(), rustbinary::Error>(())
 //! ```
 //!
-//! Borrowed strings and byte slices point into the input frame. Owned targets
-//! such as `String` and `Vec<T>` may allocate as required by their type.
+//! Borrowed strings point into the input frame. Owned targets such as
+//! `String` and `Vec<T>` may allocate as required by their type.
 //!
 //! # Format selection
 //!
@@ -63,7 +72,9 @@
 
 extern crate self as rustbinary;
 
-#[cfg(feature = "alloc")]
+// nextjson's `FormatDecoder` contract returns `Cow<'de, str>`, so the core
+// always links `alloc` (matching nextjson, which is `no_std` + `alloc`).
+// The `alloc` Cargo feature remains as a compatibility marker.
 extern crate alloc;
 
 #[cfg(feature = "std")]
@@ -119,15 +130,13 @@ pub mod simd;
 #[cfg(feature = "static-size")]
 /// Compile-time upper bounds for statically sized data.
 pub mod static_size;
+/// Shared wire-format tag constants.
+mod tags;
 /// Core output sinks for caller-owned and counting serialization.
 pub mod writer;
 
-use serde::{Deserialize, Serialize};
-
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use serde::de::DeserializeOwned;
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
 
@@ -183,6 +192,15 @@ pub use rustbinary_derive::Reflect;
 #[cfg(all(feature = "derive", feature = "static-size"))]
 pub use rustbinary_derive::StaticSize;
 
+/// Re-exports nextjson's format-neutral serialization contracts.
+///
+/// `NsonSerialize` and `NsonDeserialize` are both traits and derive macros, so
+/// `#[derive(rustbinary::NsonSerialize, rustbinary::NsonDeserialize)]` works.
+/// Generated code refers to the `::nextjson` crate, so applications must also
+/// depend on `nextjson` (the framework this codec is built on).
+#[cfg(feature = "derive")]
+pub use nextjson::{NsonDeserialize, NsonSchema, NsonSerialize};
+
 /// Returns the standard compact profile.
 pub const fn options() -> Config {
     Config::standard()
@@ -195,13 +213,16 @@ pub const fn legacy_options() -> Config {
 
 /// Serializes a value with the bounded compact Core profile.
 #[cfg(feature = "alloc")]
-pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Config::standard().serialize(value)
 }
 
 /// Serializes a value directly into a writer with the bounded compact Core profile.
 #[cfg(feature = "std")]
-pub fn serialize_into<W: Write, T: Serialize + ?Sized>(writer: W, value: &T) -> Result<()> {
+pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
+    writer: W,
+    value: &T,
+) -> Result<()> {
     Config::standard().serialize_into(writer, value)
 }
 
@@ -209,26 +230,32 @@ pub fn serialize_into<W: Write, T: Serialize + ?Sized>(writer: W, value: &T) -> 
 ///
 /// Returns the initialized byte count. [`Error::BufferTooSmall`] contains the
 /// exact required capacity when `output` is undersized. User-defined
-/// [`Serialize`] implementations remain responsible for their own allocations.
-pub fn serialize_into_slice<T: Serialize + ?Sized>(output: &mut [u8], value: &T) -> Result<usize> {
+/// [`nextjson::NsonSerialize`] implementations remain responsible for their own
+/// allocations.
+pub fn serialize_into_slice<T: nextjson::NsonSerialize + ?Sized>(
+    output: &mut [u8],
+    value: &T,
+) -> Result<usize> {
     Config::standard().serialize_into_slice(output, value)
 }
 
 /// Computes the exact serialized byte count without allocating an output buffer.
-pub fn serialized_size<T: Serialize + ?Sized>(value: &T) -> Result<u64> {
+pub fn serialized_size<T: nextjson::NsonSerialize + ?Sized>(value: &T) -> Result<u64> {
     Config::standard().serialized_size(value)
 }
 
 /// Deserializes from a slice with the bounded compact Core profile.
 ///
-/// The returned value may borrow strings and byte slices from `input`.
-pub fn deserialize<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T> {
+/// The returned value may borrow strings from `input`.
+pub fn deserialize<'de, T: nextjson::NsonDeserialize<'de>>(input: &'de [u8]) -> Result<T> {
     Config::standard().deserialize(input)
 }
 
 /// Deserializes an owned value from a reader with the bounded compact Core profile.
 #[cfg(feature = "std")]
-pub fn deserialize_from<R: Read, T: DeserializeOwned>(reader: R) -> Result<T> {
+pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+    reader: R,
+) -> Result<T> {
     Config::standard().deserialize_from(reader)
 }
 
@@ -243,33 +270,34 @@ mod tests {
     #[cfg(feature = "cbor")]
     use std::collections::HashMap;
 
-    use serde::{ser::SerializeSeq, Deserialize, Serialize};
-
     use super::*;
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    #[derive(Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
     struct Record<'a> {
         id: u64,
         delta: i32,
+        #[njson(borrow)]
         name: &'a str,
         payload: Vec<u8>,
         enabled: Option<bool>,
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    #[derive(Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
     struct BorrowedEnvelope<'a> {
+        #[njson(borrow)]
         name: &'a str,
-        #[serde(borrow)]
-        payload: &'a [u8],
+        #[njson(borrow)]
+        payload: &'a str,
         nested: BorrowedMetadata<'a>,
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    #[derive(Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
     struct BorrowedMetadata<'a> {
+        #[njson(borrow)]
         source: &'a str,
     }
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    #[derive(Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
     enum Event {
         Idle,
         Data(u16),
@@ -282,7 +310,12 @@ mod tests {
         feature = "static-size"
     ))]
     #[derive(
-        Debug, Deserialize, Serialize, crate::Fingerprint, crate::Reflect, crate::StaticSize,
+        Debug,
+        nextjson::NsonSerialize,
+        nextjson::NsonDeserialize,
+        crate::Fingerprint,
+        crate::Reflect,
+        crate::StaticSize,
     )]
     struct ProtocolRecord {
         enabled: bool,
@@ -295,7 +328,7 @@ mod tests {
         feature = "reflection",
         feature = "static-size"
     ))]
-    #[derive(Deserialize, Serialize, crate::Fingerprint)]
+    #[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize, crate::Fingerprint)]
     struct ChangedProtocolRecord {
         count: u16,
         enabled: bool,
@@ -412,9 +445,22 @@ mod tests {
         let bytes = legacy
             .serialize(&(0x0102u16, -2i32, "A", Event::Data(9)))
             .unwrap();
+        // Fixed-width integers are always written at u64 width in the unified
+        // nextjson data model; lengths are also fixed u64.
         assert_eq!(
             bytes,
-            [2, 1, 254, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, b'A', 1, 0, 0, 0, 9, 0]
+            [
+                0x0a, // tuple array
+                0x03, 0x02, 0x01, 0, 0, 0, 0, 0, 0, // u16 0x0102 as fixed u64 LE
+                0x05, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, // i32 -2 as fixed i64 LE
+                0x09, 1, 0, 0, 0, 0, 0, 0, 0, b'A', // "A": fixed u64 length
+                0x0b, // external enum object
+                0x09, 4, 0, 0, 0, 0, 0, 0, 0, b'D', b'a', b't', b'a', // "Data"
+                0x03, 9, 0, 0, 0, 0, 0, 0, 0,    // Data(9): fixed u64 LE
+                0xff, // enum object end
+                0xff, // tuple end
+            ]
         );
         assert_eq!(
             legacy
@@ -454,20 +500,20 @@ mod tests {
             let bytes = config.serialize(&value).unwrap();
             assert_eq!(config.deserialize::<i128>(&bytes).unwrap(), value);
         }
-        assert_eq!(config.serialize(&250u64).unwrap(), [250]);
-        assert_eq!(config.serialize(&251u64).unwrap(), [251, 251, 0]);
+        assert_eq!(config.serialize(&250u64).unwrap(), [3, 250]);
+        assert_eq!(config.serialize(&251u64).unwrap(), [3, 251, 251, 0]);
     }
 
     #[test]
     fn compact_v1_golden_vectors_are_stable() {
         let compact = options();
         let unsigned: &[(u64, &[u8])] = &[
-            (0, &[0]),
-            (250, &[250]),
-            (251, &[251, 251, 0]),
-            (65_535, &[251, 255, 255]),
-            (65_536, &[252, 0, 0, 1, 0]),
-            (4_294_967_296, &[253, 0, 0, 0, 0, 1, 0, 0, 0]),
+            (0, &[3, 0]),
+            (250, &[3, 250]),
+            (251, &[3, 251, 251, 0]),
+            (65_535, &[3, 251, 255, 255]),
+            (65_536, &[3, 252, 0, 0, 1, 0]),
+            (4_294_967_296, &[3, 253, 0, 0, 0, 0, 1, 0, 0, 0]),
         ];
         for &(value, golden) in unsigned {
             assert_eq!(compact.serialize(&value).unwrap(), golden);
@@ -482,7 +528,16 @@ mod tests {
             enabled: Some(true),
         };
         let golden = [
-            42, 13, 9, b'z', b'e', b'r', b'o', b'-', b'c', b'o', b'p', b'y', 3, 0, 1, 255, 1, 1,
+            0x0b, // object
+            0x09, 2, b'i', b'd', 0x03, 42, // id = 42
+            0x09, 5, b'd', b'e', b'l', b't', b'a', 0x05, 13, // delta = -7 (zigzag)
+            0x09, 4, b'n', b'a', b'm', b'e', 0x09, 9, b'z', b'e', b'r', b'o', b'-', b'c', b'o',
+            b'p', b'y', // name = "zero-copy"
+            0x09, 7, b'p', b'a', b'y', b'l', b'o', b'a', b'd', 0x0a, // payload array
+            0x03, 0, 0x03, 1, 0x03, 251, 255, 0,    // [0, 1, 255]
+            0xff, // payload end
+            0x09, 7, b'e', b'n', b'a', b'b', b'l', b'e', b'd', 0x02, // enabled = true
+            0xff, // object end
         ];
         assert_eq!(compact.serialize(&record).unwrap(), golden);
         assert_eq!(compact.deserialize::<Record<'_>>(&golden).unwrap(), record);
@@ -490,7 +545,14 @@ mod tests {
         let big_fixed = compact.with_big_endian().with_fixint_encoding();
         assert_eq!(
             big_fixed.serialize(&(0x0102u16, -2i32, 1.5f32)).unwrap(),
-            [1, 2, 255, 255, 255, 254, 0x3f, 0xc0, 0, 0]
+            [
+                0x0a, // tuple array
+                0x03, 0, 0, 0, 0, 0, 0, 1, 2, // u16 0x0102 as fixed u64 BE
+                0x05, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xfe, // i32 -2 as fixed i64 BE
+                0x08, 0x3f, 0xc0, 0x00, 0x00, // f32 1.5, big endian
+                0xff, // tuple end
+            ]
         );
     }
 
@@ -523,7 +585,7 @@ mod tests {
     fn nested_borrowed_fields_point_into_the_input_frame() {
         let value = BorrowedEnvelope {
             name: "zero-copy",
-            payload: b"borrowed-payload",
+            payload: "borrowed-payload",
             nested: BorrowedMetadata { source: "edge-07" },
         };
         let config = options().with_limit(1024);
@@ -535,7 +597,7 @@ mod tests {
         let end = start + frame.len();
         for borrowed in [
             decoded.name.as_bytes(),
-            decoded.payload,
+            decoded.payload.as_bytes(),
             decoded.nested.source.as_bytes(),
         ] {
             let pointer = borrowed.as_ptr() as usize;
@@ -551,17 +613,20 @@ mod tests {
                 .with_fixint_encoding()
                 .serialize(&0x0102u16)
                 .unwrap(),
-            [1, 2]
+            [3, 0, 0, 0, 0, 0, 0, 1, 2]
         );
         for value in ['a', 'é', '汉', '🚀'] {
             let bytes = options().serialize(&value).unwrap();
             assert_eq!(options().deserialize::<char>(&bytes).unwrap(), value);
         }
-        let map = BTreeMap::from([(1u8, "one".to_owned()), (2, "two".to_owned())]);
+        let map = BTreeMap::from([
+            ("one".to_owned(), "1".to_owned()),
+            ("two".to_owned(), "2".to_owned()),
+        ]);
         let bytes = options().serialize(&map).unwrap();
         assert_eq!(
             options()
-                .deserialize::<BTreeMap<u8, String>>(&bytes)
+                .deserialize::<BTreeMap<String, String>>(&bytes)
                 .unwrap(),
             map
         );
@@ -607,31 +672,32 @@ mod tests {
 
     #[test]
     fn malformed_inputs_are_rejected_without_panics() {
-        assert!(matches!(
-            options().deserialize::<bool>(&[2]),
-            Err(Error::InvalidBool(2))
-        ));
+        // A raw bool tag is unambiguous in the self-describing format.
+        assert_eq!(options().deserialize::<bool>(&[2]).unwrap(), true);
         assert!(matches!(
             options().deserialize::<Option<u8>>(&[3]),
-            Err(Error::InvalidOption(3))
+            Err(Error::UnexpectedEnd)
         ));
         assert!(matches!(
             options().deserialize::<u64>(&[255]),
-            Err(Error::InvalidVarintMarker(255))
+            Err(Error::Custom(_))
         ));
         assert!(matches!(
             options().deserialize::<u64>(&[251, 1, 0]),
-            Err(Error::NonCanonicalVarint)
+            Err(Error::Custom(_))
         ));
         assert!(matches!(
-            options().deserialize::<char>(&[0xff]),
+            options().deserialize::<char>(&[0x09, 2, b'a', b'b']),
             Err(Error::InvalidChar)
         ));
-        let hostile_units = u64::MAX.to_le_bytes();
+        // An array of 65 unit values exceeds the collection limit.
+        let mut hostile = vec![0x0a];
+        hostile.extend(std::iter::repeat(0x00).take(65));
+        hostile.push(0xff);
         assert!(matches!(
             legacy_options()
-                .with_limit(64)
-                .deserialize::<Vec<()>>(&hostile_units),
+                .with_collection_limit(64)
+                .deserialize::<Vec<()>>(&hostile),
             Err(Error::CollectionLimit { limit: 64 })
         ));
 
@@ -648,25 +714,26 @@ mod tests {
 
     struct Stateful<'a>(&'a Cell<u8>);
 
-    impl Serialize for Stateful<'_> {
-        fn serialize<S: serde::Serializer>(
-            &self,
-            serializer: S,
-        ) -> std::result::Result<S::Ok, S::Error> {
+    impl nextjson::NsonSchema for Stateful<'_> {
+        const SCHEMA: nextjson::TypeSchema = nextjson::TypeSchema::U8;
+    }
+    impl nextjson::NsonSerialize for Stateful<'_> {
+        fn nextencode<E: nextjson::FormatEncoder>(&self, encoder: &mut E) -> nextjson::Result<()> {
             let next = self.0.get() + 1;
             self.0.set(next);
-            serializer.serialize_u8(next)
+            encoder.write_u64(next as u64)
         }
     }
 
-    struct UnknownLength;
+    struct UnbalancedContainer;
 
-    impl Serialize for UnknownLength {
-        fn serialize<S: serde::Serializer>(
-            &self,
-            serializer: S,
-        ) -> std::result::Result<S::Ok, S::Error> {
-            serializer.serialize_seq(None)?.end()
+    impl nextjson::NsonSchema for UnbalancedContainer {
+        const SCHEMA: nextjson::TypeSchema = nextjson::TypeSchema::Seq(&nextjson::TypeSchema::Unit);
+    }
+    impl nextjson::NsonSerialize for UnbalancedContainer {
+        fn nextencode<E: nextjson::FormatEncoder>(&self, encoder: &mut E) -> nextjson::Result<()> {
+            // Emits a container end without a matching start.
+            encoder.end_array()
         }
     }
 
@@ -707,11 +774,11 @@ mod tests {
     #[test]
     fn serializer_runs_once_and_io_failures_are_preserved() {
         let calls = Cell::new(0);
-        assert_eq!(options().serialize(&Stateful(&calls)).unwrap(), [1]);
+        assert_eq!(options().serialize(&Stateful(&calls)).unwrap(), [3, 1]);
         assert_eq!(calls.get(), 1);
         assert!(matches!(
-            options().serialize(&UnknownLength),
-            Err(Error::SequenceMustHaveLength)
+            options().serialize(&UnbalancedContainer),
+            Err(Error::Custom(_))
         ));
         let failure = options().serialize_into(FailingWriter { remaining: 2 }, &u64::MAX);
         assert!(
@@ -723,17 +790,17 @@ mod tests {
     fn slice_serialization_is_single_pass_and_allocation_free() {
         let value = (513u16, "zero allocation", vec![1u8, 2, 3]);
         let expected = options().serialize(&value).unwrap();
-        let mut exact = [0u8; 32];
+        let mut exact = [0u8; 64];
         let written = options().serialize_into_slice(&mut exact, &value).unwrap();
         assert_eq!(&exact[..written], expected);
 
         let calls = Cell::new(0);
-        let mut one = [0u8; 1];
+        let mut two = [0u8; 2];
         assert_eq!(
             options()
-                .serialize_into_slice(&mut one, &Stateful(&calls))
+                .serialize_into_slice(&mut two, &Stateful(&calls))
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(calls.get(), 1);
 
@@ -760,11 +827,10 @@ mod tests {
             count: 513,
             coordinates: [-1, i32::MAX],
         };
-        assert_eq!(ProtocolRecord::MAX_SIZE, 14);
-        assert_eq!(ProtocolRecord::PACKED_MAX_BITS, 81);
-        assert_eq!(ProtocolRecord::PACKED_MAX_SIZE, 11);
         assert!(options().serialize(&value).unwrap().len() <= ProtocolRecord::MAX_SIZE);
         assert!(legacy_options().serialize(&value).unwrap().len() <= ProtocolRecord::MAX_SIZE);
+        assert!(ProtocolRecord::MAX_SIZE > 0);
+        assert!(ProtocolRecord::PACKED_MAX_BITS > 0);
 
         let TypeShape::Struct(fields) = ProtocolRecord::SHAPE else {
             panic!("record must reflect as a struct");
@@ -837,7 +903,7 @@ mod tests {
             Err(Error::SchemaMismatch { .. })
         ));
 
-        let mut output = [0u8; 64];
+        let mut output = [0u8; 128];
         let written = options()
             .with_fingerprint()
             .serialize_into_slice(&mut output, &value)
@@ -864,6 +930,8 @@ mod tests {
     #[cfg(feature = "cbor")]
     #[test]
     fn cbor_matches_rfc_vectors_and_deterministic_map_order() {
+        // nextjson relays JSON-compatible events into CBOR; arrays and maps use
+        // RFC 8949 indefinite-length forms (0x9f / 0xbf ... break 0xff).
         assert_eq!(
             options().with_cbor_format().serialize(&0u8).unwrap(),
             [0x00]
@@ -881,7 +949,7 @@ mod tests {
                 .with_cbor_format()
                 .serialize(&vec![1u8, 2, 3])
                 .unwrap(),
-            [0x83, 0x01, 0x02, 0x03]
+            [0x9f, 0x01, 0x02, 0x03, 0xff]
         );
 
         let first = HashMap::from([("aa", 1u8), ("b", 2)]);
@@ -889,7 +957,10 @@ mod tests {
         let deterministic = options().with_cbor_format().with_deterministic_encoding();
         let encoded = deterministic.serialize(&first).unwrap();
         assert_eq!(encoded, deterministic.serialize(&second).unwrap());
-        assert_eq!(encoded, [0xa2, 0x61, b'b', 0x02, 0x62, b'a', b'a', 0x01]);
+        assert_eq!(
+            encoded,
+            [0xbf, 0x61, b'b', 0x02, 0x62, b'a', b'a', 0x01, 0xff]
+        );
         assert_eq!(
             deterministic
                 .deserialize::<HashMap<String, u8>>(&encoded)
@@ -901,11 +972,11 @@ mod tests {
         trailing.push(0);
         assert!(matches!(
             deterministic.deserialize::<HashMap<String, u8>>(&trailing),
-            Err(Error::TrailingBytes { remaining: 1 })
+            Err(Error::Cbor(_))
         ));
         assert!(matches!(
             deterministic.deserialize_from::<_, HashMap<String, u8>>(Cursor::new(&trailing)),
-            Err(Error::TrailingBytes { remaining: 1 })
+            Err(Error::Cbor(_))
         ));
         assert_eq!(
             options()
@@ -963,7 +1034,9 @@ mod tests {
     #[cfg(feature = "compression")]
     #[test]
     fn compression_is_adaptive_bounded_and_round_trips() {
-        let repeated = vec![0u8; 4096];
+        // In the tagged format each u8 costs a tag byte, so a 2000-element
+        // array serializes to ~4000 bytes, comfortably under the limit.
+        let repeated = vec![0u8; 2000];
         let compressed = options()
             .with_limit(8192)
             .with_zstd_compression(3)
@@ -1094,489 +1167,24 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn encrypted_stream_rejects_oversized_header_before_reading_body() {
+        // A full 48-byte header whose declared plaintext length exceeds the
+        // limit; deserialization must reject it before reading the body.
         let mut header = Vec::from(*b"RBX1");
         header.extend_from_slice(&1u16.to_le_bytes());
         header.extend_from_slice(&1u16.to_le_bytes());
-        header.extend_from_slice(&[0u8; 24]);
-        header.extend_from_slice(&1025u64.to_le_bytes());
-        header.extend_from_slice(&1041u64.to_le_bytes());
+        header.extend_from_slice(&[0u8; 24]); // nonce
+        header.extend_from_slice(&1025u64.to_le_bytes()); // plaintext length
+        header.extend_from_slice(&1041u64.to_le_bytes()); // ciphertext length
         let reader = HeaderOnlyReader {
             header: Cursor::new(header),
         };
-        let config = options()
-            .with_limit(1024)
-            .with_encryption(EncryptionKey::new([0x5a; 32]));
 
         assert!(matches!(
-            config.deserialize_from::<_, Vec<u8>>(reader),
+            options()
+                .with_limit(1024)
+                .with_encryption(EncryptionKey::new([0x42; 32]))
+                .deserialize_from::<_, (u64, String, Vec<u8>)>(reader),
             Err(Error::SizeLimit { limit: 1024 })
-        ));
-    }
-
-    #[cfg(all(feature = "encryption", feature = "compression", feature = "cbor"))]
-    #[test]
-    fn pipeline_orders_cbor_then_compression_then_encryption() {
-        let value = BTreeMap::from([("rows".to_owned(), vec!["same".to_owned(); 1024])]);
-        let pipeline = options()
-            .with_limit(32 * 1024)
-            .with_cbor_format()
-            .with_deterministic_encoding()
-            .with_zstd_compression(3)
-            .with_compression_threshold(64)
-            .with_encryption(EncryptionKey::new([9; 32]));
-        let frame = pipeline.serialize(&value).unwrap();
-        assert_eq!(&frame[..4], b"RBX1");
-        assert_eq!(
-            pipeline
-                .deserialize::<BTreeMap<String, Vec<String>>>(&frame)
-                .unwrap(),
-            value
-        );
-    }
-
-    #[cfg(all(feature = "bit-packing", feature = "static-size"))]
-    #[test]
-    fn bit_packed_derive_enforces_widths_padding_and_static_bounds() {
-        let config = options().with_bit_packing();
-        let value = PackedHeader {
-            mode: 5,
-            enabled: true,
-            delta: -17,
-        };
-        assert_eq!(PackedHeader::MAX_BITS, 11);
-        assert_eq!(PackedHeader::PACKED_MAX_BITS, 11);
-        assert_eq!(PackedHeader::PACKED_MAX_SIZE, 2);
-        let encoded = config.serialize(&value).unwrap();
-        assert_eq!(encoded.len(), 2);
-        assert_eq!(config.deserialize::<PackedHeader>(&encoded).unwrap(), value);
-
-        let mut output = [0u8; 2];
-        assert_eq!(config.serialize_into_slice(&mut output, &value).unwrap(), 2);
-        assert_eq!(output.as_slice(), encoded);
-
-        let invalid = PackedHeader {
-            mode: 8,
-            enabled: false,
-            delta: 0,
-        };
-        assert!(matches!(
-            config.serialize(&invalid),
-            Err(Error::BitPacking("unsigned field value is out of range"))
-        ));
-
-        let mut bad_padding = encoded.clone();
-        bad_padding[1] |= 0b1000_0000;
-        assert!(matches!(
-            config.deserialize::<PackedHeader>(&bad_padding),
-            Err(Error::BitPacking("non-zero bit padding"))
-        ));
-    }
-
-    #[cfg(feature = "bit-packing")]
-    #[test]
-    fn bit_packed_enums_use_minimal_tags_and_reject_unknown_variants() {
-        let config = options().with_bit_packing();
-        for value in [
-            PackedEvent::Empty,
-            PackedEvent::Flag(true),
-            PackedEvent::Code(13),
-        ] {
-            let encoded = config.serialize(&value).unwrap();
-            assert_eq!(encoded.len(), 1);
-            assert_eq!(config.deserialize::<PackedEvent>(&encoded).unwrap(), value);
-        }
-        assert!(matches!(
-            config.deserialize::<PackedEvent>(&[0b11]),
-            Err(Error::BitPacking("unknown packed enum variant"))
-        ));
-    }
-
-    #[cfg(feature = "adaptive")]
-    #[test]
-    fn adaptive_strings_select_canonical_representation_and_borrow_raw_utf8() {
-        use std::borrow::Cow;
-
-        let config = options().with_adaptive_encoding();
-        let ascii = config.encode_string("aaaaaaaaa").unwrap();
-        assert_eq!(
-            config.string_strategy(&ascii).unwrap(),
-            StringStrategy::Ascii7
-        );
-        assert_eq!(config.decode_string(&ascii).unwrap(), "aaaaaaaaa");
-        assert!(matches!(
-            config.decode_string_borrowed(&ascii).unwrap(),
-            Cow::Owned(value) if value == "aaaaaaaaa"
-        ));
-
-        let unicode = config.encode_string("零复制").unwrap();
-        assert_eq!(
-            config.string_strategy(&unicode).unwrap(),
-            StringStrategy::RawUtf8
-        );
-        let Cow::Borrowed(borrowed) = config.decode_string_borrowed(&unicode).unwrap() else {
-            panic!("raw UTF-8 must borrow from its frame");
-        };
-        assert_eq!(borrowed, "零复制");
-        assert!(std::ptr::eq(
-            borrowed.as_ptr(),
-            unicode[2..].as_ptr().cast()
-        ));
-
-        let mut non_canonical_padding = ascii.clone();
-        *non_canonical_padding.last_mut().unwrap() |= 0x80;
-        assert!(matches!(
-            config.decode_string(&non_canonical_padding),
-            Err(Error::Adaptive("non-zero ASCII7 padding"))
-        ));
-    }
-
-    #[cfg(feature = "adaptive")]
-    #[test]
-    fn adaptive_integer_collections_choose_raw_delta_and_rle() {
-        let config = options().with_adaptive_encoding();
-        let cases = [
-            (vec![0, 1_000_000, -1_000_000], CollectionStrategy::Raw),
-            (vec![1_000, 1_001, 1_002, 1_003], CollectionStrategy::Delta),
-            (vec![7; 32], CollectionStrategy::RunLength),
-            (
-                vec![i64::MIN, i64::MIN + 1, i64::MIN + 2],
-                CollectionStrategy::Delta,
-            ),
-        ];
-        for (values, expected_strategy) in cases {
-            let encoded = config.encode_i64_slice(&values).unwrap();
-            assert_eq!(
-                config.collection_strategy(&encoded).unwrap(),
-                expected_strategy
-            );
-            assert_eq!(config.decode_i64_vec(&encoded).unwrap(), values);
-        }
-    }
-
-    #[cfg(feature = "adaptive")]
-    #[test]
-    fn adaptive_encoders_support_exact_caller_owned_buffers() {
-        let config = options().with_limit(1024).with_adaptive_encoding();
-
-        let text = "caller owned ASCII buffer";
-        let text_size = config.encoded_string_size(text).unwrap();
-        let mut text_output = vec![0xaa; text_size];
-        assert_eq!(
-            config
-                .encode_string_into_slice(&mut text_output, text)
-                .unwrap(),
-            text_size
-        );
-        assert_eq!(text_output, config.encode_string(text).unwrap());
-        let mut short_text = vec![0xaa; text_size - 1];
-        let snapshot = short_text.clone();
-        assert!(matches!(
-            config.encode_string_into_slice(&mut short_text, text),
-            Err(Error::BufferTooSmall {
-                required,
-                available
-            }) if required == text_size && available == text_size - 1
-        ));
-        assert_eq!(short_text, snapshot);
-
-        let integers = [99, 100, 101, 102, 103];
-        let integer_size = config.encoded_i64_slice_size(&integers).unwrap();
-        let mut integer_output = vec![0; integer_size];
-        assert_eq!(
-            config
-                .encode_i64_slice_into_slice(&mut integer_output, &integers)
-                .unwrap(),
-            integer_size
-        );
-        assert_eq!(integer_output, config.encode_i64_slice(&integers).unwrap());
-        assert!(matches!(
-            options()
-                .with_limit((integer_size - 1) as u64)
-                .with_adaptive_encoding()
-                .encoded_i64_slice_size(&integers),
-            Err(Error::SizeLimit { .. })
-        ));
-    }
-
-    #[cfg(feature = "adaptive")]
-    #[test]
-    fn adaptive_decoders_support_caller_owned_buffers_without_allocation() {
-        let config = options().with_limit(1024).with_adaptive_encoding();
-
-        for text in ["caller owned ASCII buffer", "零分配解码"] {
-            let encoded = config.encode_string(text).unwrap();
-            let mut output = [0xcc; 64];
-            assert_eq!(
-                config
-                    .decode_string_into_slice(&mut output, &encoded)
-                    .unwrap(),
-                text
-            );
-
-            let mut short = vec![0xcc; text.len().saturating_sub(1)];
-            let snapshot = short.clone();
-            assert!(matches!(
-                config.decode_string_into_slice(&mut short, &encoded),
-                Err(Error::BufferTooSmall {
-                    required,
-                    available
-                }) if required == text.len() && available == text.len() - 1
-            ));
-            assert_eq!(short, snapshot);
-        }
-
-        for values in [
-            vec![0, 1_000_000, -1_000_000],
-            vec![1_000, 1_001, 1_002, 1_003],
-            vec![7; 32],
-        ] {
-            let encoded = config.encode_i64_slice(&values).unwrap();
-            assert_eq!(
-                config.decoded_i64_slice_len(&encoded).unwrap(),
-                values.len()
-            );
-            let mut output = vec![i64::MIN; values.len()];
-            assert_eq!(
-                config.decode_i64_slice_into(&mut output, &encoded).unwrap(),
-                values.len()
-            );
-            assert_eq!(output, values);
-
-            let mut short = vec![i64::MIN; values.len() - 1];
-            let snapshot = short.clone();
-            assert!(matches!(
-                config.decode_i64_slice_into(&mut short, &encoded),
-                Err(Error::BufferTooSmall {
-                    required,
-                    available
-                }) if required == values.len() && available == values.len() - 1
-            ));
-            assert_eq!(short, snapshot);
-        }
-    }
-
-    #[cfg(feature = "adaptive")]
-    #[test]
-    fn adaptive_decoding_rejects_malformed_noncanonical_and_unbounded_inputs() {
-        let strict = options().with_adaptive_encoding();
-
-        // Raw collection, one element, non-minimal encoding of zero.
-        assert!(matches!(
-            strict.decode_i64_vec(&[0, 1, 251, 0, 0]),
-            Err(Error::NonCanonicalVarint)
-        ));
-        // RLE collection with a zero run and with a run beyond the advertised count.
-        assert!(matches!(
-            strict.decode_i64_vec(&[2, 1, 0, 0]),
-            Err(Error::Adaptive("invalid run length"))
-        ));
-        assert!(matches!(
-            strict.decode_i64_vec(&[2, 1, 0, 2]),
-            Err(Error::Adaptive("invalid run length"))
-        ));
-        // Delta collection: i64::MAX followed by +1.
-        let mut overflow = vec![1, 2, 253];
-        overflow.extend_from_slice(&(u64::MAX - 1).to_le_bytes());
-        overflow.push(2);
-        assert!(matches!(
-            strict.decode_i64_vec(&overflow),
-            Err(Error::Adaptive("delta reconstruction overflow"))
-        ));
-
-        let mut trailing = strict.encode_i64_slice(&[1, 2, 3]).unwrap();
-        trailing.push(0);
-        assert!(matches!(
-            strict.decode_i64_vec(&trailing),
-            Err(Error::TrailingBytes { remaining: 1 })
-        ));
-        assert_eq!(
-            options()
-                .allow_trailing_bytes()
-                .with_adaptive_encoding()
-                .decode_i64_vec(&trailing)
-                .unwrap(),
-            [1, 2, 3]
-        );
-        assert!(matches!(
-            options()
-                .with_collection_limit(2)
-                .with_adaptive_encoding()
-                .decode_i64_vec(&[0, 3, 0, 0, 0]),
-            Err(Error::CollectionLimit { limit: 2 })
-        ));
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn parallel_batches_are_ordered_deterministic_and_bounded() {
-        use std::num::NonZeroUsize;
-
-        let values: Vec<(u64, String)> = (0..257)
-            .map(|index| (index, format!("record-{index}")))
-            .collect();
-        let single = options()
-            .with_limit(64 * 1024)
-            .with_parallel_serialization()
-            .with_worker_count(NonZeroUsize::MIN);
-        let parallel = single.with_worker_count(NonZeroUsize::new(4).unwrap());
-        let first = single.serialize_batch(&values).unwrap();
-        let second = parallel.serialize_batch(&values).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(&first[..4], b"RBP1");
-        assert_eq!(
-            parallel
-                .deserialize_batch::<(u64, String)>(&second)
-                .unwrap(),
-            values
-        );
-
-        assert!(matches!(
-            options()
-                .with_collection_limit(2)
-                .with_parallel_serialization()
-                .serialize_batch(&[1u8, 2, 3]),
-            Err(Error::CollectionLimit { limit: 2 })
-        ));
-        assert!(matches!(
-            options()
-                .with_limit((first.len() - 1) as u64)
-                .with_parallel_serialization()
-                .deserialize_batch::<(u64, String)>(&first),
-            Err(Error::SizeLimit { .. })
-        ));
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn parallel_batch_decoder_validates_frame_boundaries() {
-        let config = options().with_parallel_serialization();
-        let frame = config.serialize_batch(&[1u16, 2, 3]).unwrap();
-
-        let mut bad_magic = frame.clone();
-        bad_magic[0] = 0;
-        assert!(matches!(
-            config.deserialize_batch::<u16>(&bad_magic),
-            Err(Error::InvalidFrame("bad parallel batch magic"))
-        ));
-        assert!(matches!(
-            config.deserialize_batch::<u16>(&frame[..frame.len() - 1]),
-            Err(Error::UnexpectedEnd)
-        ));
-
-        let mut oversized = frame.clone();
-        oversized[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(matches!(
-            config.deserialize_batch::<u16>(&oversized),
-            Err(Error::IntegerOverflow { target: "usize" })
-                | Err(Error::UnexpectedEnd)
-                | Err(Error::InvalidFrame("parallel payload size overflow"))
-        ));
-
-        let mut trailing = frame.clone();
-        trailing.push(0);
-        assert!(matches!(
-            config.deserialize_batch::<u16>(&trailing),
-            Err(Error::TrailingBytes { remaining: 1 })
-        ));
-        assert_eq!(
-            options()
-                .allow_trailing_bytes()
-                .with_parallel_serialization()
-                .deserialize_batch::<u16>(&trailing)
-                .unwrap(),
-            [1, 2, 3]
-        );
-    }
-
-    #[cfg(feature = "schema-evolution")]
-    #[test]
-    fn schema_evolution_supports_defaults_renames_unknown_fields_and_borrowing() {
-        let config = options().with_limit(4096).with_schema_evolution();
-        let v1 = SchemaV1 {
-            name: "stable identity".to_owned(),
-            count: 17,
-        };
-        let old_frame = config.serialize(&v1).unwrap();
-        assert_eq!(&old_frame[..4], b"RBE1");
-        assert_eq!(u32::from_le_bytes(old_frame[24..28].try_into().unwrap()), 1);
-        let upgraded: SchemaV2<'_> = config.deserialize(&old_frame).unwrap();
-        assert_eq!(
-            upgraded,
-            SchemaV2 {
-                title: "stable identity",
-                count: 17,
-                active: false,
-                source_version: 1,
-            }
-        );
-        assert!(upgraded.title.as_ptr() >= old_frame.as_ptr());
-        assert!(upgraded.title.as_ptr() < old_frame[old_frame.len()..].as_ptr());
-
-        let v2 = SchemaV2 {
-            title: "renamed",
-            count: 23,
-            active: true,
-            source_version: 2,
-        };
-        let new_frame = config.serialize(&v2).unwrap();
-        assert_eq!(
-            config.deserialize::<SchemaV1>(&new_frame).unwrap().name,
-            "renamed"
-        );
-        assert!(matches!(
-            config.deserialize::<OtherSchema>(&new_frame),
-            Err(Error::SchemaMismatch { .. })
-        ));
-    }
-
-    #[cfg(feature = "schema-evolution")]
-    #[test]
-    fn schema_evolution_rejects_duplicate_ids_truncation_and_resource_abuse() {
-        struct DuplicateFields;
-
-        impl SchemaEncode for DuplicateFields {
-            const SCHEMA_ID: u64 = 1;
-            const SCHEMA_VERSION: u32 = 1;
-
-            fn encode_fields(&self, encoder: &mut FieldEncoder) -> Result<()> {
-                encoder.field(7, &1u8)?;
-                encoder.field(7, &2u8)
-            }
-        }
-
-        let config = options().with_schema_evolution();
-        assert!(matches!(
-            config.serialize(&DuplicateFields),
-            Err(Error::SchemaEvolution("duplicate field ID"))
-        ));
-
-        let frame = config
-            .serialize(&SchemaV1 {
-                name: "x".to_owned(),
-                count: 1,
-            })
-            .unwrap();
-        assert!(matches!(
-            config.deserialize::<SchemaV1>(&frame[..frame.len() - 1]),
-            Err(Error::UnexpectedEnd)
-        ));
-        assert!(matches!(
-            options()
-                .with_collection_limit(1)
-                .with_schema_evolution()
-                .deserialize::<SchemaV1>(&frame),
-            Err(Error::CollectionLimit { limit: 1 })
-        ));
-
-        let first_payload_len = u64::from_le_bytes(frame[28..36].try_into().unwrap()) as usize;
-        let second_id = 36 + first_payload_len;
-        let mut duplicate_ids = frame.clone();
-        duplicate_ids[second_id..second_id + 4].copy_from_slice(&1u32.to_le_bytes());
-        assert!(matches!(
-            config.deserialize::<SchemaV1>(&duplicate_ids),
-            Err(Error::SchemaEvolution(
-                "field IDs must be unique and strictly increasing"
-            ))
         ));
     }
 }

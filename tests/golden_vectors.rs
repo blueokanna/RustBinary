@@ -1,9 +1,19 @@
 #[test]
 fn core_compact_and_legacy_vectors_are_stable() {
     let value = (251_u64, -2_i32, "A");
-    let compact = [251, 251, 0, 3, 1, b'A'];
+    let compact = [
+        0x0a, // tuple array
+        3, 251, 251, 0, // u64 251 (tag + marker varint)
+        5, 3, // i32 -2 (tag + zigzag)
+        9, 1, b'A', // "A"
+        0xff, // tuple end
+    ];
     let legacy = [
-        251, 0, 0, 0, 0, 0, 0, 0, 254, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, b'A',
+        0x0a, // tuple array
+        3, 251, 0, 0, 0, 0, 0, 0, 0, // u64 251 (fixed width)
+        5, 254, 255, 255, 255, 255, 255, 255, 255, // i32 -2 (fixed width)
+        9, 1, 0, 0, 0, 0, 0, 0, 0, b'A', // "A" (fixed-u64 length)
+        0xff, // tuple end
     ];
 
     let mut compact_output = [0_u8; 32];
@@ -75,7 +85,7 @@ fn protocol_adaptive_delta_vector_is_stable() {
 }
 
 #[cfg(all(feature = "derive", feature = "fingerprint"))]
-#[derive(serde::Deserialize, rustbinary::protocol::Fingerprint, serde::Serialize)]
+#[derive(nextjson::NsonDeserialize, rustbinary::protocol::Fingerprint, nextjson::NsonSerialize)]
 struct FingerprintedRecord {
     id: u16,
     active: bool,
@@ -93,7 +103,11 @@ fn protocol_fingerprint_vector_is_stable() {
         .serialize(&value)
         .unwrap();
     let golden = [
-        b'R', b'B', b'F', b'P', 1, 0, 0, 0, 78, 190, 14, 153, 0, 102, 91, 209, 251, 251, 0, 1,
+        b'R', b'B', b'F', b'P', 1, 0, 0, 0, 78, 190, 14, 153, 0, 102, 91, 209,  // header
+        0x0b, // object
+        9, 2, b'i', b'd', 3, 251, 251, 0, // id = 251
+        9, 6, b'a', b'c', b't', b'i', b'v', b'e', 2,    // active = true
+        0xff, // object end
     ];
     assert_eq!(frame, golden);
     rustbinary::options()
@@ -150,9 +164,13 @@ fn protocol_evolution_vector_is_stable() {
         active: true,
         id: 0x0102,
     };
+    // Field payloads use the self-describing binary format: active = [2],
+    // id 0x0102 = [3, 251, 2, 1].
     let golden = [
-        b'R', b'B', b'E', b'1', 1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0,
-        0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 251, 2, 1,
+        b'R', b'B', b'E', b'1', 1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 2, 0, 0, 0, 2, 0, 0, 0,
+        // field 1: active = true
+        1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, // field 2: id = 0x0102
+        2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 251, 2, 1,
     ];
     let config = rustbinary::options().with_schema_evolution();
     assert_eq!(config.serialize(&value).unwrap(), golden);
@@ -166,7 +184,8 @@ fn protocol_evolution_vector_is_stable() {
 #[test]
 fn pipeline_deterministic_cbor_vector_is_stable() {
     let value = (1_u8, "A");
-    let golden = [0x82, 0x01, 0x61, b'A'];
+    // nextjson relays JSON-compatible events into indefinite-length CBOR.
+    let golden = [0x9f, 0x01, 0x61, b'A', 0xff];
     let config: rustbinary::pipeline::CborConfig = rustbinary::options()
         .with_cbor_format()
         .with_deterministic_encoding();
@@ -180,8 +199,9 @@ fn pipeline_deterministic_cbor_vector_is_stable() {
 #[cfg(feature = "compression")]
 #[test]
 fn pipeline_raw_compression_vector_is_stable() {
+    // The uncompressed payload of 7u8 is [3, 7] (tag + varint).
     let golden = [
-        b'R', b'B', b'Z', b'1', 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7,
+        b'R', b'B', b'Z', b'1', 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 7,
     ];
     let config: rustbinary::pipeline::CompressedConfig =
         rustbinary::options().with_zstd_compression(3);
@@ -192,9 +212,12 @@ fn pipeline_raw_compression_vector_is_stable() {
 #[cfg(feature = "parallel")]
 #[test]
 fn pipeline_parallel_vector_is_stable() {
+    // Element payloads are [3, 1] and [3, 251, 251, 0] under the compact profile.
     let golden = [
-        b'R', b'B', b'P', b'1', 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0,
-        0, 0, 0, 0, 0, 0, 1, 251, 251, 0,
+        b'R', b'B', b'P', b'1', 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0,
+        0, 0, 0, 0, 0, 0, // length table
+        3, 1, // 1u16
+        3, 251, 251, 0, // 251u16
     ];
     let config: rustbinary::pipeline::ParallelConfig =
         rustbinary::options().with_parallel_serialization();
@@ -207,10 +230,11 @@ fn pipeline_parallel_vector_is_stable() {
 fn pipeline_encryption_decoder_vector_is_stable() {
     let key = rustbinary::EncryptionKey::new([0x42; 32]);
     let config = rustbinary::options().with_encryption(key);
+    // Plaintext is the self-describing encoding of 7u8: [3, 7].
     let golden = [
-        b'R', b'B', b'X', b'1', 1, 0, 1, 0, 244, 187, 38, 1, 226, 129, 252, 13, 97, 62, 69, 215,
-        186, 23, 180, 251, 124, 108, 62, 49, 215, 85, 17, 244, 1, 0, 0, 0, 0, 0, 0, 0, 17, 0, 0, 0,
-        0, 0, 0, 0, 54, 51, 18, 172, 70, 14, 71, 116, 249, 191, 206, 78, 253, 200, 31, 94, 56,
+        82, 66, 88, 49, 1, 0, 1, 0, 164, 151, 179, 104, 196, 1, 210, 153, 150, 34, 206, 174, 95,
+        128, 33, 17, 249, 19, 52, 173, 208, 104, 36, 210, 2, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 0,
+        0, 0, 0, 29, 51, 248, 74, 186, 101, 55, 63, 223, 65, 162, 99, 27, 56, 149, 10, 35, 15,
     ];
     assert_eq!(config.deserialize::<u8>(&golden).unwrap(), 7);
 

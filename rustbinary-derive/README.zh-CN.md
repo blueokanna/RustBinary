@@ -23,8 +23,8 @@
 | `Reflect` | `rustbinary::Reflect` | 读取静态字段和 variant 元数据 |
 | `BitPacked` | `rustbinary::BitPack` | 对有界字段按 bit 压缩存储 |
 
-这些宏不会实现 `serde::Serialize` 或 `serde::Deserialize`。需要普通二进制、
-CBOR、压缩、加密或 Schema 演进时，应把它们和 Serde derive 组合使用。
+这些宏不会实现 `nextjson::NsonSerialize` 或 `nextjson::NsonDeserialize`。需要普通二进制、
+CBOR、压缩、加密或 Schema 演进时，应把它们和 nextjson derive 组合使用。
 
 ## 安装
 
@@ -32,7 +32,7 @@ CBOR、压缩、加密或 Schema 演进时，应把它们和 Serde derive 组合
 
 ```toml
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+nextjson = { version = "0.1", features = ["derive"] }
 rustbinary = { version = "0.1.4", features = [
     "derive",
     "fingerprint",
@@ -67,14 +67,14 @@ workspace 中同时写 `path` 和 `version` 是有意设计的。本地构建使
 
 ## 完整示例
 
-下面的类型同时使用本 package 的全部 derive。它是普通的 Serde 数据模型，
+下面的类型同时使用本 package 的全部 derive。它是普通的 nextjson 数据模型，
 具有兼容性 fingerprint、静态元数据，并为有界标志提供独立的位打包布局。
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::{Fingerprint, Reflect, StaticSize, TypeShape};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Fingerprint, Reflect, StaticSize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize, Fingerprint, Reflect, StaticSize)]
 struct Header {
     enabled: bool,
     partition: u16,
@@ -166,9 +166,9 @@ let value: Header = config.deserialize(&frame)?;
 纳入参数类型身份：
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Serialize, Deserialize, Fingerprint)]
+#[derive(NsonSerialize, NsonDeserialize, Fingerprint)]
 struct Envelope<T> {
     sequence: u64,
     payload: T,
@@ -203,7 +203,7 @@ pub trait StaticSize {
 因为它们不存在仅由类型决定的有限上界。对这类值应设置运行时资源上限：
 
 ```rust
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize)]
 struct DynamicMessage {
     body: String,
 }
@@ -247,7 +247,7 @@ match Header::SHAPE {
 ```
 
 这是结构元数据，不是 Rust ABI 反射。它不会暴露内存 offset、padding、私有
-运行时状态、Serde rename 规则或动态类型注册表。类型别名和泛型参数按其
+运行时状态、nextjson rename 规则或动态类型注册表。类型别名和泛型参数按其
 声明时的 token 表示输出。
 
 ## `BitPacked`
@@ -325,7 +325,8 @@ struct Outer {
 | union | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
 
 泛型参数必须满足所选 derive 的 trait 约束，原有 where clause 会被保留。
-Serde 属性仍由 Serde 负责，这些过程宏不会解释 Serde rename 等属性。
+nextjson 属性（`#[njson(...)]`）仍由 nextjson 负责，这些过程宏不会解释 nextjson
+rename 等属性。
 
 ## 诊断和失败情况
 
@@ -346,8 +347,8 @@ Serde 属性仍由 Serde 负责，这些过程宏不会解释 Serde rename 等�
 
 ### 分离兼容布局和存储布局
 
-对跨版本边界的 Serde 模型使用 `Fingerprint`，对 frame 内部的紧凑 flags
-类型使用 `BitPacked`。不要假定位打包布局和普通 Serde 布局互相兼容。
+对跨版本边界的 nextjson 模型使用 `Fingerprint`，对 frame 内部的紧凑 flags
+类型使用 `BitPacked`。不要假定位打包布局和普通 nextjson 布局互相兼容。
 
 ### 限制不可信输入
 

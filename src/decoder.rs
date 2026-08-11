@@ -1,20 +1,44 @@
-use serde::de::{
-    self, value::U32Deserializer, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
-    Visitor,
-};
-use serde::Deserialize;
+//! Deserialization: a self-describing binary decoder implementing
+//! [`nextjson::FormatDecoder`].
+//!
+//! Mirrors [`crate::ser`]: every value starts with a one-byte type tag and
+//! containers are terminator-delimited (`0xff`). The decoder keeps a
+//! single-token lookahead so [`nextjson::FormatDecoder::peek_token`] supports
+//! `Option`, `Value` and untagged-enum backtracking without consuming input.
+//! Unescaped strings borrow directly from the input, preserving the codec's
+//! zero-copy `#[njson(borrow)]` contract.
+
+use alloc::borrow::Cow;
+use core::str;
+
+use nextjson::de::Mark;
+use nextjson::Error as NextjsonError;
+use nextjson::{FormatDecoder, Number, Token};
 
 use crate::{
     config::{Config, IntEncoding, TrailingBytes},
     error::{Error, Result},
+    tags::{
+        TAG_ARRAY, TAG_END, TAG_F32, TAG_F64, TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT,
+        TAG_STRING, TAG_TRUE, TAG_U128, TAG_U64,
+    },
 };
+
+/// Maximum container nesting depth (mirrors nextjson's default).
+const MAX_DEPTH: usize = 128;
 
 const U16_MARKER: u8 = 251;
 const U32_MARKER: u8 = 252;
 const U64_MARKER: u8 = 253;
 const U128_MARKER: u8 = 254;
 
-pub(crate) fn from_slice<'de, T: Deserialize<'de>>(input: &'de [u8], config: Config) -> Result<T> {
+type NextjsonResult<T> = core::result::Result<T, NextjsonError>;
+
+/// Decodes one value that may borrow from `input`.
+pub(crate) fn from_slice<'de, T: nextjson::NsonDeserialize<'de>>(
+    input: &'de [u8],
+    config: Config,
+) -> Result<T> {
     let (value, consumed) = from_slice_with_consumed(input, config)?;
     if config.trailing == TrailingBytes::Reject && consumed != input.len() {
         return Err(Error::TrailingBytes {
@@ -24,7 +48,8 @@ pub(crate) fn from_slice<'de, T: Deserialize<'de>>(input: &'de [u8], config: Con
     Ok(value)
 }
 
-pub(crate) fn from_slice_with_consumed<'de, T: Deserialize<'de>>(
+/// Decodes one value, returning it together with the number of consumed bytes.
+pub(crate) fn from_slice_with_consumed<'de, T: nextjson::NsonDeserialize<'de>>(
     input: &'de [u8],
     config: Config,
 ) -> Result<(T, usize)> {
@@ -32,18 +57,45 @@ pub(crate) fn from_slice_with_consumed<'de, T: Deserialize<'de>>(
         input,
         cursor: 0,
         config,
+        depth: 0,
+        counts: [0; MAX_DEPTH],
+        lookahead: None,
+        wire_error: None,
     };
-    let value = T::deserialize(&mut decoder)?;
+    let value = T::nextdecode(&mut decoder).map_err(|error| {
+        decoder
+            .wire_error
+            .take()
+            .unwrap_or_else(|| Error::from_nextjson(error))
+    })?;
+    if decoder.depth != 0 {
+        return Err(Error::Custom(
+            "decoder finished inside an unclosed container".into(),
+        ));
+    }
     Ok((value, decoder.cursor))
 }
 
+/// Self-describing binary decoder driven by nextjson's event contract.
 struct Decoder<'de> {
     input: &'de [u8],
     cursor: usize,
     config: Config,
+    depth: usize,
+    counts: [u64; MAX_DEPTH],
+    lookahead: Option<Token<'de>>,
+    wire_error: Option<Error>,
 }
 
 impl<'de> Decoder<'de> {
+    /// Records the precise RustBinary error and returns a nextjson error for
+    /// the `FormatDecoder` boundary. The original is recovered by the public
+    /// API in [`from_slice_with_consumed`].
+    fn fail(&mut self, error: Error) -> NextjsonError {
+        self.wire_error = Some(error);
+        NextjsonError::custom("rustbinary wire error")
+    }
+
     fn take(&mut self, len: usize) -> Result<&'de [u8]> {
         let end = self.cursor.checked_add(len).ok_or(Error::UnexpectedEnd)?;
         if let Some(limit) = self.config.limit {
@@ -63,15 +115,23 @@ impl<'de> Decoder<'de> {
         Ok(self.take(1)?[0])
     }
 
+    /// Returns the next byte without advancing the cursor.
+    fn peek_byte(&self) -> Result<u8> {
+        self.input
+            .get(self.cursor)
+            .copied()
+            .ok_or(Error::UnexpectedEnd)
+    }
+
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.take(N)?.try_into().map_err(|_| Error::UnexpectedEnd)
     }
 
-    fn unsigned(&mut self, fixed_bytes: usize, target_max: u128) -> Result<u128> {
+    fn unsigned(&mut self, fixed_bytes: usize, target_max: u128) -> NextjsonResult<u128> {
         let value = if self.config.integers == IntEncoding::Variable && fixed_bytes > 1 {
             self.varint()?
         } else {
-            let source = self.take(fixed_bytes)?;
+            let source = self.take(fixed_bytes).map_err(|error| self.fail(error))?;
             let mut bytes = [0; 16];
             if self.config.endian.little() {
                 bytes[..fixed_bytes].copy_from_slice(source);
@@ -82,20 +142,20 @@ impl<'de> Decoder<'de> {
             }
         };
         if value > target_max {
-            Err(Error::IntegerOverflow {
+            Err(self.fail(Error::IntegerOverflow {
                 target: unsigned_name(fixed_bytes),
-            })
+            }))
         } else {
             Ok(value)
         }
     }
 
-    fn signed(&mut self, fixed_bytes: usize, min: i128, max: i128) -> Result<i128> {
+    fn signed(&mut self, fixed_bytes: usize, min: i128, max: i128) -> NextjsonResult<i128> {
         let value = if self.config.integers == IntEncoding::Variable && fixed_bytes > 1 {
             let encoded = self.varint()?;
             ((encoded >> 1) as i128) ^ -((encoded & 1) as i128)
         } else {
-            let source = self.take(fixed_bytes)?;
+            let source = self.take(fixed_bytes).map_err(|error| self.fail(error))?;
             let fill = if source.first().is_some_and(|first| {
                 if self.config.endian.little() {
                     source[fixed_bytes - 1] & 0x80 != 0
@@ -117,86 +177,240 @@ impl<'de> Decoder<'de> {
             }
         };
         if value < min || value > max {
-            Err(Error::IntegerOverflow {
+            Err(self.fail(Error::IntegerOverflow {
                 target: signed_name(fixed_bytes),
-            })
+            }))
         } else {
             Ok(value)
         }
     }
 
-    fn varint(&mut self) -> Result<u128> {
-        let marker = self.byte()?;
+    fn varint(&mut self) -> NextjsonResult<u128> {
+        let marker = self.byte().map_err(|error| self.fail(error))?;
         let (value, minimum) = match marker {
             0..=250 => return Ok(marker as u128),
             U16_MARKER => (self.literal_u16()? as u128, 251),
             U32_MARKER => (self.literal_u32()? as u128, 0x1_0000),
             U64_MARKER => (self.literal_u64()? as u128, 0x1_0000_0000),
             U128_MARKER => (self.literal_u128()?, 0x1_0000_0000_0000_0000),
-            other => return Err(Error::InvalidVarintMarker(other)),
+            other => return Err(self.fail(Error::InvalidVarintMarker(other))),
         };
         if value < minimum {
-            Err(Error::NonCanonicalVarint)
+            Err(self.fail(Error::NonCanonicalVarint))
         } else {
             Ok(value)
         }
     }
 
-    fn literal_u16(&mut self) -> Result<u16> {
-        let b = self.fixed()?;
+    fn literal_u16(&mut self) -> NextjsonResult<u16> {
+        let bytes = self.fixed().map_err(|error| self.fail(error))?;
         Ok(if self.config.endian.little() {
-            u16::from_le_bytes(b)
+            u16::from_le_bytes(bytes)
         } else {
-            u16::from_be_bytes(b)
+            u16::from_be_bytes(bytes)
         })
     }
-    fn literal_u32(&mut self) -> Result<u32> {
-        let b = self.fixed()?;
+    fn literal_u32(&mut self) -> NextjsonResult<u32> {
+        let bytes = self.fixed().map_err(|error| self.fail(error))?;
         Ok(if self.config.endian.little() {
-            u32::from_le_bytes(b)
+            u32::from_le_bytes(bytes)
         } else {
-            u32::from_be_bytes(b)
+            u32::from_be_bytes(bytes)
         })
     }
-    fn literal_u64(&mut self) -> Result<u64> {
-        let b = self.fixed()?;
+    fn literal_u64(&mut self) -> NextjsonResult<u64> {
+        let bytes = self.fixed().map_err(|error| self.fail(error))?;
         Ok(if self.config.endian.little() {
-            u64::from_le_bytes(b)
+            u64::from_le_bytes(bytes)
         } else {
-            u64::from_be_bytes(b)
+            u64::from_be_bytes(bytes)
         })
     }
-    fn literal_u128(&mut self) -> Result<u128> {
-        let b = self.fixed()?;
+    fn literal_u128(&mut self) -> NextjsonResult<u128> {
+        let bytes = self.fixed().map_err(|error| self.fail(error))?;
         Ok(if self.config.endian.little() {
-            u128::from_le_bytes(b)
+            u128::from_le_bytes(bytes)
         } else {
-            u128::from_be_bytes(b)
+            u128::from_be_bytes(bytes)
         })
     }
 
-    fn length(&mut self) -> Result<usize> {
+    fn read_u64(&mut self) -> NextjsonResult<u64> {
+        Ok(self.unsigned(8, u64::MAX as u128)? as u64)
+    }
+    fn read_u128(&mut self) -> NextjsonResult<u128> {
+        self.unsigned(16, u128::MAX)
+    }
+    fn read_i64(&mut self) -> NextjsonResult<i64> {
+        Ok(self.signed(8, i64::MIN as i128, i64::MAX as i128)? as i64)
+    }
+    fn read_i128(&mut self) -> NextjsonResult<i128> {
+        self.signed(16, i128::MIN, i128::MAX)
+    }
+    fn read_f64(&mut self) -> NextjsonResult<f64> {
+        let bytes = self.fixed().map_err(|error| self.fail(error))?;
+        Ok(if self.config.endian.little() {
+            f64::from_le_bytes(bytes)
+        } else {
+            f64::from_be_bytes(bytes)
+        })
+    }
+    fn read_f32(&mut self) -> NextjsonResult<f32> {
+        let bytes = self.fixed().map_err(|error| self.fail(error))?;
+        Ok(if self.config.endian.little() {
+            f32::from_le_bytes(bytes)
+        } else {
+            f32::from_be_bytes(bytes)
+        })
+    }
+
+    /// Reads a length payload (strings and collection counts).
+    fn length(&mut self) -> NextjsonResult<u64> {
         let value = self.unsigned(8, u64::MAX as u128)?;
         if let Some(limit) = self.config.collection_limit {
             if value > limit as u128 {
-                return Err(Error::CollectionLimit { limit });
+                return Err(self.fail(Error::CollectionLimit { limit }));
             }
         }
-        usize::try_from(value).map_err(|_| Error::IntegerOverflow { target: "usize" })
+        Ok(value as u64)
     }
 
-    fn sequence<V: Visitor<'de>>(&mut self, len: usize, visitor: V) -> Result<V::Value> {
-        let mut access = Sequence {
-            decoder: self,
-            remaining: len,
-        };
-        let value = visitor.visit_seq(&mut access)?;
-        if access.remaining != 0 {
-            return Err(Error::Custom(
-                "sequence ended before all elements were decoded".into(),
-            ));
+    fn read_string(&mut self) -> NextjsonResult<Cow<'de, str>> {
+        let len = usize::try_from(self.length()?)
+            .map_err(|_| self.fail(Error::IntegerOverflow { target: "usize" }))?;
+        let bytes = self.take(len).map_err(|error| self.fail(error))?;
+        let value = str::from_utf8(bytes).map_err(|error| self.fail(Error::InvalidUtf8(error)))?;
+        Ok(Cow::Borrowed(value))
+    }
+
+    /// Reads and returns the next full token (tag plus any payload).
+    fn read_token(&mut self) -> NextjsonResult<Token<'de>> {
+        let tag = self.byte().map_err(|error| self.fail(error))?;
+        match tag {
+            TAG_NULL => Ok(Token::Null),
+            TAG_FALSE => Ok(Token::Bool(false)),
+            TAG_TRUE => Ok(Token::Bool(true)),
+            TAG_U64 => Ok(Token::Number(Number::U64(self.read_u64()?))),
+            TAG_U128 => Ok(Token::Number(Number::U128(self.read_u128()?))),
+            TAG_I64 => Ok(Token::Number(Number::I64(self.read_i64()?))),
+            TAG_I128 => Ok(Token::Number(Number::I128(self.read_i128()?))),
+            TAG_F64 => Ok(Token::Number(Number::F64(self.read_f64()?))),
+            TAG_F32 => Ok(Token::Number(Number::F64(self.read_f32()? as f64))),
+            TAG_STRING => Ok(Token::Str(self.read_string()?)),
+            TAG_ARRAY => Ok(Token::BeginArray),
+            TAG_OBJECT => Ok(Token::BeginObject),
+            TAG_END => Err(self.fail(Error::Custom(
+                "unexpected end-of-container terminator".into(),
+            ))),
+            _ => Err(self.fail(Error::Custom("invalid value tag".into()))),
         }
-        Ok(value)
+    }
+
+    /// Returns the next token without consuming it.
+    fn peek_token_inner(&mut self) -> NextjsonResult<Token<'de>> {
+        if self.lookahead.is_none() {
+            self.lookahead = Some(self.read_token()?);
+        }
+        Ok(self.lookahead.clone().expect("lookahead initialized"))
+    }
+
+    /// Consumes and returns the next token, honoring any pending lookahead.
+    fn take_token(&mut self) -> NextjsonResult<Token<'de>> {
+        match self.lookahead.take() {
+            Some(token) => Ok(token),
+            None => self.read_token(),
+        }
+    }
+
+    /// Whether the next byte is the container terminator (not consumed).
+    fn peek_end(&mut self) -> NextjsonResult<bool> {
+        if self.lookahead.is_some() {
+            return Ok(false);
+        }
+        Ok(self.peek_byte().map_err(|error| self.fail(error))? == TAG_END)
+    }
+
+    fn push_frame(&mut self) -> NextjsonResult<()> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.fail(Error::Custom("decoder nesting depth limit exceeded".into())));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn exit_container(&mut self) -> NextjsonResult<()> {
+        if self.depth == 0 {
+            return Err(self.fail(Error::Custom("container end without matching start".into())));
+        }
+        // The entry separators only probe for the terminator; consuming it is
+        // this method's job (mirroring nextjson's `}` / `]` consumption).
+        let byte = self.peek_byte().map_err(|error| self.fail(error))?;
+        if byte != TAG_END {
+            return Err(self.fail(Error::Custom("container end without terminator".into())));
+        }
+        self.cursor += 1;
+        self.depth -= 1;
+        Ok(())
+    }
+
+    /// Probes the entry separator: `true` if more entries follow, `false` at
+    /// the container end (the terminator is left for `end_array` / `end_object`).
+    fn container_sep(&mut self) -> NextjsonResult<bool> {
+        if self.lookahead.is_some() {
+            return Ok(true);
+        }
+        let index = self.depth.checked_sub(1).ok_or_else(|| {
+            self.fail(Error::Custom(
+                "container separator outside any container".into(),
+            ))
+        })?;
+        let count = self.counts[index]
+            .checked_add(1)
+            .ok_or_else(|| self.fail(Error::CollectionLimit { limit: u64::MAX }))?;
+        if let Some(limit) = self.config.collection_limit {
+            if count > limit {
+                return Err(self.fail(Error::CollectionLimit { limit }));
+            }
+        }
+        self.counts[index] = count;
+        Ok(self.peek_byte().map_err(|error| self.fail(error))? != TAG_END)
+    }
+
+    /// Skips one complete value (used for unknown object fields).
+    fn skip_value_inner(&mut self) -> NextjsonResult<()> {
+        match self.take_token()? {
+            Token::BeginArray | Token::BeginObject => {
+                let mut nested = 1usize;
+                loop {
+                    if self.peek_byte().map_err(|error| self.fail(error))? == TAG_END {
+                        self.cursor += 1;
+                        nested -= 1;
+                        if nested == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if matches!(self.read_token()?, Token::BeginArray | Token::BeginObject) {
+                        nested += 1;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn token_name(token: &Token<'_>) -> &'static str {
+    match token {
+        Token::Null => "null",
+        Token::Bool(_) => "bool",
+        Token::Number(_) => "number",
+        Token::Str(_) => "string",
+        Token::BeginObject => "object",
+        Token::EndObject => "end of object",
+        Token::BeginArray => "array",
+        Token::EndArray => "end of array",
     }
 }
 
@@ -219,259 +433,126 @@ const fn signed_name(bytes: usize) -> &'static str {
     }
 }
 
-struct Sequence<'a, 'de> {
-    decoder: &'a mut Decoder<'de>,
-    remaining: usize,
-}
+impl<'de> FormatDecoder<'de> for Decoder<'de> {
+    fn begin_object(&mut self) -> NextjsonResult<()> {
+        match self.take_token()? {
+            Token::BeginObject => {}
+            other => {
+                return Err(NextjsonError::invalid_type("an object", token_name(&other)));
+            }
+        }
+        self.push_frame()
+    }
 
-impl<'de> SeqAccess<'de> for &mut Sequence<'_, 'de> {
-    type Error = Error;
-    fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>> {
-        if self.remaining == 0 {
+    fn end_object(&mut self) -> NextjsonResult<()> {
+        self.exit_container()
+    }
+
+    fn object_key(&mut self) -> NextjsonResult<Option<Cow<'de, str>>> {
+        if self.peek_end()? {
             return Ok(None);
         }
-        self.remaining -= 1;
-        seed.deserialize(&mut *self.decoder).map(Some)
+        match self.take_token()? {
+            Token::Str(key) => Ok(Some(key)),
+            other => Err(NextjsonError::invalid_type(
+                "an object key string",
+                token_name(&other),
+            )),
+        }
     }
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining)
-    }
-}
 
-struct Map<'a, 'de> {
-    decoder: &'a mut Decoder<'de>,
-    remaining: usize,
-    value_pending: bool,
-}
+    fn object_entry_sep(&mut self) -> NextjsonResult<bool> {
+        self.container_sep()
+    }
 
-impl<'de> MapAccess<'de> for &mut Map<'_, 'de> {
-    type Error = Error;
-    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
-        if self.remaining == 0 {
-            return Ok(None);
+    fn begin_array(&mut self) -> NextjsonResult<()> {
+        match self.take_token()? {
+            Token::BeginArray => {}
+            other => {
+                return Err(NextjsonError::invalid_type("an array", token_name(&other)));
+            }
         }
-        if self.value_pending {
-            return Err(Error::Custom("map requested a key before its value".into()));
-        }
-        let key = seed.deserialize(&mut *self.decoder)?;
-        self.value_pending = true;
-        Ok(Some(key))
+        self.push_frame()
     }
-    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
-        if !self.value_pending {
-            return Err(Error::Custom("map requested a value without a key".into()));
-        }
-        let value = seed.deserialize(&mut *self.decoder)?;
-        self.value_pending = false;
-        self.remaining -= 1;
-        Ok(value)
-    }
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining)
-    }
-}
 
-macro_rules! number {
-    ($method:ident, $visit:ident, unsigned, $ty:ty, $bytes:expr) => {
-        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            visitor.$visit(self.unsigned($bytes, <$ty>::MAX as u128)? as $ty)
-        }
-    };
-    ($method:ident, $visit:ident, signed, $ty:ty, $bytes:expr) => {
-        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            visitor.$visit(self.signed($bytes, <$ty>::MIN as i128, <$ty>::MAX as i128)? as $ty)
-        }
-    };
-}
+    fn end_array(&mut self) -> NextjsonResult<()> {
+        self.exit_container()
+    }
 
-impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
-    type Error = Error;
-    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value> {
-        Err(Error::Unsupported("deserialize_any"))
+    fn array_has_more(&mut self) -> NextjsonResult<bool> {
+        self.peek_end().map(|end| !end)
     }
-    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        match self.byte()? {
-            0 => visitor.visit_bool(false),
-            1 => visitor.visit_bool(true),
-            value => Err(Error::InvalidBool(value)),
-        }
-    }
-    fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_i8(self.byte()? as i8)
-    }
-    number!(deserialize_i16, visit_i16, signed, i16, 2);
-    number!(deserialize_i32, visit_i32, signed, i32, 4);
-    number!(deserialize_i64, visit_i64, signed, i64, 8);
-    number!(deserialize_i128, visit_i128, signed, i128, 16);
-    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_u8(self.byte()?)
-    }
-    number!(deserialize_u16, visit_u16, unsigned, u16, 2);
-    number!(deserialize_u32, visit_u32, unsigned, u32, 4);
-    number!(deserialize_u64, visit_u64, unsigned, u64, 8);
-    number!(deserialize_u128, visit_u128, unsigned, u128, 16);
-    fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let b = self.fixed()?;
-        visitor.visit_f32(if self.config.endian.little() {
-            f32::from_le_bytes(b)
-        } else {
-            f32::from_be_bytes(b)
-        })
-    }
-    fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let b = self.fixed()?;
-        visitor.visit_f64(if self.config.endian.little() {
-            f64::from_le_bytes(b)
-        } else {
-            f64::from_be_bytes(b)
-        })
-    }
-    fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let first = self.byte()?;
-        let width = match first {
-            0x00..=0x7f => 1,
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(Error::InvalidChar),
-        };
-        let mut bytes = [0; 4];
-        bytes[0] = first;
-        if width > 1 {
-            bytes[1..width].copy_from_slice(self.take(width - 1).map_err(|_| Error::InvalidChar)?);
-        }
-        let text = core::str::from_utf8(&bytes[..width]).map_err(|_| Error::InvalidChar)?;
-        let value = text.chars().next().ok_or(Error::InvalidChar)?;
-        visitor.visit_char(value)
-    }
-    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let len = self.length()?;
-        let bytes = self.take(len)?;
-        let value = core::str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
-        visitor.visit_borrowed_str(value)
-    }
-    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.deserialize_str(visitor)
-    }
-    fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let len = self.length()?;
-        visitor.visit_borrowed_bytes(self.take(len)?)
-    }
-    fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.deserialize_bytes(visitor)
-    }
-    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        match self.byte()? {
-            0 => visitor.visit_none(),
-            1 => visitor.visit_some(self),
-            value => Err(Error::InvalidOption(value)),
-        }
-    }
-    fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_unit()
-    }
-    fn deserialize_unit_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value> {
-        visitor.visit_unit()
-    }
-    fn deserialize_newtype_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value> {
-        visitor.visit_newtype_struct(self)
-    }
-    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let len = self.length()?;
-        self.sequence(len, visitor)
-    }
-    fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> {
-        self.sequence(len, visitor)
-    }
-    fn deserialize_tuple_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        len: usize,
-        visitor: V,
-    ) -> Result<V::Value> {
-        self.sequence(len, visitor)
-    }
-    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let len = self.length()?;
-        let mut access = Map {
-            decoder: self,
-            remaining: len,
-            value_pending: false,
-        };
-        let value = visitor.visit_map(&mut access)?;
-        if access.remaining != 0 || access.value_pending {
-            return Err(Error::Custom(
-                "map ended before all entries were decoded".into(),
-            ));
-        }
-        Ok(value)
-    }
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value> {
-        self.sequence(fields.len(), visitor)
-    }
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value> {
-        let variant = self.unsigned(4, u32::MAX as u128)? as u32;
-        visitor.visit_enum(Variant {
-            decoder: self,
-            index: variant,
-        })
-    }
-    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.deserialize_str(visitor)
-    }
-    fn deserialize_ignored_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value> {
-        Err(Error::Unsupported("deserialize_ignored_any"))
-    }
-}
 
-struct Variant<'a, 'de> {
-    decoder: &'a mut Decoder<'de>,
-    index: u32,
-}
+    fn array_entry_sep(&mut self) -> NextjsonResult<bool> {
+        self.container_sep()
+    }
 
-impl<'de> EnumAccess<'de> for Variant<'_, 'de> {
-    type Error = Error;
-    type Variant = Self;
-    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self)> {
-        let index = seed.deserialize(U32Deserializer::<Error>::new(self.index))?;
-        Ok((index, self))
+    fn unit(&mut self) -> NextjsonResult<()> {
+        match self.take_token()? {
+            Token::Null => Ok(()),
+            other => Err(NextjsonError::invalid_type("null", token_name(&other))),
+        }
     }
-}
 
-impl<'de> VariantAccess<'de> for Variant<'_, 'de> {
-    type Error = Error;
-    fn unit_variant(self) -> Result<()> {
-        Ok(())
+    fn bool(&mut self) -> NextjsonResult<bool> {
+        match self.take_token()? {
+            Token::Bool(value) => Ok(value),
+            other => Err(NextjsonError::invalid_type("a boolean", token_name(&other))),
+        }
     }
-    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> {
-        seed.deserialize(self.decoder)
+
+    fn number(&mut self) -> NextjsonResult<Number> {
+        match self.take_token()? {
+            Token::Number(value) => Ok(value),
+            other => Err(NextjsonError::invalid_type("a number", token_name(&other))),
+        }
     }
-    fn tuple_variant<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> {
-        de::Deserializer::deserialize_tuple(self.decoder, len, visitor)
+
+    fn string(&mut self) -> NextjsonResult<Cow<'de, str>> {
+        match self.take_token()? {
+            Token::Str(value) => Ok(value),
+            other => Err(NextjsonError::invalid_type("a string", token_name(&other))),
+        }
     }
-    fn struct_variant<V: Visitor<'de>>(
-        self,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value> {
-        de::Deserializer::deserialize_tuple(self.decoder, fields.len(), visitor)
+
+    fn char(&mut self) -> NextjsonResult<char> {
+        match self.take_token()? {
+            Token::Str(value) => {
+                let mut chars = value.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(ch), None) => Ok(ch),
+                    _ => Err(self.fail(Error::InvalidChar)),
+                }
+            }
+            other => Err(NextjsonError::invalid_type(
+                "a character",
+                token_name(&other),
+            )),
+        }
+    }
+
+    fn skip_value(&mut self) -> NextjsonResult<()> {
+        self.skip_value_inner()
+    }
+
+    fn peek_token(&mut self) -> NextjsonResult<Token<'de>> {
+        self.peek_token_inner()
+    }
+
+    fn next_token(&mut self) -> NextjsonResult<Token<'de>> {
+        self.take_token()
+    }
+
+    fn save(&self) -> Mark {
+        Mark::new(self.cursor, self.depth as u32)
+    }
+
+    fn restore(&mut self, mark: Mark) {
+        self.cursor = mark.pos();
+        self.depth = mark.depth() as usize;
+        for slot in &mut self.counts[mark.depth() as usize..] {
+            *slot = 0;
+        }
+        self.lookahead = None;
     }
 }

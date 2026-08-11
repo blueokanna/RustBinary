@@ -1,12 +1,13 @@
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::core::{Error, ErrorCategory};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct Packet<'a> {
     sequence: u64,
+    #[njson(borrow)]
     topic: &'a str,
-    #[serde(borrow)]
-    payload: &'a [u8],
+    #[njson(borrow)]
+    payload: &'a str,
 }
 
 fn points_into(whole: &[u8], part: &[u8]) -> bool {
@@ -24,7 +25,7 @@ fn main() -> rustbinary::core::Result<()> {
     let value = Packet {
         sequence: 65_536,
         topic: "telemetry/temperature",
-        payload: b"23.5 C",
+        payload: "23.5 C",
     };
 
     // Exact sizing and caller-owned output use one explicit wire profile.
@@ -43,7 +44,7 @@ fn main() -> rustbinary::core::Result<()> {
     let decoded: Packet<'_> = config.deserialize(&frame)?;
     assert_eq!(decoded, value);
     assert!(points_into(&frame, decoded.topic.as_bytes()));
-    assert!(points_into(&frame, decoded.payload));
+    assert!(points_into(&frame, decoded.payload.as_bytes()));
 
     // Caller capacity is a configuration failure and reports the exact need.
     let mut short = [0_u8; 4];

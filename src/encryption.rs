@@ -4,7 +4,6 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     Key, XChaCha20Poly1305, XNonce,
 };
-use serde::{de::DeserializeOwned, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "cbor")]
@@ -111,7 +110,7 @@ impl EncryptedConfig {
     }
 
     /// Serializes and encrypts a value with a fresh random 192-bit nonce.
-    pub fn serialize<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
         let plaintext = Zeroizing::new(self.serialize_payload(value)?);
         self.enforce_plaintext_limit(plaintext.len() as u64)?;
         let mut nonce_bytes = [0; NONCE_LEN];
@@ -148,7 +147,10 @@ impl EncryptedConfig {
     }
 
     /// Decrypts, authenticates, and deserializes a complete frame.
-    pub fn deserialize<T: DeserializeOwned>(&self, input: &[u8]) -> Result<T> {
+    pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de>>(
+        &self,
+        input: &[u8],
+    ) -> Result<T> {
         let header = input.get(..HEADER_LEN).ok_or(Error::UnexpectedEnd)?;
         let (_, declared_plaintext_len, _) = parse_header(header)?;
         self.enforce_plaintext_limit(declared_plaintext_len)?;
@@ -172,7 +174,10 @@ impl EncryptedConfig {
     }
 
     /// Reads exactly one encrypted frame and leaves subsequent frames unread.
-    pub fn deserialize_from<R: Read, T: DeserializeOwned>(&self, mut reader: R) -> Result<T> {
+    pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+        &self,
+        mut reader: R,
+    ) -> Result<T> {
         let mut header = [0; HEADER_LEN];
         reader.read_exact(&mut header)?;
         let (_, plaintext_len, ciphertext_len) = parse_header(&header)?;
@@ -194,7 +199,7 @@ impl EncryptedConfig {
         self.deserialize(&frame)
     }
 
-    fn serialize_payload<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
+    fn serialize_payload<T: nextjson::NsonSerialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>> {
         match self.payload {
             PayloadFormat::Binary(config) => config.serialize(value),
             #[cfg(feature = "cbor")]
@@ -204,7 +209,10 @@ impl EncryptedConfig {
         }
     }
 
-    fn deserialize_payload<T: DeserializeOwned>(&self, payload: &[u8]) -> Result<T> {
+    fn deserialize_payload<T: for<'de> nextjson::NsonDeserialize<'de>>(
+        &self,
+        payload: &[u8],
+    ) -> Result<T> {
         match self.payload {
             PayloadFormat::Binary(config) => config.deserialize(payload),
             #[cfg(feature = "cbor")]

@@ -1,7 +1,6 @@
 //! Standard-library adapters around the `no_std` Compact V1 core.
 
 use crate::{decoder, ser, Config, EncodeWriter, Error, Result};
-use serde::{de::DeserializeOwned, Serialize};
 use std::io::{Read, Write};
 
 struct IoWriter<W>(W);
@@ -13,7 +12,7 @@ impl<W: Write> EncodeWriter for IoWriter<W> {
 }
 
 /// Serializes a value into a standard I/O writer.
-pub fn serialize_into<W: Write, T: Serialize + ?Sized>(
+pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
     config: Config,
     writer: W,
     value: &T,
@@ -22,7 +21,10 @@ pub fn serialize_into<W: Write, T: Serialize + ?Sized>(
 }
 
 /// Reads bounded input and decodes one owned value.
-pub fn deserialize_from<R: Read, T: DeserializeOwned>(config: Config, mut reader: R) -> Result<T> {
+pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+    config: Config,
+    mut reader: R,
+) -> Result<T> {
     let max = config.limit.unwrap_or(u64::MAX);
     let read_cap = max.saturating_add(1);
     let mut bytes = alloc::vec::Vec::new();

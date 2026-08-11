@@ -1,8 +1,13 @@
 # RustBinary
 
-RustBinary 是一个面向 Serde 的有界二进制编解码库。线格式配置是显式的；
+RustBinary 是一个面向 **nextjson** 的有界二进制编解码库。线格式配置是显式的；
 自适应编码、位打包、Schema 指纹、CBOR、压缩、认证加密、Schema 演进和并行
 批处理均通过 feature 独立启用。
+
+编解码器直接构建在 nextjson 的格式中立契约（`NsonSerialize` / `NsonDeserialize`
++ `FormatEncoder` / `FormatDecoder`）之上，取代了原先的 Serde 依赖。二进制线格式
+是带类型标签的自描述流：每个值前有一字节类型标签，容器以 `0xff` 结尾，因此
+`Option`、`Value`、无标签枚举和借用字符串都能无歧义往返。
 
 产品面明确分为三层：
 
@@ -35,19 +40,19 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 
 | 能力 | 状态 | 实现说明 |
 | --- | --- | --- |
-| Serde 二进制编解码 | 已实现 | 固定宽度兼容模式与严格 marker-varint 模式 |
+| nextjson 二进制编解码 | 已实现 | 固定宽度兼容模式与严格 marker-varint 模式 |
 | 整数自适应编码 | 已实现 | 按实际值选择宽度，有符号整数使用 ZigZag |
 | 字符串自适应编码 | 已实现 | 运行时在原始 UTF-8 与 ASCII7 之间择优 |
 | 集合自适应编码 | 已实现 | `i64` 集合在 raw、delta、RLE 中选择最小结果 |
 | SIMD | 热路径已实现 | x86_64 运行时 SSE2/AVX2，AArch64 NEON，其他平台标量回退 |
 | AVX-512、SVE、SME | 仅能力探测 | `hardware_capabilities` 可报告，尚无对应 codec 内核 |
-| 零分配编解码路径 | 已实现 | 精确长度 Serde 输出及调用方缓冲区自适应解码 |
-| 借用式零复制反序列化 | 已实现 | 嵌套 `&str`、`&[u8]` 直接指向输入 frame |
+| 零分配编解码路径 | 已实现 | 精确长度 nextjson 输出及调用方缓冲区自适应解码 |
+| 借用式零复制反序列化 | 已实现 | 嵌套 `&str` 直接指向输入 frame |
 | 只读相对指针对象归档 | 已实现，需 `archive` | 版本化包头、显式 schema ID、有界校验和 mmap 原地访问 |
 | 位打包 | 已实现 | `BitPacked` derive、宽度检查、规范零 padding |
 | Schema 指纹 | 已实现 | 覆盖类型结构及完整 binary/CBOR 配置 |
 | 编译期内存上界 | 已实现 | `MAX_SIZE`、`PACKED_MAX_BITS`、`PACKED_MAX_SIZE` |
-| RFC 8949 CBOR | 已实现 | Ciborium 编解码与递归 canonical map 排序 |
+| RFC 8949 CBOR | 已实现 | nextjson CBOR 中继与递归 canonical map 排序 |
 | Schema 演进 | 已实现 | 稳定字段 ID、版本、默认值、跳过未知字段、迁移 |
 | 压缩集成 | 已实现 | 自适应 Zstandard；压缩后变大则保留原文 |
 | 原生加密层 | 已实现 | XChaCha20-Poly1305、随机 192-bit nonce、认证 frame header |
@@ -59,7 +64,7 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 | `no_std + alloc` | 已实现 | 保留 `Vec`、`String`、owned data、指纹、演进和标量 adaptive codec |
 | Async Fiber/UFA | 未实现 | 不用阻塞 I/O 包装成假的 async API |
 
-这里严格区分“已探测”和“已加速”；Serde codec 与相对指针对象归档也是两套独立的
+这里严格区分“已探测”和“已加速”；nextjson codec 与相对指针对象归档也是两套独立的
 格式和 API。
 
 ## 安装
@@ -67,7 +72,7 @@ profile 明确声明，否则不暗示与其他二进制格式兼容。
 ```toml
 [dependencies]
 rustbinary = "0.1.4"
-serde = { version = "1", features = ["derive"] }
+nextjson = { version = "0.1", features = ["derive"] }
 ```
 
 只在确实需要时启用整层，也可只选择单项能力：
@@ -86,7 +91,7 @@ rustbinary = { version = "0.1.4", features = ["archive"] }
 | Feature | 默认启用 | 用途与依赖 |
 | --- | --- | --- |
 | `std` | 是 | Core owned/I/O API；Pipeline 与运行时 SIMD feature 以它为前提 |
-| `alloc` | 通过 `std` | 不依赖 `std` 的 owned `Vec`/`String` API |
+| `alloc` | 通过 `std` | 兼容性标记；owned `Vec`/`String` API 始终可用（nextjson 的 `FormatDecoder` 需要 `alloc`） |
 | `protocol` | 否 | 完整 Protocol 层聚合 feature |
 | `pipeline` | 否 | 完整 Pipeline 层聚合 feature |
 | `archive` | 否 | 经校验的只读 mmap 归档；依赖 `std`、rkyv 和 memmap2 |
@@ -97,7 +102,7 @@ rustbinary = { version = "0.1.4", features = ["archive"] }
 | `simd` | 否 | 运行时能力探测与热扫描分派，不改变线格式 |
 | `bit-packing` | 否 | 核心位级 trait 和调用方缓冲区 codec |
 | `adaptive` | 否 | 调用方缓冲区自适应字符串/集合；隐含 `bit-packing`；`alloc` 增加 owned API |
-| `cbor` | 否 | 基于 Ciborium 的 RFC 8949 |
+| `cbor` | 否 | 基于 nextjson CBOR 中继的 RFC 8949 |
 | `compression` | 否 | 自适应 Zstandard frame |
 | `encryption` | 否 | XChaCha20-Poly1305、系统随机数、密钥清零 |
 | `parallel` | 否 | scoped thread 有序批处理 |
@@ -119,9 +124,9 @@ marker-varint、ZigZag 有符号整数、默认 64 MiB 字节上限、一百万�
 并拒绝尾随字节。`legacy_options()` 显式选择旧的无界定宽模式并允许尾随字节。
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct Packet {
     sequence: u64,
     payload: Vec<u8>,
@@ -151,22 +156,22 @@ Config -> CborConfig -> CompressedConfig -> EncryptedConfig
 ### 核心线格式规范
 
 格式编码的是值，不是 Rust 对象内存；不会写入 padding、原生指针、vtable 或
-`repr(Rust)` 布局。
+`repr(Rust)` 布局。每个值前有一字节类型标签；数组和对象以 `0xff` 终结。标签使
+流自描述，因此 `Option`、`Value`、无标签枚举和 `peek_token` 都能无歧义往返。
 
-| Serde 值 | 线表示 |
+| nextjson 值 | 线表示 |
 | --- | --- |
-| `bool` | 单字节，只允许 `0` 或 `1` |
-| `Option<T>` | 单字节 `0`/`1` tag，`Some` 后跟 `T` |
-| `u8` / `i8` | 单字节 |
-| 定宽整数 | 按配置端序写入声明宽度 |
-| 可变无符号整数 | 规范 marker 加 0/2/4/8/16 字节 payload |
-| 可变有符号整数 | ZigZag 后使用无符号 marker 格式 |
-| `f32` / `f64` | 按配置端序保留 IEEE 754 位模式 |
-| `char` | 一个合法 UTF-8 scalar，不带长度 |
-| 字符串/字节 | 编码后的字节长度加原始字节 |
-| 序列/map | 声明元素/entry 数量后跟内容 |
-| tuple/struct | 按 Serde 声明顺序写字段值，不写名字 |
-| enum | 按配置编码 `u32` variant index，后跟 variant 内容 |
+| `null` / unit / `None` | 标签 `0x00` |
+| `false` / `true` | 标签 `0x01` / `0x02` |
+| `u64` / `u128` | 标签 `0x03` / `0x04` + 无符号 payload |
+| `i64` / `i128` | 标签 `0x05` / `0x06` + ZigZag payload |
+| `f64` / `f32` | 标签 `0x07` / `0x08` + 按配置端序的 IEEE 754 位模式 |
+| 字符串 / char | 标签 `0x09` + 编码字节长度 + UTF-8 |
+| 数组 | 标签 `0x0a` + 元素 + `0xff` |
+| 对象 | 标签 `0x0b` + (`字符串键` + 值) 对 + `0xff` |
+
+整数与长度 payload 使用 marker-varint 方案（legacy profile 下为定宽 `u64`，
+因为 nextjson 的统一数据模型把所有整数按 `u64`/`i64` 宽度跨线传输）。
 
 Marker varint 必须使用最短规范形式：
 
@@ -179,7 +184,7 @@ Marker varint 必须使用最短规范形式：
 | `254` | 16 字节 | 18,446,744,073,709,551,616 |
 | `255` | 保留且非法 | 永不接受 |
 
-解码器拒绝非最短形式、窄化溢出、非法 UTF-8、非法 primitive tag、截断、资源上限
+解码器拒绝非最短形式、窄化溢出、非法 UTF-8、非法类型标签、截断、资源上限
 违规以及不允许的尾随字节。
 
 ## 零分配与零复制
@@ -187,37 +192,37 @@ Marker varint 必须使用最短规范形式：
 `serialized_size` 通过计数 writer 得到精确长度；`serialize_into_slice` 只执行一次
 序列化并写入调用方内存。容量不足时，`Error::BufferTooSmall` 返回精确所需容量。
 
-从 slice 反序列化时，任意嵌套层级的 `&str` 和 `&[u8]` 都可直接借用输入
-frame，生命周期由 Rust 静态约束，不复制 payload、不重新创建字符串。ASCII7
-需要展开，因此返回 owned string；adaptive raw UTF-8 可返回 `Cow::Borrowed`。
+从 slice 反序列化时，任意嵌套层级的 `&str` 都可直接借用输入 frame，生命周期由
+Rust 静态约束，不复制 payload、不重新创建字符串。ASCII7 需要展开，因此返回
+owned string；adaptive raw UTF-8 可返回 `Cow::Borrowed`。
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(NsonSerialize, NsonDeserialize)]
 struct View<'a> {
     name: &'a str,
-    #[serde(borrow)]
-    payload: &'a [u8],
+    #[njson(borrow)]
+    payload: &'a str,
 }
 
-let source = View { name: "edge", payload: b"frame" };
+let source = View { name: "edge", payload: "frame" };
 let config = rustbinary::options().with_limit(4096);
 let mut storage = vec![0; config.serialized_size(&source)? as usize];
 let written = config.serialize_into_slice(&mut storage, &source)?;
 let view: View<'_> = config.deserialize(&storage[..written])?;
-assert_eq!(view.payload, b"frame");
+assert_eq!(view.payload, "frame");
 # Ok::<(), rustbinary::Error>(())
 ```
 
-这条路径上 codec 自身不分配；用户自定义的 Serde 实现仍可能自行分配。
+这条路径上 codec 自身不分配；用户自定义的 nextjson 实现仍可能自行分配。
 
 codec 自身保证无分配的路径包括 `serialized_size`、`serialize_into_slice`、
 adaptive `encode_*_into_slice`、`decode_i64_slice_into`、
 `decode_string_into_slice` 以及位打包调用方缓冲区。Reader 解码要求
 `DeserializeOwned`；返回指向临时 reader buffer 的引用在 Rust 中并不安全。
 
-借用解析对字符串/字节 payload 是真正零复制，它属于 Serde 字节流路径；指针范围
+借用解析对字符串 payload 是真正零复制，它属于 nextjson 字节流路径；指针范围
 断言见 [zero_copy.rs](examples/zero_copy.rs)。映射对象图使用独立的 archive 产品面。
 
 ## 内存映射归档
@@ -238,7 +243,7 @@ adaptive `encode_*_into_slice`、`decode_i64_slice_into`、
 
 ## 自适应编码
 
-`with_adaptive_encoding()` 保留紧凑 Serde 配置，并提供显式的数据感知 API。
+`with_adaptive_encoding()` 保留紧凑 nextjson 配置，并提供显式的数据感知 API。
 编码器比较完整编码长度后写入稳定策略 tag；解码器会校验规范 varint、padding、
 长度、delta 溢出及 RLE run，不能把损坏数据静默接受。
 
@@ -266,7 +271,7 @@ assert_eq!(
 # Ok::<(), rustbinary::Error>(())
 ```
 
-自适应 frame 必须显式使用；如果普通 Serde 字段在不知情时改变表示，会破坏协议兼容性。
+自适应 frame 必须显式使用；如果普通字段在不知情时改变表示，会破坏协议兼容性。
 
 字符串 frame 由 `strategy:u8`、规范化解码字节长度 varint 和 payload 组成。策略 0
 是原始 UTF-8；策略 1 是最低有效位优先的 ASCII7。只有输入全部为 ASCII 且完整打包
@@ -400,13 +405,13 @@ ID 严格递增，并在切片之前检查全部长度运算。
 - 浮点数保留 IEEE 754 bit pattern，端序显式配置。
 - 可变整数拒绝 marker 255 和非最短编码。
 - 普通 struct 只按声明顺序编码字段值，不写字段名。
-- 普通 map 保留 Serde 迭代顺序，因此不保证确定性。
+- 普通 map 保留 nextjson 迭代顺序，因此不保证确定性。
 - 确定性 map 必须使用 deterministic CBOR 或有序 map。
 - 压缩/加密 frame 校验版本、flag、长度和资源上限。
 - 流解码器在为 body 分配内存前校验 frame 长度关系和配置上限。
 - 解密必须先完成认证，之后才会反序列化。
 - Fingerprint 只做兼容性检查，不提供密码学认证。
-- 用户自定义 Serde 实现仍可能分配，或不接受 borrowed visitor。
+- 用户自定义 nextjson 实现仍可能分配，或不接受 borrowed visitor。
 
 处理任何不可信输入时，都应设置符合业务的字节/集合上限；除非外层协议明确拥有尾随
 数据，否则应拒绝尾随字节；对抗攻击者时必须使用认证，并把解压/反序列化错误视为

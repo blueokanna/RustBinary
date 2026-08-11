@@ -1,10 +1,6 @@
 #[cfg(feature = "alloc")]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use serde::Deserialize;
-#[cfg(feature = "alloc")]
-use serde::Serialize;
-
 use crate::{BitReader, BitWriter, Config, Error, Result, TrailingBytes};
 
 const RAW_UTF8: u8 = 0;
@@ -49,14 +45,17 @@ impl AdaptiveConfig {
         self.base
     }
 
-    /// Uses value-width adaptive varints for a regular Serde payload.
+    /// Uses value-width adaptive varints for a regular nextjson payload.
     #[cfg(feature = "alloc")]
-    pub fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         self.base.serialize(value)
     }
 
-    /// Decodes a regular value-width adaptive Serde payload.
-    pub fn deserialize<'de, T: Deserialize<'de>>(self, input: &'de [u8]) -> Result<T> {
+    /// Decodes a regular value-width adaptive nextjson payload.
+    pub fn deserialize<'de, T: nextjson::NsonDeserialize<'de>>(
+        self,
+        input: &'de [u8],
+    ) -> Result<T> {
         self.base.deserialize(input)
     }
 

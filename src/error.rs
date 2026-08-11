@@ -25,7 +25,7 @@ pub enum ErrorCategory {
     InternalBug,
 }
 
-/// Serde-provided diagnostic text.
+/// Diagnostic text supplied by custom serializers or external formats.
 ///
 /// The text is retained when `alloc` is enabled. Pure core builds retain the
 /// error category without requiring dynamic memory.
@@ -66,7 +66,7 @@ impl fmt::Display for CustomMessage {
         }
         #[cfg(not(feature = "alloc"))]
         {
-            f.write_str("custom Serde error")
+            f.write_str("custom error")
         }
     }
 }
@@ -212,7 +212,7 @@ impl fmt::Display for Error {
             Self::SequenceMustHaveLength => {
                 f.write_str("binary sequences and maps must declare their length")
             }
-            Self::Unsupported(operation) => write!(f, "unsupported Serde operation: {operation}"),
+            Self::Unsupported(operation) => write!(f, "unsupported operation: {operation}"),
             Self::Custom(message) => fmt::Display::fmt(message, f),
         }
     }
@@ -236,14 +236,10 @@ impl From<io::Error> for Error {
     }
 }
 
-impl serde::ser::Error for Error {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        Self::Custom(CustomMessage::from_display(message))
-    }
-}
-
-impl serde::de::Error for Error {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        Self::Custom(CustomMessage::from_display(message))
+impl Error {
+    /// Converts a nextjson error (surfaced by a `FormatEncoder` / `FormatDecoder`
+    /// implementation) into a RustBinary [`Error`].
+    pub(crate) fn from_nextjson(error: nextjson::Error) -> Self {
+        Self::Custom(CustomMessage::from_display(error))
     }
 }

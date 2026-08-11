@@ -21,10 +21,11 @@
 //! - [`BitPacked`](derive@BitPacked) generates a checked bit-level codec for
 //!   bounded fields and nested `BitPack` values.
 //!
-//! The generated implementations are not a replacement for Serde derives.
-//! Add `Serialize` and `Deserialize` when the value also crosses a normal
-//! `rustbinary` or CBOR wire profile. For the complete syntax and production
-//! constraints, see the package README and the re-exported runtime traits.
+//! The generated implementations are not a replacement for the nextjson
+//! derives. Add `NsonSerialize` and `NsonDeserialize` when the value also
+//! crosses a normal `rustbinary` or CBOR wire profile. For the complete syntax
+//! and production constraints, see the package README and the re-exported
+//! runtime traits.
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
@@ -201,18 +202,62 @@ fn sum_field_bits(fields: &Fields) -> syn::Result<proc_macro2::TokenStream> {
     Ok(sum)
 }
 
+/// Worst-case serialized bytes of one named object key. Length prefixes are
+/// fixed-u64 in the fixed-width profile (9 + len) and marker-varint elsewhere
+/// (2 + len), so the worst case is the fixed-width form.
+fn key_size(name: &str) -> proc_macro2::TokenStream {
+    let len = name.len();
+    quote!(9usize + #len)
+}
+
+/// Sum of field sizes; named fields additionally contribute their key bytes.
 fn sum_fields(fields: &Fields, packed: bool) -> proc_macro2::TokenStream {
-    fields.iter().fold(quote!(0usize), |sum, field| {
-        let size = static_field_size(field, packed);
-        quote!(::rustbinary::static_size::saturating_add(#sum, #size))
-    })
+    fields
+        .iter()
+        .enumerate()
+        .fold(quote!(0usize), |sum, (index, field)| {
+            let size = static_field_size(field, packed);
+            if field.ident.is_some() {
+                let key = key_size(&field_name(index, field));
+                quote!(::rustbinary::static_size::saturating_add(
+                    #sum,
+                    ::rustbinary::static_size::saturating_add(#size, #key),
+                ))
+            } else {
+                quote!(::rustbinary::static_size::saturating_add(#sum, #size))
+            }
+        })
+}
+
+/// Container overhead (tag + terminator, or a single null for unit shapes).
+fn shape_overhead(fields: &Fields) -> proc_macro2::TokenStream {
+    match fields {
+        Fields::Unit => quote!(1usize),
+        Fields::Unnamed(_) | Fields::Named(_) => quote!(2usize),
+    }
+}
+
+/// Worst-case serialized content of one enum variant (excluding the variant
+/// key, which is added by [`max_variants`]).
+fn variant_content_size(fields: &Fields, packed: bool) -> proc_macro2::TokenStream {
+    match fields {
+        // A newtype variant writes its payload directly.
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => static_field_size(&f.unnamed[0], packed),
+        other => {
+            let payload = sum_fields(fields, packed);
+            let overhead = shape_overhead(other);
+            quote!(::rustbinary::static_size::saturating_add(#payload, #overhead))
+        }
+    }
 }
 
 fn max_variants(data: &DataEnum, packed: bool) -> proc_macro2::TokenStream {
     data.variants
         .iter()
         .fold(quote!(0usize), |maximum, variant| {
-            let size = sum_fields(&variant.fields, packed);
+            let key = key_size(&variant.ident.to_string());
+            let content = variant_content_size(&variant.fields, packed);
+            let size = quote!(::rustbinary::static_size::saturating_add(#key, #content));
             quote!(::rustbinary::static_size::max(#maximum, #size))
         })
 }
@@ -225,12 +270,21 @@ fn static_size_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream
     );
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     let (maximum, packed_bits) = match &input.data {
-        Data::Struct(data) => (
-            sum_fields(&data.fields, false),
-            sum_field_bits(&data.fields)?,
-        ),
+        Data::Struct(data) => {
+            let payload = sum_fields(&data.fields, false);
+            let overhead = shape_overhead(&data.fields);
+            (
+                quote!(::rustbinary::static_size::saturating_add(#payload, #overhead)),
+                sum_field_bits(&data.fields)?,
+            )
+        }
         Data::Enum(data) => {
-            let maximum = max_variants(data, false);
+            // External nextjson enums encode as an object with one variant key.
+            let variants = max_variants(data, false);
+            let maximum = quote!(::rustbinary::static_size::saturating_add(
+                ::rustbinary::static_size::saturating_add(1usize, #variants),
+                1usize,
+            ));
             let tag_bits = if data.variants.len() <= 1 {
                 0usize
             } else {
@@ -242,7 +296,7 @@ fn static_size_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 packed_payload = quote!(::rustbinary::static_size::max(#packed_payload, #bits));
             }
             (
-                quote!(::rustbinary::static_size::saturating_add(5, #maximum)),
+                maximum,
                 quote!(::rustbinary::static_size::saturating_add(#tag_bits, #packed_payload)),
             )
         }

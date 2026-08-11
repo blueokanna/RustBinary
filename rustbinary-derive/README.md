@@ -26,9 +26,10 @@ and the `derive` feature are additive and independent.
 | `Reflect` | `rustbinary::Reflect` | Inspect static field and variant metadata |
 | `BitPacked` | `rustbinary::BitPack` | Pack bounded fields at bit granularity |
 
-The macros do not implement `serde::Serialize` or `serde::Deserialize`.
-Combine them with Serde derives when the ordinary binary, CBOR, compression,
-encryption, or schema-evolution APIs are needed.
+The macros do not implement `nextjson::NsonSerialize` or
+`nextjson::NsonDeserialize`. Combine them with nextjson derives when the
+ordinary binary, CBOR, compression, encryption, or schema-evolution APIs are
+needed.
 
 ## Installation
 
@@ -37,7 +38,7 @@ macros:
 
 ```toml
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+nextjson = { version = "0.1", features = ["derive"] }
 rustbinary = { version = "0.1.4", features = [
     "derive",
     "fingerprint",
@@ -75,14 +76,14 @@ from crates.io. Publish `rustbinary-derive` before `rustbinary`.
 ## Complete Example
 
 The following type uses every derive provided by this package. It is a normal
-Serde value, has a compatibility fingerprint, exposes static metadata, and
+nextjson value, has a compatibility fingerprint, exposes static metadata, and
 has a separate bit-packed representation for bounded flags.
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::{Fingerprint, Reflect, StaticSize, TypeShape};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Fingerprint, Reflect, StaticSize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize, Fingerprint, Reflect, StaticSize)]
 struct Header {
     enabled: bool,
     partition: u16,
@@ -181,9 +182,9 @@ required because the generated constant incorporates the parameter's type
 identity:
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Serialize, Deserialize, Fingerprint)]
+#[derive(NsonSerialize, NsonDeserialize, Fingerprint)]
 struct Envelope<T> {
     sequence: u64,
     payload: T,
@@ -221,7 +222,7 @@ and `Vec<T>` intentionally do not implement it because they have no finite
 type-only upper bound. Use an application limit for those values instead:
 
 ```rust
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize)]
 struct DynamicMessage {
     body: String,
 }
@@ -266,7 +267,7 @@ match Header::SHAPE {
 ```
 
 This is structural metadata, not Rust ABI reflection. It does not expose
-memory offsets, padding, private runtime state, serde rename rules, or a
+memory offsets, padding, private runtime state, nextjson rename rules, or a
 dynamic type registry. Type aliases and generic parameters are represented by
 their declared token spelling.
 
@@ -351,8 +352,8 @@ represented safely from type syntax alone.
 | Union | rejected | rejected | rejected | rejected |
 
 Generic parameters must satisfy the trait required by the selected derive.
-Where clauses are preserved. Serde attributes remain Serde's concern and are
-not interpreted by these macros.
+Where clauses are preserved. nextjson attributes (`#[njson(...)]`) remain
+nextjson's concern and are not interpreted by these macros.
 
 ## Diagnostics and Failure Cases
 
@@ -374,9 +375,9 @@ non-zero padding, unknown tags, and rejected trailing bytes return typed
 
 ### Separate compatibility and storage layouts
 
-Use `Fingerprint` on the Serde model that crosses a compatibility boundary and
-`BitPacked` on a compact flags type used inside a frame. Do not assume that a
-bit-packed layout is compatible with the ordinary Serde layout.
+Use `Fingerprint` on the nextjson model that crosses a compatibility boundary
+and `BitPacked` on a compact flags type used inside a frame. Do not assume
+that a bit-packed layout is compatible with the ordinary nextjson layout.
 
 ### Bound untrusted input
 

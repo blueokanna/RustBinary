@@ -1,14 +1,25 @@
-use std::io::{self, Cursor, Read, Write};
+//! RFC 8949 CBOR configuration driven by nextjson's CBOR relay.
+//!
+//! Encoding and decoding delegate to [`nextjson::formats::Cbor`], which
+//! relays JSON-compatible events through the crate's validated
+//! `cross_format` engine (arrays and maps use RFC 8949 indefinite-length
+//! forms). Deterministic mode sorts object keys with RFC 8949 canonical
+//! ordering before encoding. Resource limits from the base [`Config`] are
+//! enforced around the relay; trailing bytes are always rejected because the
+//! relay requires exactly one CBOR root value.
 
-use ciborium::value::{CanonicalValue, Value};
-use serde::{de::DeserializeOwned, Serialize};
+use std::io::{Read, Write};
+
+use nextjson::formats::{Cbor, Format};
+use nextjson::Value;
+
+use crate::{Config, Error, Result, TrailingBytes};
 
 #[cfg(feature = "fingerprint")]
 use crate::{
     frame::{encode_header, validate_header, HEADER_LEN},
     schema::{config_fingerprint, hash_bytes, hash_u64, Fingerprint},
 };
-use crate::{Config, Error, Result, TrailingBytes};
 
 #[cfg(feature = "fingerprint")]
 const FRAME_MAGIC: [u8; 4] = *b"RBCF";
@@ -77,7 +88,7 @@ impl CborConfig {
     }
 
     /// Encodes a value as CBOR.
-    pub fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         self.serialize_into(&mut output, value)?;
         Ok(output)
@@ -86,72 +97,71 @@ impl CborConfig {
     /// Encodes CBOR directly into a writer.
     ///
     /// Deterministic mode allocates a normalized value tree because arbitrary
-    /// Serde maps cannot be sorted without retaining their encoded keys.
-    pub fn serialize_into<W: Write, T: Serialize + ?Sized>(
+    /// maps cannot be sorted without retaining their encoded keys.
+    pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
         self,
-        writer: W,
+        mut writer: W,
         value: &T,
     ) -> Result<()> {
-        let mut writer = LimitedWriter::new(writer, self.base.limit);
-        let result = if self.deterministic {
-            let normalized = normalize(Value::serialized(value).map_err(cbor_error)?)?;
-            ciborium::into_writer(&normalized, &mut writer)
+        let bytes = self.encode_value(value)?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    fn encode_value<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+        let bytes = if self.deterministic {
+            let value = nextjson::to_value(value).map_err(cbor_error)?;
+            let value = canonicalize(value)?;
+            Cbor.encode(&value).map_err(cbor_error)?
         } else {
-            ciborium::into_writer(value, &mut writer)
+            Cbor.encode(value).map_err(cbor_error)?
         };
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) if writer.exceeded => Err(Error::SizeLimit {
-                limit: self.base.limit.expect("exceeded only with a limit"),
-            }),
-            Err(error) => Err(cbor_error(error)),
-        }
+        self.enforce_byte_limit(bytes.len())?;
+        Ok(bytes)
     }
 
-    /// Computes the exact CBOR size with a counting writer.
-    pub fn serialized_size<T: Serialize + ?Sized>(self, value: &T) -> Result<u64> {
-        let mut counter = Counter { written: 0 };
-        self.serialize_into(&mut counter, value)?;
-        Ok(counter.written)
-    }
-
-    /// Decodes one owned CBOR value from a slice.
-    pub fn deserialize<T: DeserializeOwned>(self, input: &[u8]) -> Result<T> {
+    fn enforce_byte_limit(self, length: usize) -> Result<()> {
         if let Some(limit) = self.base.limit {
-            if input.len() as u64 > limit {
+            if length as u64 > limit {
                 return Err(Error::SizeLimit { limit });
             }
         }
-        let mut cursor = Cursor::new(input);
-        let value = ciborium::from_reader(&mut cursor).map_err(cbor_error)?;
-        if self.base.trailing == TrailingBytes::Reject && cursor.position() != input.len() as u64 {
-            return Err(Error::TrailingBytes {
-                remaining: input.len() - cursor.position() as usize,
-            });
+        Ok(())
+    }
+
+    /// Computes the exact CBOR size.
+    pub fn serialized_size<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<u64> {
+        let bytes = self.encode_value(value)?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// Decodes one owned CBOR value from a slice.
+    pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        input: &[u8],
+    ) -> Result<T> {
+        self.enforce_byte_limit(input.len())?;
+        let value = Cbor.decode(input).map_err(cbor_error)?;
+        if self.base.trailing == TrailingBytes::Reject {
+            // The nextjson relay already requires exactly one CBOR root value,
+            // so trailing bytes are rejected inside `Cbor::decode`.
         }
         Ok(value)
     }
 
     /// Decodes one owned CBOR value from a reader.
-    pub fn deserialize_from<R: Read, T: DeserializeOwned>(self, reader: R) -> Result<T> {
-        let mut reader = LimitedReader::new(reader, self.base.limit);
-        match ciborium::from_reader(&mut reader) {
-            Ok(value) => {
-                if self.base.trailing == TrailingBytes::Reject {
-                    let trailing = reader.drain_remaining()?;
-                    if trailing != 0 {
-                        return Err(Error::TrailingBytes {
-                            remaining: trailing,
-                        });
-                    }
-                }
-                Ok(value)
-            }
-            Err(_) if reader.exceeded => Err(Error::SizeLimit {
-                limit: self.base.limit.expect("exceeded only with a limit"),
-            }),
-            Err(error) => Err(cbor_error(error)),
+    pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        mut reader: R,
+    ) -> Result<T> {
+        let max = self.base.limit.unwrap_or(u64::MAX);
+        let read_cap = max.saturating_add(1);
+        let mut bytes = Vec::new();
+        reader.by_ref().take(read_cap).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
+            return Err(Error::SizeLimit { limit: max });
         }
+        self.deserialize(&bytes)
     }
 }
 
@@ -170,14 +180,17 @@ impl FingerprintedCborConfig {
     }
 
     /// Serializes a fingerprinted CBOR frame.
-    pub fn serialize<T: Serialize + Fingerprint + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
+        self,
+        value: &T,
+    ) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         self.serialize_into(&mut output, value)?;
         Ok(output)
     }
 
     /// Writes a fingerprinted CBOR frame directly into a writer.
-    pub fn serialize_into<W: Write, T: Serialize + Fingerprint + ?Sized>(
+    pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
         self,
         mut writer: W,
         value: &T,
@@ -187,13 +200,16 @@ impl FingerprintedCborConfig {
     }
 
     /// Validates the CBOR schema frame and decodes its owned payload.
-    pub fn deserialize<T: DeserializeOwned + Fingerprint>(self, input: &[u8]) -> Result<T> {
+    pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de> + Fingerprint>(
+        self,
+        input: &[u8],
+    ) -> Result<T> {
         let payload = validate_header(FRAME_MAGIC, input, self.config.fingerprint::<T>())?;
         self.config.deserialize(payload)
     }
 
     /// Reads and validates one fingerprinted CBOR value.
-    pub fn deserialize_from<R: Read, T: DeserializeOwned + Fingerprint>(
+    pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de> + Fingerprint>(
         self,
         mut reader: R,
     ) -> Result<T> {
@@ -204,7 +220,10 @@ impl FingerprintedCborConfig {
     }
 
     /// Computes the complete fingerprinted CBOR size.
-    pub fn serialized_size<T: Serialize + Fingerprint + ?Sized>(self, value: &T) -> Result<u64> {
+    pub fn serialized_size<T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
+        self,
+        value: &T,
+    ) -> Result<u64> {
         self.config
             .serialized_size(value)?
             .checked_add(HEADER_LEN as u64)
@@ -212,160 +231,40 @@ impl FingerprintedCborConfig {
     }
 }
 
-fn normalize(value: Value) -> Result<Value> {
+/// Recursively sorts object keys with RFC 8949 canonical ordering (shorter
+/// keys first, then bytewise).
+fn canonicalize(value: Value) -> Result<Value> {
     match value {
-        Value::Array(values) => values
+        Value::Array(items) => items
             .into_iter()
-            .map(normalize)
+            .map(canonicalize)
             .collect::<Result<Vec<_>>>()
             .map(Value::Array),
-        Value::Map(entries) => {
-            let mut entries = entries
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map
                 .into_iter()
-                .map(|(key, value)| Ok((normalize(key)?, normalize(value)?)))
-                .collect::<Result<Vec<_>>>()?;
-            entries.sort_by(|left, right| canonical_cmp(&left.0, &right.0));
-            if entries
-                .windows(2)
-                .any(|pair| canonical_cmp(&pair[0].0, &pair[1].0).is_eq())
-            {
+                .map(|(key, value)| Ok((key, canonicalize(value)?)))
+                .collect::<Result<_>>()?;
+            entries.sort_by(|left, right| canonical_cmp(left.0.as_bytes(), right.0.as_bytes()));
+            if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
                 return Err(Error::Cbor(
                     "deterministic maps cannot contain duplicate canonical keys".into(),
                 ));
             }
-            Ok(Value::Map(entries))
+            let mut out = nextjson::Map::new();
+            for (key, value) in entries {
+                out.insert(key, value);
+            }
+            Ok(Value::Object(out))
         }
-        Value::Tag(tag, value) => Ok(Value::Tag(tag, Box::new(normalize(*value)?))),
         scalar => Ok(scalar),
     }
 }
 
-fn canonical_cmp(left: &Value, right: &Value) -> std::cmp::Ordering {
-    CanonicalValue::from(left.clone()).cmp(&CanonicalValue::from(right.clone()))
+fn canonical_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 
-fn cbor_error(error: impl std::fmt::Display) -> Error {
+fn cbor_error(error: nextjson::Error) -> Error {
     Error::Cbor(error.to_string())
-}
-
-struct LimitedWriter<W> {
-    inner: W,
-    limit: Option<u64>,
-    written: u64,
-    exceeded: bool,
-}
-
-impl<W> LimitedWriter<W> {
-    const fn new(inner: W, limit: Option<u64>) -> Self {
-        Self {
-            inner,
-            limit,
-            written: 0,
-            exceeded: false,
-        }
-    }
-}
-
-impl<W: Write> Write for LimitedWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let amount = u64::try_from(bytes.len())
-            .map_err(|_| io::Error::other("CBOR write length exceeds u64"))?;
-        let next = self
-            .written
-            .checked_add(amount)
-            .ok_or_else(|| io::Error::other("CBOR write length overflow"))?;
-        if self.limit.is_some_and(|limit| next > limit) {
-            self.exceeded = true;
-            return Err(io::Error::other("CBOR size limit exceeded"));
-        }
-        let written = self.inner.write(bytes)?;
-        self.written = self
-            .written
-            .checked_add(written as u64)
-            .ok_or_else(|| io::Error::other("CBOR write length overflow"))?;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-struct LimitedReader<R> {
-    inner: R,
-    limit: Option<u64>,
-    read: u64,
-    exceeded: bool,
-}
-
-impl<R> LimitedReader<R> {
-    const fn new(inner: R, limit: Option<u64>) -> Self {
-        Self {
-            inner,
-            limit,
-            read: 0,
-            exceeded: false,
-        }
-    }
-}
-
-impl<R: Read> LimitedReader<R> {
-    fn drain_remaining(&mut self) -> Result<usize> {
-        let mut trailing = 0usize;
-        let mut buffer = [0u8; 8 * 1024];
-        loop {
-            let read = self.inner.read(&mut buffer)?;
-            if read == 0 {
-                return Ok(trailing);
-            }
-            trailing = trailing
-                .checked_add(read)
-                .ok_or(Error::SizeLimit { limit: u64::MAX })?;
-            self.read = self
-                .read
-                .checked_add(read as u64)
-                .ok_or(Error::SizeLimit { limit: u64::MAX })?;
-            if let Some(limit) = self.limit {
-                if self.read > limit {
-                    self.exceeded = true;
-                    return Err(Error::SizeLimit { limit });
-                }
-            }
-        }
-    }
-}
-
-impl<R: Read> Read for LimitedReader<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        let allowed = match self.limit {
-            Some(limit) if self.read >= limit => {
-                self.exceeded = true;
-                return Err(io::Error::other("CBOR size limit exceeded"));
-            }
-            Some(limit) => usize::try_from((limit - self.read).min(output.len() as u64))
-                .map_err(|_| io::Error::other("CBOR read length exceeds usize"))?,
-            None => output.len(),
-        };
-        let read = self.inner.read(&mut output[..allowed])?;
-        self.read += read as u64;
-        Ok(read)
-    }
-}
-
-struct Counter {
-    written: u64,
-}
-
-impl Write for Counter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.written = self
-            .written
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("CBOR size overflow"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }

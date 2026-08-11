@@ -1,15 +1,17 @@
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct Envelope<'a> {
+    #[njson(borrow)]
     topic: &'a str,
-    #[serde(borrow)]
-    payload: &'a [u8],
+    #[njson(borrow)]
+    payload: &'a str,
     nested: Metadata<'a>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct Metadata<'a> {
+    #[njson(borrow)]
     source: &'a str,
 }
 
@@ -23,7 +25,7 @@ fn points_into(whole: &[u8], part: &[u8]) -> bool {
 fn main() -> rustbinary::Result<()> {
     let value = Envelope {
         topic: "events/temperature",
-        payload: b"sensor-frame",
+        payload: "sensor-frame",
         nested: Metadata { source: "edge-07" },
     };
     let config = rustbinary::core::options()
@@ -37,7 +39,7 @@ fn main() -> rustbinary::Result<()> {
     let decoded: Envelope<'_> = config.deserialize(&frame[..written])?;
     assert_eq!(decoded, value);
     assert!(points_into(&frame, decoded.topic.as_bytes()));
-    assert!(points_into(&frame, decoded.payload));
+    assert!(points_into(&frame, decoded.payload.as_bytes()));
     assert!(points_into(&frame, decoded.nested.source.as_bytes()));
     assert_eq!(written, required);
 

@@ -14,7 +14,7 @@ pub struct FieldInfo {
 pub struct VariantInfo {
     /// Declared variant name.
     pub name: &'static str,
-    /// Zero-based discriminant used by the default Serde representation.
+    /// Zero-based discriminant used by the default nextjson representation.
     pub index: usize,
     /// Variant fields in declaration order.
     pub fields: &'static [FieldInfo],

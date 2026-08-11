@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::{
     core::{Error, ErrorCategory},
     pipeline::EncryptionKey,
 };
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct AuditBatch {
     tenant: String,
     attributes: BTreeMap<String, String>,

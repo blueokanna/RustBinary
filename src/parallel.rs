@@ -1,7 +1,5 @@
 use std::{num::NonZeroUsize, thread};
 
-use serde::{de::DeserializeOwned, Serialize};
-
 use crate::{Config, Error, Result, TrailingBytes};
 
 const MAGIC: &[u8; 4] = b"RBP1";
@@ -43,7 +41,10 @@ impl ParallelConfig {
     }
 
     /// Encodes an ordered collection as a deterministic parallel batch frame.
-    pub fn serialize_batch<T: Serialize + Sync>(self, values: &[T]) -> Result<Vec<u8>> {
+    pub fn serialize_batch<T: nextjson::NsonSerialize + Sync>(
+        self,
+        values: &[T],
+    ) -> Result<Vec<u8>> {
         self.enforce_collection_limit(values.len())?;
         let payloads = parallel_map(values, self.workers.get(), |value| {
             self.base.serialize(value)
@@ -82,7 +83,10 @@ impl ParallelConfig {
     }
 
     /// Validates and decodes an ordered parallel batch frame.
-    pub fn deserialize_batch<T: DeserializeOwned + Send>(self, input: &[u8]) -> Result<Vec<T>> {
+    pub fn deserialize_batch<T: for<'de> nextjson::NsonDeserialize<'de> + Send>(
+        self,
+        input: &[u8],
+    ) -> Result<Vec<T>> {
         self.enforce_byte_limit(input.len())?;
         let mut cursor = FrameCursor::new(input);
         if cursor.take(4)? != MAGIC {

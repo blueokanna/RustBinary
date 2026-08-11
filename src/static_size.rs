@@ -46,24 +46,31 @@ macro_rules! fixed {
     )+};
 }
 
+// `MAX_SIZE` is the worst case across supported profiles. In the unified
+// nextjson data model every integer crosses the wire at `u64` / `i64` width, so
+// the fixed-width profile dominates small integers (tag + 8 bytes) while the
+// marker-varint profile dominates 64-bit values (tag + 9 bytes). The
+// bit-packed bounds are independent of the wire format.
 fixed! {
-    () => (0, 0), bool => (1, 1), char => (4, 32),
-    i8 => (1, 8), u8 => (1, 8),
-    i16 => (3, 16), u16 => (3, 16),
-    i32 => (5, 32), u32 => (5, 32),
-    i64 => (9, 64), u64 => (9, 64),
-    i128 => (17, 128), u128 => (17, 128),
-    f32 => (4, 32), f64 => (8, 64)
+    () => (1, 0), bool => (1, 1), char => (13, 32),
+    i8 => (9, 8), u8 => (9, 8),
+    i16 => (9, 16), u16 => (9, 16),
+    i32 => (9, 32), u32 => (9, 32),
+    i64 => (10, 64), u64 => (10, 64),
+    i128 => (18, 128), u128 => (18, 128),
+    f32 => (5, 32), f64 => (9, 64)
 }
 
 impl<T: StaticSize> StaticSize for Option<T> {
-    const MAX_SIZE: usize = saturating_add(1, T::MAX_SIZE);
+    // None is a single null tag; Some is the tagged value.
+    const MAX_SIZE: usize = max(1, T::MAX_SIZE);
     const PACKED_MAX_BITS: usize = saturating_add(1, T::PACKED_MAX_BITS);
     const PACKED_MAX_SIZE: usize = bytes_for_bits(Self::PACKED_MAX_BITS);
 }
 
 impl<T: StaticSize, const N: usize> StaticSize for [T; N] {
-    const MAX_SIZE: usize = saturating_mul(T::MAX_SIZE, N);
+    // Array tag + elements + terminator.
+    const MAX_SIZE: usize = saturating_add(saturating_mul(T::MAX_SIZE, N), 2);
     const PACKED_MAX_BITS: usize = saturating_mul(T::PACKED_MAX_BITS, N);
     const PACKED_MAX_SIZE: usize = bytes_for_bits(Self::PACKED_MAX_BITS);
 }
@@ -77,7 +84,8 @@ impl<T> StaticSize for PhantomData<T> {
 macro_rules! tuple_size {
     ($($name:ident),+) => {
         impl<$($name: StaticSize),+> StaticSize for ($($name,)+) {
-            const MAX_SIZE: usize = 0usize $(.saturating_add($name::MAX_SIZE))+;
+            // Array tag + elements + terminator.
+            const MAX_SIZE: usize = 2usize $(.saturating_add($name::MAX_SIZE))+;
             const PACKED_MAX_BITS: usize = 0usize $(.saturating_add($name::PACKED_MAX_BITS))+;
             const PACKED_MAX_SIZE: usize = bytes_for_bits(Self::PACKED_MAX_BITS);
         }

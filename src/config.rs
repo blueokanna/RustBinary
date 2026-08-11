@@ -1,9 +1,5 @@
-use serde::{Deserialize, Serialize};
-
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use serde::de::DeserializeOwned;
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
 
@@ -195,12 +191,12 @@ impl Config {
     }
     /// Serializes a value into a new vector.
     #[cfg(feature = "alloc")]
-    pub fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         ser::to_vec(value, self)
     }
     /// Serializes a value directly into `writer`.
     #[cfg(feature = "std")]
-    pub fn serialize_into<W: Write, T: Serialize + ?Sized>(
+    pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
         self,
         writer: W,
         value: &T,
@@ -211,8 +207,8 @@ impl Config {
     ///
     /// If capacity is insufficient, the error reports the exact required size.
     /// The prefix that fits in `output` is written before that error is returned.
-    /// A user-provided [`Serialize`] implementation may still allocate internally.
-    pub fn serialize_into_slice<T: Serialize + ?Sized>(
+    /// A user-provided [`nextjson::NsonSerialize`] implementation may still allocate internally.
+    pub fn serialize_into_slice<T: nextjson::NsonSerialize + ?Sized>(
         self,
         output: &mut [u8],
         value: &T,
@@ -220,16 +216,22 @@ impl Config {
         ser::to_slice(output, value, self)
     }
     /// Calculates the exact encoded size without retaining encoded bytes.
-    pub fn serialized_size<T: Serialize + ?Sized>(self, value: &T) -> Result<u64> {
+    pub fn serialized_size<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<u64> {
         ser::size(value, self)
     }
     /// Deserializes a value that may borrow from `input`.
-    pub fn deserialize<'de, T: Deserialize<'de>>(self, input: &'de [u8]) -> Result<T> {
+    pub fn deserialize<'de, T: nextjson::NsonDeserialize<'de>>(
+        self,
+        input: &'de [u8],
+    ) -> Result<T> {
         decoder::from_slice(input, self)
     }
     /// Reads and deserializes an owned value.
     #[cfg(feature = "std")]
-    pub fn deserialize_from<R: Read, T: DeserializeOwned>(self, reader: R) -> Result<T> {
+    pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        reader: R,
+    ) -> Result<T> {
         crate::adapters::deserialize_from(self, reader)
     }
 }
@@ -272,28 +274,35 @@ pub trait Options: Sized {
         self.config().allow_trailing_bytes()
     }
     #[cfg(feature = "alloc")]
-    fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         self.config().serialize(value)
     }
     #[cfg(feature = "std")]
-    fn serialize_into<W: Write, T: Serialize + ?Sized>(self, writer: W, value: &T) -> Result<()> {
+    fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
+        self,
+        writer: W,
+        value: &T,
+    ) -> Result<()> {
         self.config().serialize_into(writer, value)
     }
-    fn serialize_into_slice<T: Serialize + ?Sized>(
+    fn serialize_into_slice<T: nextjson::NsonSerialize + ?Sized>(
         self,
         output: &mut [u8],
         value: &T,
     ) -> Result<usize> {
         self.config().serialize_into_slice(output, value)
     }
-    fn serialized_size<T: Serialize + ?Sized>(self, value: &T) -> Result<u64> {
+    fn serialized_size<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<u64> {
         self.config().serialized_size(value)
     }
-    fn deserialize<'de, T: Deserialize<'de>>(self, input: &'de [u8]) -> Result<T> {
+    fn deserialize<'de, T: nextjson::NsonDeserialize<'de>>(self, input: &'de [u8]) -> Result<T> {
         self.config().deserialize(input)
     }
     #[cfg(feature = "std")]
-    fn deserialize_from<R: Read, T: DeserializeOwned>(self, reader: R) -> Result<T> {
+    fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        reader: R,
+    ) -> Result<T> {
         self.config().deserialize_from(reader)
     }
 }

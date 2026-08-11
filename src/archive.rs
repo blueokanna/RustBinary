@@ -1,6 +1,6 @@
 //! Validated relative-pointer archives for read-only memory mapping.
 //!
-//! This module is deliberately separate from the Serde stream codec. Archive
+//! This module is deliberately separate from the nextjson stream codec. Archive
 //! values use rkyv's flat, relative-pointer layout and can be accessed in place
 //! after one structural validation pass. RustBinary adds a stable envelope,
 //! explicit application schema identifiers, resource limits, and a read-only

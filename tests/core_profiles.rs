@@ -1,14 +1,15 @@
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
 use rustbinary::ErrorCategory;
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, NsonDeserialize, PartialEq, NsonSerialize)]
 struct Borrowed<'a> {
     id: u64,
     delta: i32,
+    #[njson(borrow)]
     name: &'a str,
-    #[serde(borrow)]
-    payload: &'a [u8],
+    #[njson(borrow)]
+    payload: &'a str,
 }
 
 #[test]
@@ -17,7 +18,7 @@ fn core_slice_codec_needs_neither_std_io_nor_codec_allocation() {
         id: 65_536,
         delta: -7,
         name: "compact-v1",
-        payload: b"caller-owned",
+        payload: "caller-owned",
     };
     let config = rustbinary::options().with_limit(128);
     let required = config.serialized_size(&value).unwrap() as usize;

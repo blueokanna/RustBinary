@@ -1,9 +1,9 @@
 use std::num::NonZeroUsize;
 
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::core::{Error, ErrorCategory};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct Partition {
     sequence: u64,
     payload: Vec<u8>,

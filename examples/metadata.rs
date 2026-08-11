@@ -1,14 +1,14 @@
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::{
     core::{Error, ErrorCategory},
     protocol::{Fingerprint as _, Reflect as _, StaticSize as _, TypeShape},
 };
-use serde::{Deserialize, Serialize};
 
 #[derive(
     Debug,
     PartialEq,
-    Serialize,
-    Deserialize,
+    NsonSerialize,
+    NsonDeserialize,
     rustbinary::protocol::Fingerprint,
     rustbinary::protocol::Reflect,
     rustbinary::protocol::StaticSize,
@@ -19,7 +19,7 @@ struct Header {
     coordinates: [i32; 2],
 }
 
-#[derive(Serialize, Deserialize, rustbinary::protocol::Fingerprint)]
+#[derive(NsonSerialize, NsonDeserialize, rustbinary::protocol::Fingerprint)]
 struct ReorderedHeader {
     partition: u16,
     online: bool,

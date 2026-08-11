@@ -4,12 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
 const DEFAULT_SAMPLE_TIME: Duration = Duration::from_millis(200);
 const SAMPLES: usize = 9;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, NsonDeserialize, PartialEq, NsonSerialize)]
 struct Telemetry {
     sequence: u64,
     timestamp_delta: i64,
@@ -68,7 +68,7 @@ fn telemetry_record(readings: usize, payload: usize) -> Telemetry {
 
 fn run_shape<T>(shape: &str, value: &T, sample_time: Duration)
 where
-    T: DeserializeOwned + PartialEq + Serialize,
+    T: for<'de> nextjson::NsonDeserialize<'de> + PartialEq + NsonSerialize,
 {
     let owned = benchmark_owned(value, sample_time);
     let caller_buffer = benchmark_caller_buffer(value, sample_time);
@@ -83,7 +83,7 @@ where
 
 fn benchmark_owned<T>(value: &T, sample_time: Duration) -> CodecResult
 where
-    T: DeserializeOwned + PartialEq + Serialize,
+    T: for<'de> nextjson::NsonDeserialize<'de> + PartialEq + NsonSerialize,
 {
     let config = rustbinary::options();
     let encoded = config.serialize(value).expect("RustBinary encode failed");
@@ -111,7 +111,7 @@ where
 
 fn benchmark_caller_buffer<T>(value: &T, sample_time: Duration) -> CodecResult
 where
-    T: DeserializeOwned + PartialEq + Serialize,
+    T: for<'de> nextjson::NsonDeserialize<'de> + PartialEq + NsonSerialize,
 {
     let config = rustbinary::options();
     let required = usize::try_from(

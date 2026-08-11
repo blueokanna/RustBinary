@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
 use rustbinary::{
     core::options,
@@ -11,8 +11,8 @@ use rustbinary::{
     Clone,
     Debug,
     PartialEq,
-    Serialize,
-    Deserialize,
+    NsonSerialize,
+    NsonDeserialize,
     rustbinary::protocol::Fingerprint,
     rustbinary::protocol::Reflect,
     rustbinary::protocol::StaticSize,

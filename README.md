@@ -1,8 +1,16 @@
 # RustBinary
 
-RustBinary is a bounded binary codec for Serde with explicit wire profiles and
-opt-in systems for adaptive encoding, bit packing, schema identity, CBOR,
-compression, authenticated encryption, schema evolution, and parallel batches.
+RustBinary is a bounded binary codec for **nextjson** with explicit wire
+profiles and opt-in systems for adaptive encoding, bit packing, schema
+identity, CBOR, compression, authenticated encryption, schema evolution, and
+parallel batches.
+
+The codec is built directly on nextjson's format-neutral contracts
+(`NsonSerialize` / `NsonDeserialize` + `FormatEncoder` / `FormatDecoder`),
+replacing the former Serde dependency. The binary wire format is a
+type-tagged, self-describing stream: every value carries a one-byte type tag
+and containers are terminator-delimited, so `Option`, `Value`, untagged enums
+and borrowed strings round-trip unambiguously.
 
 The product surface is deliberately split into three layers:
 
@@ -40,19 +48,19 @@ format is not implied unless a profile explicitly documents it.
 
 | Capability | Status | Implementation |
 | --- | --- | --- |
-| Binary Serde codec | Implemented | Fixed-width compatibility and strict marker-varint profiles |
+| Binary nextjson codec | Implemented | Fixed-width compatibility and strict marker-varint profiles |
 | Adaptive integers | Implemented | Per-value marker width and ZigZag signed values |
 | Adaptive strings | Implemented | Runtime choice between raw UTF-8 and ASCII7 |
 | Adaptive collections | Implemented | Runtime minimum-size choice among raw, delta, and RLE `i64` frames |
 | SIMD | Implemented for hot scans | Runtime SSE2/AVX2 on x86_64 and NEON on AArch64; scalar fallback |
 | AVX-512, SVE, SME | Detection only | Reported by `hardware_capabilities`; no codec kernels are claimed |
-| Zero-allocation codec paths | Implemented | Exact-size Serde output and caller-owned adaptive decode buffers |
-| Borrowed zero-copy decoding | Implemented | Nested `&str` and `&[u8]` point directly into the input frame |
+| Zero-allocation codec paths | Implemented | Exact-size nextjson output and caller-owned adaptive decode buffers |
+| Borrowed zero-copy decoding | Implemented | Nested `&str` fields point directly into the input frame |
 | Read-only relative-pointer archive | Implemented behind `archive` | Versioned envelope, explicit schema ID, bounded validation, and in-place mmap access |
 | Bit packing | Implemented | `BitPacked` derive, checked widths, canonical zero padding |
 | Schema fingerprinting | Implemented | Type structure plus complete binary/CBOR configuration |
 | Compile-time bounds | Implemented | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}` |
-| RFC 8949 CBOR | Implemented | Ciborium codec plus recursive canonical map ordering mode |
+| RFC 8949 CBOR | Implemented | nextjson CBOR relay plus recursive canonical map ordering mode |
 | Schema evolution | Implemented | Stable field IDs, versions, defaults, unknown-field skipping, migrations |
 | Compression | Implemented | Adaptive Zstandard frame; raw data retained when compression loses |
 | Encryption | Implemented | XChaCha20-Poly1305, random 192-bit nonce, authenticated frame header |
@@ -65,15 +73,15 @@ format is not implied unless a profile explicitly documents it.
 | Async fiber/UFA | Not implemented | No fake async wrapper is exposed over blocking I/O |
 
 The distinction is deliberate: hardware detection is not described as hardware
-acceleration, and the Serde codec and relative-pointer archive remain separate
-formats and APIs.
+acceleration, and the nextjson codec and relative-pointer archive remain
+separate formats and APIs.
 
 ## Install
 
 ```toml
 [dependencies]
 rustbinary = "0.1.4"
-serde = { version = "1", features = ["derive"] }
+nextjson = { version = "0.1", features = ["derive"] }
 ```
 
 Enable a complete optional layer only when it is actually needed:
@@ -97,7 +105,7 @@ Zstandard dependency requires a platform C toolchain.
 | Feature | Default | Purpose and dependency |
 | --- | --- | --- |
 | `std` | Yes | Owned Core and I/O APIs; required by Pipeline and runtime SIMD features |
-| `alloc` | Via `std` | Owned `Vec`/`String` APIs without requiring `std` |
+| `alloc` | Via `std` | Compatibility marker; owned `Vec`/`String` APIs are always available (nextjson's `FormatDecoder` requires `alloc`) |
 | `protocol` | No | Complete Protocol layer convenience bundle |
 | `pipeline` | No | Complete Pipeline layer convenience bundle |
 | `archive` | No | Validated read-only mmap archives; requires `std`, rkyv, and memmap2 |
@@ -108,7 +116,7 @@ Zstandard dependency requires a platform C toolchain.
 | `simd` | No | Runtime detection and hot-scan dispatch; never changes bytes |
 | `bit-packing` | No | Core bit-level traits and caller-buffer codec |
 | `adaptive` | No | Caller-buffer adaptive strings/collections; implies `bit-packing`; `alloc` adds owned APIs |
-| `cbor` | No | RFC 8949 through Ciborium |
+| `cbor` | No | RFC 8949 through nextjson's CBOR relay |
 | `compression` | No | Adaptive Zstandard frame |
 | `encryption` | No | XChaCha20-Poly1305, OS randomness, zeroization |
 | `parallel` | No | Scoped-thread ordered batch frames |
@@ -133,9 +141,9 @@ rejected trailing bytes. `legacy_options()` explicitly selects the former
 unbounded fixed-width profile and allowed trailing bytes.
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, NsonSerialize, NsonDeserialize)]
 struct Packet {
     sequence: u64,
     payload: Vec<u8>,
@@ -167,22 +175,25 @@ accidentally run before compression through this chain.
 ### Core Wire Specification
 
 The format encodes values, never Rust object memory. It does not serialize
-padding, native pointers, vtables, or `repr(Rust)` layout.
+padding, native pointers, vtables, or `repr(Rust)` layout. Every value starts
+with a one-byte type tag; arrays and objects are terminator-delimited
+(`0xff`). The tags make the stream self-describing, so `Option`, `Value`,
+untagged enums and `peek_token` round-trip unambiguously.
 
-| Serde value | Wire representation |
+| nextjson value | Wire representation |
 | --- | --- |
-| `bool` | One byte, exactly `0` or `1` |
-| `Option<T>` | One-byte `0`/`1` tag, then `T` for `Some` |
-| `u8` / `i8` | One byte |
-| Fixed integer | Exact declared width in configured endian |
-| Variable unsigned integer | Canonical marker plus 0/2/4/8/16 payload bytes |
-| Variable signed integer | ZigZag followed by unsigned marker encoding |
-| `f32` / `f64` | IEEE 754 bits in configured endian |
-| `char` | One valid UTF-8 scalar without a length prefix |
-| String / bytes | Encoded byte length followed by exact bytes |
-| Sequence / map | Declared count followed by values or entries |
-| Tuple / struct | Fields in Serde declaration order without names |
-| Enum | Configured `u32` variant index followed by variant data |
+| `null` / unit / `None` | Tag `0x00` |
+| `false` / `true` | Tags `0x01` / `0x02` |
+| `u64` / `u128` | Tags `0x03` / `0x04` + unsigned payload |
+| `i64` / `i128` | Tags `0x05` / `0x06` + ZigZag payload |
+| `f64` / `f32` | Tags `0x07` / `0x08` + IEEE 754 bits in configured endian |
+| String / char | Tag `0x09` + encoded byte length + UTF-8 |
+| Array | Tag `0x0a` + elements + `0xff` |
+| Object | Tag `0x0b` + (`string key` + value) pairs + `0xff` |
+
+Integer and length payloads use the marker-varint scheme (or fixed `u64`
+width in the legacy profile, because nextjson's unified data model crosses
+all integers at `u64`/`i64` width).
 
 Marker varints are canonical:
 
@@ -196,7 +207,7 @@ Marker varints are canonical:
 | `255` | Reserved and invalid | Never accepted |
 
 Decoders reject non-minimal forms, narrowing overflow, malformed UTF-8,
-invalid primitive tags, truncation, resource-limit violations, and disallowed
+invalid type tags, truncation, resource-limit violations, and disallowed
 trailing bytes.
 
 ## Zero Allocation and Zero Copy
@@ -211,25 +222,25 @@ Packed ASCII7 strings necessarily expand into owned text; raw adaptive UTF-8
 can be returned as `Cow::Borrowed`.
 
 ```rust
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(NsonSerialize, NsonDeserialize)]
 struct View<'a> {
     name: &'a str,
-    #[serde(borrow)]
-    payload: &'a [u8],
+    #[njson(borrow)]
+    payload: &'a str,
 }
 
-let source = View { name: "edge", payload: b"frame" };
+let source = View { name: "edge", payload: "frame" };
 let config = rustbinary::options().with_limit(4096);
 let mut storage = vec![0; config.serialized_size(&source)? as usize];
 let written = config.serialize_into_slice(&mut storage, &source)?;
 let view: View<'_> = config.deserialize(&storage[..written])?;
-assert_eq!(view.payload, b"frame");
+assert_eq!(view.payload, "frame");
 # Ok::<(), rustbinary::Error>(())
 ```
 
-The codec itself does not allocate on this path. A user-defined Serde
+The codec itself does not allocate on this path. A user-defined nextjson
 implementation can still allocate internally.
 
 Codec-owned allocation-free paths include `serialized_size`,
@@ -238,8 +249,8 @@ Codec-owned allocation-free paths include `serialized_size`,
 buffers. Reader-based decoding requires `DeserializeOwned`; returning a
 reference into a temporary reader buffer would be unsound.
 
-Borrowed parsing is true zero-copy for borrowed string and byte payloads. It is
-the Serde stream path; [zero_copy.rs](examples/zero_copy.rs) contains its
+Borrowed parsing is true zero-copy for borrowed string payloads. It is the
+nextjson stream path; [zero_copy.rs](examples/zero_copy.rs) contains its
 pointer-range assertions. Use the separate archive surface for mapped object
 graphs.
 
@@ -268,8 +279,8 @@ and proves that strings, vectors, and child records point inside the mapping.
 
 ## Adaptive Encoding
 
-`with_adaptive_encoding()` retains the compact Serde profile and adds explicit
-data-aware APIs. Strategy selection compares complete encoded sizes, uses a
+`with_adaptive_encoding()` retains the compact nextjson profile and adds
+explicit data-aware APIs. Strategy selection compares complete encoded sizes, uses a
 stable tag in the frame, and validates canonical varints, padding, lengths,
 delta overflow, and RLE runs while decoding.
 
@@ -298,7 +309,7 @@ assert_eq!(
 ```
 
 Adaptive frames are explicit because silently changing the representation of
-ordinary Serde fields would break protocol compatibility.
+ordinary fields would break protocol compatibility.
 
 String frames contain `strategy:u8`, a canonical decoded-byte-length varint,
 and payload. Strategy 0 is raw UTF-8; strategy 1 is ASCII7 packed
@@ -332,11 +343,12 @@ those backends require target hardware CI before becoming a wire-engine claim.
 ## Derived Systems
 
 ```rust
+use nextjson::{NsonDeserialize, NsonSerialize};
 use rustbinary::{Fingerprint as _, Reflect as _, StaticSize as _};
 
 #[derive(
-    serde::Serialize,
-    serde::Deserialize,
+    NsonSerialize,
+    NsonDeserialize,
     rustbinary::Fingerprint,
     rustbinary::Reflect,
     rustbinary::StaticSize,
@@ -480,17 +492,17 @@ failure.
 
 ## Wire and Security Rules
 
-- Boolean and option tags are one-byte `0` or `1` values.
+- Every value starts with a one-byte type tag; `0xff` terminates containers.
 - Floats preserve their IEEE 754 bit pattern; endianness is explicit.
 - Variable integers reject marker 255 and non-minimal encodings.
-- Struct fields are encoded in declaration order; names are not in binary payloads.
-- Ordinary maps preserve Serde iteration order and are not deterministic.
+- Struct fields are encoded as named object keys.
+- Ordinary maps preserve nextjson iteration order and are not deterministic.
 - Deterministic map serialization requires deterministic CBOR or an ordered map.
 - Compression and encryption frames validate versions, flags, lengths, and limits.
 - Stream decoders validate frame length relationships and configured limits before body allocation.
 - Decryption authenticates before deserialization.
 - Fingerprints are compatibility checks, not cryptographic authentication.
-- User-defined Serde implementations may allocate or reject borrowed visitors.
+- User-defined nextjson implementations may allocate or reject borrowed visitors.
 
 At every untrusted boundary, set realistic byte and collection limits, reject
 trailing bytes unless an outer protocol owns them, authenticate adversarial
@@ -520,8 +532,8 @@ cargo bench --bench codec_comparison
 ```
 
 The benchmark compares RustBinary's owned and caller-buffer Compact V1 paths
-over the same Serde shapes. It validates each round trip before collecting nine
-calibrated samples and prints the median as raw Markdown.
+over the same nextjson shapes. It validates each round trip before collecting
+nine calibrated samples and prints the median as raw Markdown.
 
 ### Executable Examples
 

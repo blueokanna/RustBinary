@@ -1,7 +1,5 @@
 use std::io::{Cursor, Read, Write};
 
-use serde::{de::DeserializeOwned, Serialize};
-
 #[cfg(feature = "cbor")]
 use crate::CborConfig;
 use crate::{Config, Error, Result, TrailingBytes};
@@ -68,7 +66,7 @@ impl CompressedConfig {
     }
 
     /// Serializes and adaptively compresses a framed payload.
-    pub fn serialize<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         let raw = self.serialize_payload(value)?;
         let compressed = if raw.len() >= self.threshold {
             Some(
@@ -92,7 +90,7 @@ impl CompressedConfig {
     }
 
     /// Serializes a compression frame into a writer.
-    pub fn serialize_into<W: Write, T: Serialize + ?Sized>(
+    pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
         self,
         mut writer: W,
         value: &T,
@@ -102,7 +100,10 @@ impl CompressedConfig {
     }
 
     /// Deserializes an adaptively compressed frame.
-    pub fn deserialize<T: DeserializeOwned>(self, input: &[u8]) -> Result<T> {
+    pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        input: &[u8],
+    ) -> Result<T> {
         let header = input.get(..HEADER_LEN).ok_or(Error::UnexpectedEnd)?;
         let (_, declared_raw_len, _) = parse_header(header)?;
         self.enforce_raw_limit(declared_raw_len)?;
@@ -136,7 +137,10 @@ impl CompressedConfig {
     }
 
     /// Reads and deserializes one complete compression frame.
-    pub fn deserialize_from<R: Read, T: DeserializeOwned>(self, mut reader: R) -> Result<T> {
+    pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        mut reader: R,
+    ) -> Result<T> {
         let mut header = [0; HEADER_LEN];
         reader.read_exact(&mut header)?;
         let (_, raw_len, stored_len) = parse_header(&header)?;
@@ -159,7 +163,7 @@ impl CompressedConfig {
         self.deserialize(&frame)
     }
 
-    fn serialize_payload<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    fn serialize_payload<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         match self.payload {
             PayloadFormat::Binary(config) => config.serialize(value),
             #[cfg(feature = "cbor")]
@@ -167,7 +171,10 @@ impl CompressedConfig {
         }
     }
 
-    fn deserialize_payload<T: DeserializeOwned>(self, payload: &[u8]) -> Result<T> {
+    fn deserialize_payload<T: for<'de> nextjson::NsonDeserialize<'de>>(
+        self,
+        payload: &[u8],
+    ) -> Result<T> {
         match self.payload {
             PayloadFormat::Binary(config) => config.deserialize(payload),
             #[cfg(feature = "cbor")]

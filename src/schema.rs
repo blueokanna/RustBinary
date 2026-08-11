@@ -11,10 +11,6 @@ use std::{
     io::{Read, Write},
 };
 
-#[cfg(feature = "std")]
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     frame::{encode_header, validate_header, HEADER_LEN},
     Config, Endian, Error, IntEncoding, Result, TrailingBytes,
@@ -193,7 +189,10 @@ impl FingerprintedConfig {
     }
 
     /// Serializes a fingerprint header followed by the configured binary payload.
-    pub fn serialize<T: Serialize + Fingerprint + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
+    pub fn serialize<T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
+        self,
+        value: &T,
+    ) -> Result<Vec<u8>> {
         let payload = self.config.serialize(value)?;
         let mut output = Vec::with_capacity(HEADER_LEN.saturating_add(payload.len()));
         output.extend_from_slice(&encode_header(FRAME_MAGIC, T::fingerprint(self.config)));
@@ -203,7 +202,7 @@ impl FingerprintedConfig {
 
     /// Writes a fingerprint header and payload directly into `writer`.
     #[cfg(feature = "std")]
-    pub fn serialize_into<W: Write, T: Serialize + Fingerprint + ?Sized>(
+    pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
         self,
         mut writer: W,
         value: &T,
@@ -213,7 +212,7 @@ impl FingerprintedConfig {
     }
 
     /// Writes a fingerprinted frame into caller-owned memory.
-    pub fn serialize_into_slice<T: Serialize + Fingerprint + ?Sized>(
+    pub fn serialize_into_slice<T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
         self,
         output: &mut [u8],
         value: &T,
@@ -246,7 +245,7 @@ impl FingerprintedConfig {
     }
 
     /// Validates the header and decodes a value that may borrow from the payload.
-    pub fn deserialize<'de, T: Deserialize<'de> + Fingerprint>(
+    pub fn deserialize<'de, T: nextjson::NsonDeserialize<'de> + Fingerprint>(
         self,
         input: &'de [u8],
     ) -> Result<T> {
@@ -256,7 +255,7 @@ impl FingerprintedConfig {
 
     /// Reads, validates, and decodes an owned fingerprinted value.
     #[cfg(feature = "std")]
-    pub fn deserialize_from<R: Read, T: DeserializeOwned + Fingerprint>(
+    pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de> + Fingerprint>(
         self,
         mut reader: R,
     ) -> Result<T> {
@@ -267,7 +266,10 @@ impl FingerprintedConfig {
     }
 
     /// Computes the complete framed size.
-    pub fn serialized_size<T: Serialize + Fingerprint + ?Sized>(self, value: &T) -> Result<u64> {
+    pub fn serialized_size<T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
+        self,
+        value: &T,
+    ) -> Result<u64> {
         self.config
             .serialized_size(value)?
             .checked_add(HEADER_LEN as u64)
