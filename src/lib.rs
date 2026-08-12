@@ -439,6 +439,92 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "bit-packing", feature = "static-size"))]
+    #[test]
+    fn bit_packed_struct_and_enum_round_trip_within_static_bounds() {
+        let config = options().with_bit_packing();
+        for header in [
+            PackedHeader {
+                mode: 0,
+                enabled: false,
+                delta: -1,
+            },
+            PackedHeader {
+                mode: 7,
+                enabled: true,
+                delta: 63,
+            },
+        ] {
+            let bytes = config.serialize(&header).unwrap();
+            assert_eq!(config.deserialize::<PackedHeader>(&bytes).unwrap(), header);
+            assert!(bytes.len() <= PackedHeader::PACKED_MAX_SIZE);
+        }
+        const { assert!(PackedHeader::MAX_SIZE > 0) };
+        const { assert!(PackedHeader::PACKED_MAX_BITS > 0) };
+
+        for event in [
+            PackedEvent::Empty,
+            PackedEvent::Flag(true),
+            PackedEvent::Code(15),
+        ] {
+            let bytes = config.serialize(&event).unwrap();
+            assert_eq!(config.deserialize::<PackedEvent>(&bytes).unwrap(), event);
+        }
+    }
+
+    #[cfg(feature = "schema-evolution")]
+    #[test]
+    fn schema_evolution_is_forward_compatible_and_rejects_foreign_ids() {
+        let config = options().with_schema_evolution();
+
+        // V1 frame (fields submitted out of order; frame canonicalizes IDs).
+        let v1 = SchemaV1 {
+            name: "alpha".into(),
+            count: 7,
+        };
+        let v1_bytes = config.serialize(&v1).unwrap();
+
+        // V2 decodes a V1 frame: the new `active` field defaults and the
+        // encoded revision is reported for explicit migrations.
+        let decoded_v2: SchemaV2<'_> = config.deserialize(&v1_bytes).unwrap();
+        assert_eq!(
+            decoded_v2,
+            SchemaV2 {
+                title: "alpha",
+                count: 7,
+                active: false,
+                source_version: SchemaV1::SCHEMA_VERSION,
+            }
+        );
+
+        // V2 round-trips its own frame with the encoded revision reported.
+        let v2 = SchemaV2 {
+            title: "beta",
+            count: 9,
+            active: true,
+            source_version: 0,
+        };
+        let v2_bytes = config.serialize(&v2).unwrap();
+        assert_eq!(
+            config.deserialize::<SchemaV2<'_>>(&v2_bytes).unwrap(),
+            SchemaV2 {
+                title: "beta",
+                count: 9,
+                active: true,
+                source_version: SchemaV2::SCHEMA_VERSION,
+            }
+        );
+
+        // A schema with a different stable ID must reject the frame.
+        assert!(matches!(
+            config.deserialize::<OtherSchema>(&v1_bytes),
+            Err(Error::SchemaMismatch {
+                expected: 0xdead_beef,
+                actual: <SchemaV1 as SchemaEncode>::SCHEMA_ID
+            })
+        ));
+    }
+
     #[test]
     fn legacy_fixed_vector_is_stable() {
         let legacy = legacy_options();
@@ -673,7 +759,7 @@ mod tests {
     #[test]
     fn malformed_inputs_are_rejected_without_panics() {
         // A raw bool tag is unambiguous in the self-describing format.
-        assert_eq!(options().deserialize::<bool>(&[2]).unwrap(), true);
+        assert!(options().deserialize::<bool>(&[2]).unwrap());
         assert!(matches!(
             options().deserialize::<Option<u8>>(&[3]),
             Err(Error::UnexpectedEnd)
@@ -692,7 +778,7 @@ mod tests {
         ));
         // An array of 65 unit values exceeds the collection limit.
         let mut hostile = vec![0x0a];
-        hostile.extend(std::iter::repeat(0x00).take(65));
+        hostile.extend(std::iter::repeat_n(0x00, 65));
         hostile.push(0xff);
         assert!(matches!(
             legacy_options()
@@ -718,7 +804,10 @@ mod tests {
         const SCHEMA: nextjson::TypeSchema = nextjson::TypeSchema::U8;
     }
     impl nextjson::NsonSerialize for Stateful<'_> {
-        fn nextencode<E: nextjson::FormatEncoder>(&self, encoder: &mut E) -> nextjson::Result<()> {
+        fn nextencode<E: nextjson::FormatEncoder>(
+            &self,
+            encoder: &mut E,
+        ) -> ::core::result::Result<(), E::Error> {
             let next = self.0.get() + 1;
             self.0.set(next);
             encoder.write_u64(next as u64)
@@ -731,7 +820,10 @@ mod tests {
         const SCHEMA: nextjson::TypeSchema = nextjson::TypeSchema::Seq(&nextjson::TypeSchema::Unit);
     }
     impl nextjson::NsonSerialize for UnbalancedContainer {
-        fn nextencode<E: nextjson::FormatEncoder>(&self, encoder: &mut E) -> nextjson::Result<()> {
+        fn nextencode<E: nextjson::FormatEncoder>(
+            &self,
+            encoder: &mut E,
+        ) -> ::core::result::Result<(), E::Error> {
             // Emits a container end without a matching start.
             encoder.end_array()
         }
@@ -829,8 +921,8 @@ mod tests {
         };
         assert!(options().serialize(&value).unwrap().len() <= ProtocolRecord::MAX_SIZE);
         assert!(legacy_options().serialize(&value).unwrap().len() <= ProtocolRecord::MAX_SIZE);
-        assert!(ProtocolRecord::MAX_SIZE > 0);
-        assert!(ProtocolRecord::PACKED_MAX_BITS > 0);
+        const { assert!(ProtocolRecord::MAX_SIZE > 0) };
+        const { assert!(ProtocolRecord::PACKED_MAX_BITS > 0) };
 
         let TypeShape::Struct(fields) = ProtocolRecord::SHAPE else {
             panic!("record must reflect as a struct");

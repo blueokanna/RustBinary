@@ -194,7 +194,10 @@ impl FingerprintedConfig {
         value: &T,
     ) -> Result<Vec<u8>> {
         let payload = self.config.serialize(value)?;
-        let mut output = Vec::with_capacity(HEADER_LEN.saturating_add(payload.len()));
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(HEADER_LEN.saturating_add(payload.len()))
+            .map_err(|_| Error::SizeLimit { limit: u64::MAX })?;
         output.extend_from_slice(&encode_header(FRAME_MAGIC, T::fingerprint(self.config)));
         output.extend_from_slice(&payload);
         Ok(output)

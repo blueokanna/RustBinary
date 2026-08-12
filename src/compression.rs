@@ -104,6 +104,9 @@ impl CompressedConfig {
         self,
         input: &[u8],
     ) -> Result<T> {
+        // Enforce the declared raw-length limit before validating the frame
+        // body, so an oversized header fails fast with SizeLimit instead of
+        // a structural frame error or an unbounded decompression.
         let header = input.get(..HEADER_LEN).ok_or(Error::UnexpectedEnd)?;
         let (_, declared_raw_len, _) = parse_header(header)?;
         self.enforce_raw_limit(declared_raw_len)?;
@@ -196,13 +199,15 @@ impl CompressedConfig {
             #[cfg(feature = "cbor")]
             PayloadFormat::Cbor(config) => config.base_config().limit,
         };
-        if limit.is_some_and(|limit| raw_len > limit) {
-            Err(Error::SizeLimit {
-                limit: limit.expect("checked as some"),
-            })
-        } else {
-            Ok(())
+        // Decompression is always bounded. Without a configured limit
+        // (`legacy()` / `with_no_limit()`), fall back to the crate-wide
+        // default so a hostile frame cannot drive an unbounded expansion
+        // (decompression bomb) from an attacker-controlled header.
+        let bound = limit.unwrap_or(crate::DEFAULT_SIZE_LIMIT);
+        if raw_len > bound {
+            return Err(Error::SizeLimit { limit: bound });
         }
+        Ok(())
     }
 
     #[cfg(feature = "encryption")]
@@ -212,10 +217,13 @@ impl CompressedConfig {
             #[cfg(feature = "cbor")]
             PayloadFormat::Cbor(config) => config.base_config().limit,
         };
-        match limit {
-            Some(limit) => Some(limit.saturating_add(HEADER_LEN as u64)),
-            None => None,
-        }
+        // Mirrors `enforce_raw_limit`: the envelope bounds the plaintext even
+        // when no explicit limit is configured.
+        let bound = match limit {
+            Some(limit) => limit,
+            None => crate::DEFAULT_SIZE_LIMIT,
+        };
+        Some(bound.saturating_add(HEADER_LEN as u64))
     }
 
     #[cfg(feature = "encryption")]

@@ -338,6 +338,159 @@ assert_eq!(secure.deserialize::<Vec<u32>>(&frame)?, value);
 
 生产环境必须从密钥管理系统获得 key；硬编码 key 只能用于测试。
 
+压缩 frame 的报头记录 raw 与 stored 长度。解码器拒绝未知 flags、不一致的长度
+关系、解压长度不匹配、截断以及已配置限额违规。仅当压缩输出严格更小时才保留压缩。
+
+加密每次从操作系统获取全新的 192-bit nonce。完整报头（算法 ID、nonce、长度）作为
+AEAD 关联数据与密文一起被认证。`EncryptionKey` 持有 32 字节密钥，`Debug` 输出
+脱敏，并在 drop 时清零；密钥派生、轮换、存储和访问控制属于应用/KMS 职责。完整
+示例见 [secure_pipeline.rs](examples/secure_pipeline.rs)。
+
+## Schema 演进
+
+`schema-evolution` feature 使用稳定 schema ID、版本、规范字段 ID 排序、长度
+分隔字段、未知字段跳过、默认值、借用字段以及由应用控制的迁移。字段 ID 与 schema
+ID 是显式的协议决策，而不是会在重构中悄然变化的哈希值。
+
+frame 包含 magic `RBE1`、格式版本、flags、稳定 schema ID、schema 版本、字段
+数量，以及长度分隔的 `(field_id, payload)` 条目。编码器对 ID 排序并拒绝重复；
+解码器要求 ID 严格递增，并在切片前校验全部长度运算。
+
+应用协议规则：
+
+1. 为一个兼容类型族分配唯一的 schema ID。
+2. 永远不要为不同含义或不兼容类型复用字段 ID。
+3. 重命名 Rust 字段时保留字段 ID。
+4. 向后兼容靠新增可选/带默认值字段实现。
+5. 用编码版本驱动有意的语义迁移。
+6. 需要转发或保留时检查未知字段。
+
+完整的 V1/V2 升级与降级行为（含重命名、默认值和借用字段）见
+[schema_evolution.rs](examples/schema_evolution.rs)。
+
+## 并行与流
+
+`with_parallel_serialization()` 在 scoped worker 上编码独立 batch 元素，并输出
+有序长度表，因此调度不会影响输出字节。它面向大量独立 record；小值应使用普通
+单值 API。
+
+`serialize_into` 直接写入 `std::io::Write`。`deserialize_from` 从 `std::io::Read`
+读取 owned 值。只有 slice 解码可以返回借用值。每个不可信边界都应同时设置字节上限
+和集合上限。
+
+并行编码面向独立且足够大的 record。每个元素单独编码；有序 `u64` 长度表和按源顺序
+排列的 payload 段使输出与 worker 调度无关。小值可能更慢，因为 worker 与合并开销
+会占主导。完整示例见 [parallel_batch.rs](examples/parallel_batch.rs)。
+
+压缩与加密的流式读取器在传入 `&mut R` 时只消费一个声明 frame，后续 frame 保持
+未读。报头关系和配置的 raw/plaintext 限额会在 body 分配之前被检查。
+
+## 确定性契约
+
+- 端序、整数模式和枚举表示是显式的。
+- 自适应 tag 与平局规则是规范的。
+- 位打包末尾 padding 必须为零。
+- Schema 演进字段按稳定数值 ID 排序。
+- 并行 batch 保持源顺序。
+- Deterministic CBOR 递归排序 canonical map key。
+- 浮点 IEEE 位模式（包括 NaN payload）被保留。
+
+普通 `HashMap` 迭代是随机的，不确定。请使用 `BTreeMap`、其他有序序列化器或
+deterministic CBOR。加密 frame 有意不确定，因为 nonce 复用是安全失败。
+
+## 线格式与安全规则
+
+- 每个值前有一字节类型标签；`0xff` 终结容器。
+- 浮点保留 IEEE 754 位模式；端序是显式的。
+- 可变整数拒绝 marker 255 和非最短编码。
+- 结构体字段编码为命名对象键。
+- 普通 map 保留 nextjson 迭代顺序，不确定。
+- 确定性 map 序列化需要 deterministic CBOR 或有序 map。
+- 压缩与加密 frame 校验版本、flags、长度和限额。
+- 流式解码器在 body 分配前校验 frame 长度关系和配置限额。
+- 解密在反序列化之前完成认证。
+- 指纹是兼容性检查，不是密码学认证。
+- 用户自定义的 nextjson 实现可能分配或拒绝借用访问者。
+
+在每个不可信边界：设置现实的字节与集合上限，除非外层协议持有尾随字节否则拒绝之，
+对敌对数据做认证，并把解压/反序列化错误视为输入失败。
+
+解压始终有界，即使未配置字节上限：解压后大小先与 frame 报头交叉校验，当使用
+`with_no_limit` / legacy profile 时以 crate 全局默认上限封顶，恶意 frame 无法无界
+膨胀。CBOR 中继在类型化解码前物化 Value 树，其单容器元素数量受集合上限约束以限制
+内存放大。集合上限只约束序列/映射的元素数量；字符串由字节上限约束。
+
+## 错误模型
+
+所有操作返回 `rustbinary::Result<T>`。`Error` 保留 I/O 错误，并为限额、容量、
+frame、schema、压缩、加密、位打包、自适应数据、worker 失败和畸形基础值提供
+结构化变体。它是 `#[non_exhaustive]`；下游穷尽匹配需要兜底分支。frame 偏移、
+长度求和、delta 重建和整数收窄都使用受检运算，而不是依赖 panic 恢复。
+
+`Error::category()` 提供稳定的运维映射：`UserInput`、`Protocol`、`Configuration`
+或 `InternalBug`。
+
+## 验证
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --all-features
+cargo test --workspace --all-features --release
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --all-features --no-deps
+cargo bench --bench codec_comparison
+```
+
+基准在同一批 nextjson 形状上比较 RustBinary 的 owned 与 caller-buffer Compact V1
+路径。每次往返先校验再采集九个校准样本，输出原始 Markdown 格式的中位数。
+
+### 可执行示例
+
+| 示例 | 范围 | 命令 |
+| --- | --- | --- |
+| [complete.rs](examples/complete.rs) | 全特性端到端组合 | `cargo run --example complete --all-features` |
+| [core_codec.rs](examples/core_codec.rs) | 有界 Core、调用方缓冲区、借用、尾随与错误策略 | `cargo run --example core_codec` |
+| [zero_copy.rs](examples/zero_copy.rs) | 嵌套借用与指针证明 | `cargo run --example zero_copy` |
+| [mmap_archive.rs](examples/mmap_archive.rs) | 经校验的只读 mmap 对象图与指针证明 | `cargo run --example mmap_archive --features archive` |
+| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | 自适应决策与调用方缓冲区 | `cargo run --example adaptive_zero_alloc --features adaptive` |
+| [secure_pipeline.rs](examples/secure_pipeline.rs) | Deterministic CBOR、压缩、AEAD | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
+| [schema_evolution.rs](examples/schema_evolution.rs) | Schema V1/V2 双向演进 | `cargo run --example schema_evolution --features schema-evolution` |
+| [parallel_batch.rs](examples/parallel_batch.rs) | 有序多 worker 批处理 | `cargo run --example parallel_batch --features parallel` |
+| [metadata.rs](examples/metadata.rs) | 指纹、反射、上界、位打包 | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
+
+## docs.rs 与兼容性
+
+包元数据以全部特性构建 docs.rs。公开模块按子系统分组，feature 门控的 API 会获得
+docs.rs 自动标签。PowerShell 下的严格本地文档校验：
+
+```powershell
+$env:RUSTDOCFLAGS='-D warnings'
+cargo doc --workspace --all-features --no-deps
+```
+
+版本化 wrapper 拒绝未知版本和保留 flags，而不是猜测。1.0 之前，线格式可能在 minor
+release 之间变化，并必须在 release notes 中明确说明。长期部署应固定版本、记录完整
+配置、保留 golden vectors，并使用显式 schema ID。
+
+## 当前非目标
+
+- 从序列化内存直接转换任意 Rust 结构体
+- 可变共享内存对象图或对映射文件进行原地更新
+- 把阻塞 I/O 包装成误导性的 async facade
+- 在核心 profile 中自动排序随机化 map
+- 在没有经过测试的内核时宣称 AVX-512/SVE 加速
+- 取代应用密钥管理、授权或 schema 治理
+
+## 许可证
+
+RustBinary 以 [Apache License, Version 2.0](LICENSE) 授权。
+
+你可以在该许可条款下使用、复制、修改和再分发本项目。再分发必须保留版权声明、
+许可文本和必需的署名声明。源代码的修改应明确标识，并适用 Apache 许可的专利条款
+和免责声明。
+
+完整法律文本见 [`LICENSE`](LICENSE)。本项目不附带任何形式的保证或条件。
+
 压缩 header 记录 raw/stored 长度。解码器拒绝未知 flag、不一致的长度关系、解压后
 长度不符、截断和配置上限违规；只有压缩结果严格更小时才保留压缩 payload。
 

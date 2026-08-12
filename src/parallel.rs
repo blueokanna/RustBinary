@@ -142,23 +142,19 @@ impl ParallelConfig {
     }
 
     fn enforce_byte_limit(self, length: usize) -> Result<()> {
-        if self.base.limit.is_some_and(|limit| length as u64 > limit) {
-            return Err(Error::SizeLimit {
-                limit: self.base.limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.limit {
+            if length as u64 > limit {
+                return Err(Error::SizeLimit { limit });
+            }
         }
         Ok(())
     }
 
     fn enforce_collection_limit(self, length: usize) -> Result<()> {
-        if self
-            .base
-            .collection_limit
-            .is_some_and(|limit| length as u64 > limit)
-        {
-            return Err(Error::CollectionLimit {
-                limit: self.base.collection_limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.collection_limit {
+            if length as u64 > limit {
+                return Err(Error::CollectionLimit { limit });
+            }
         }
         Ok(())
     }
@@ -218,16 +214,18 @@ impl<'a> FrameCursor<'a> {
         Ok(value)
     }
 
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEnd)
+    }
+
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().expect("fixed width"),
-        ))
+        Ok(u16::from_le_bytes(self.take_array()?))
     }
 
     fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("fixed width"),
-        ))
+        Ok(u64::from_le_bytes(self.take_array()?))
     }
 
     fn finish(self, trailing: TrailingBytes) -> Result<()> {

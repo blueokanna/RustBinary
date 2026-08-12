@@ -234,16 +234,11 @@ impl<W: EncodeWriter> Encoder<W> {
         }
     }
 
-    /// Writes a length payload. Strings, arrays and objects are all subject to
-    /// the configured collection limit.
+    /// Writes a length payload. Strings are bounded by the byte limit; the
+    /// collection limit applies to sequence/map element counts (`count_element`).
     fn length(&mut self, len: usize) -> NextjsonResult<()> {
         let len =
             u64::try_from(len).map_err(|_| self.fail(Error::IntegerOverflow { target: "u64" }))?;
-        if let Some(limit) = self.config.collection_limit {
-            if len > limit {
-                return Err(self.fail(Error::CollectionLimit { limit }));
-            }
-        }
         self.unsigned(len as u128, 8)
     }
 
@@ -286,11 +281,14 @@ impl<W: EncodeWriter> Encoder<W> {
             return Err(self.fail(Error::Custom("container end without matching start".into())));
         }
         self.depth -= 1;
+        self.counts[self.depth] = 0;
         self.emit_tag(TAG_END)
     }
 }
 
 impl<W: EncodeWriter> nextjson::FormatEncoder for Encoder<W> {
+    type Error = NextjsonError;
+
     fn begin_array(&mut self) -> NextjsonResult<()> {
         self.enter_container(TAG_ARRAY)
     }
@@ -371,5 +369,11 @@ impl<W: EncodeWriter> nextjson::FormatEncoder for Encoder<W> {
             Number::I128(value) => self.write_i128(value),
             Number::F64(value) => self.write_f64(value),
         }
+    }
+
+    fn is_human_readable(&self) -> bool {
+        // RustBinary is a binary wire format; types that branch on this flag
+        // (timestamps, identifiers, byte strings) must use their binary shape.
+        false
     }
 }

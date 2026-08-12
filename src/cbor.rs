@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use nextjson::formats::{Cbor, Format};
 use nextjson::Value;
 
-use crate::{Config, Error, Result, TrailingBytes};
+use crate::{Config, Error, Result};
 
 #[cfg(feature = "fingerprint")]
 use crate::{
@@ -141,12 +141,43 @@ impl CborConfig {
         input: &[u8],
     ) -> Result<T> {
         self.enforce_byte_limit(input.len())?;
-        let value = Cbor.decode(input).map_err(cbor_error)?;
-        if self.base.trailing == TrailingBytes::Reject {
-            // The nextjson relay already requires exactly one CBOR root value,
-            // so trailing bytes are rejected inside `Cbor::decode`.
+        // The nextjson CBOR relay first materializes a value tree before typed
+        // decode, so the collection limit must be enforced on that tree to keep
+        // single-container memory amplification bounded (each element expands
+        // from one input byte to roughly a 32-byte `Value`).
+        let json = nextjson::cross_format::cbor_to_json(input).map_err(cbor_error)?;
+        let value: nextjson::Value = nextjson::from_slice(&json).map_err(cbor_error)?;
+        self.enforce_collection_limits(&value)?;
+        nextjson::from_value(value).map_err(cbor_error)
+    }
+
+    /// Recursively enforces the configured per-container element limit.
+    fn enforce_collection_limits(self, value: &nextjson::Value) -> Result<()> {
+        match value {
+            nextjson::Value::Array(items) => {
+                self.enforce_collection_limit(items.len())?;
+                for item in items {
+                    self.enforce_collection_limits(item)?;
+                }
+            }
+            nextjson::Value::Object(map) => {
+                self.enforce_collection_limit(map.len())?;
+                for (_, item) in map.iter() {
+                    self.enforce_collection_limits(item)?;
+                }
+            }
+            _ => {}
         }
-        Ok(value)
+        Ok(())
+    }
+
+    fn enforce_collection_limit(self, length: usize) -> Result<()> {
+        if let Some(limit) = self.base.collection_limit {
+            if length as u64 > limit {
+                return Err(Error::CollectionLimit { limit });
+            }
+        }
+        Ok(())
     }
 
     /// Decodes one owned CBOR value from a reader.

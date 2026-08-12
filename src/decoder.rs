@@ -264,14 +264,10 @@ impl<'de> Decoder<'de> {
         })
     }
 
-    /// Reads a length payload (strings and collection counts).
+    /// Reads a length payload. Strings are bounded by the byte limit; the
+    /// collection limit applies to sequence/map element counts (`container_sep`).
     fn length(&mut self) -> NextjsonResult<u64> {
         let value = self.unsigned(8, u64::MAX as u128)?;
-        if let Some(limit) = self.config.collection_limit {
-            if value > limit as u128 {
-                return Err(self.fail(Error::CollectionLimit { limit }));
-            }
-        }
         Ok(value as u64)
     }
 
@@ -350,6 +346,9 @@ impl<'de> Decoder<'de> {
         }
         self.cursor += 1;
         self.depth -= 1;
+        // Reset this container's element counter so sibling containers at the
+        // same depth each get their own collection-limit budget.
+        self.counts[self.depth] = 0;
         Ok(())
     }
 
@@ -434,6 +433,8 @@ const fn signed_name(bytes: usize) -> &'static str {
 }
 
 impl<'de> FormatDecoder<'de> for Decoder<'de> {
+    type Error = NextjsonError;
+
     fn begin_object(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
             Token::BeginObject => {}
@@ -548,11 +549,26 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     }
 
     fn restore(&mut self, mark: Mark) {
+        // `Mark` is a public type, so clamp defensively: a depth beyond the
+        // counter table must not panic (unreachable through this decoder's own
+        // `save`, but cheap to harden). A cursor beyond the input fails safely
+        // on the next `take`.
+        let depth = (mark.depth() as usize).min(self.counts.len());
         self.cursor = mark.pos();
-        self.depth = mark.depth() as usize;
-        for slot in &mut self.counts[mark.depth() as usize..] {
+        self.depth = depth;
+        for slot in &mut self.counts[depth..] {
             *slot = 0;
         }
         self.lookahead = None;
+        // `restore` follows a failed untagged-variant attempt, so any wire
+        // error recorded during that attempt is stale for the retry and must
+        // not shadow the error reported by a later variant.
+        self.wire_error = None;
+    }
+
+    fn is_human_readable(&self) -> bool {
+        // RustBinary is a binary wire format; types that branch on this flag
+        // must use their binary decode shape.
+        false
     }
 }

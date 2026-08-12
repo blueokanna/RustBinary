@@ -118,23 +118,19 @@ impl EvolutionConfig {
     }
 
     fn enforce_byte_limit(self, length: usize) -> Result<()> {
-        if self.base.limit.is_some_and(|limit| length as u64 > limit) {
-            return Err(Error::SizeLimit {
-                limit: self.base.limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.limit {
+            if length as u64 > limit {
+                return Err(Error::SizeLimit { limit });
+            }
         }
         Ok(())
     }
 
     fn enforce_collection_limit(self, length: usize) -> Result<()> {
-        if self
-            .base
-            .collection_limit
-            .is_some_and(|limit| length as u64 > limit)
-        {
-            return Err(Error::CollectionLimit {
-                limit: self.base.collection_limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.collection_limit {
+            if length as u64 > limit {
+                return Err(Error::CollectionLimit { limit });
+            }
         }
         Ok(())
     }
@@ -171,14 +167,10 @@ impl FieldEncoder {
 
     fn finish<T: SchemaEncode + ?Sized>(mut self) -> Result<Vec<u8>> {
         self.fields.sort_unstable_by_key(|field| field.id);
-        if self
-            .base
-            .collection_limit
-            .is_some_and(|limit| self.fields.len() as u64 > limit)
-        {
-            return Err(Error::CollectionLimit {
-                limit: self.base.collection_limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.collection_limit {
+            if self.fields.len() as u64 > limit {
+                return Err(Error::CollectionLimit { limit });
+            }
         }
         let mut required = HEADER_SIZE;
         for field in &self.fields {
@@ -187,10 +179,10 @@ impl FieldEncoder {
                 .and_then(|size| size.checked_add(field.payload.len()))
                 .ok_or(Error::InvalidFrame("schema evolution frame size overflow"))?;
         }
-        if self.base.limit.is_some_and(|limit| required as u64 > limit) {
-            return Err(Error::SizeLimit {
-                limit: self.base.limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.limit {
+            if required as u64 > limit {
+                return Err(Error::SizeLimit { limit });
+            }
         }
         let field_count = u32::try_from(self.fields.len())
             .map_err(|_| Error::IntegerOverflow { target: "u32" })?;

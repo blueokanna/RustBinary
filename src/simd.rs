@@ -87,17 +87,24 @@ const fn detect_sme() -> bool {
 }
 
 /// Returns the fastest implemented backend supported by the current process.
+///
+/// Runtime feature probing is performed once and cached: every codec hot-path
+/// dispatch (`is_ascii`, `plain_varint_prefix`) reuses the result instead of
+/// re-running CPU feature detection on each call.
 pub fn simd_backend() -> SimdBackend {
-    let capabilities = hardware_capabilities();
-    if capabilities.avx2 {
-        SimdBackend::Avx2
-    } else if capabilities.sse2 {
-        SimdBackend::Sse2
-    } else if capabilities.neon {
-        SimdBackend::Neon
-    } else {
-        SimdBackend::Scalar
-    }
+    static BACKEND: std::sync::LazyLock<SimdBackend> = std::sync::LazyLock::new(|| {
+        let capabilities = hardware_capabilities();
+        if capabilities.avx2 {
+            SimdBackend::Avx2
+        } else if capabilities.sse2 {
+            SimdBackend::Sse2
+        } else if capabilities.neon {
+            SimdBackend::Neon
+        } else {
+            SimdBackend::Scalar
+        }
+    });
+    *BACKEND
 }
 
 #[cfg(feature = "adaptive")]

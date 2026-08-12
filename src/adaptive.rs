@@ -74,7 +74,6 @@ impl AdaptiveConfig {
 
     /// Returns the exact adaptive string frame size without allocating.
     pub fn encoded_string_size(self, value: &str) -> Result<usize> {
-        self.enforce_collection_limit(value.len())?;
         let (_, _, required) = string_layout(value)?;
         self.enforce_byte_limit(required)?;
         Ok(required)
@@ -84,7 +83,6 @@ impl AdaptiveConfig {
     ///
     /// The output is left untouched when it is too small.
     pub fn encode_string_into_slice(self, output: &mut [u8], value: &str) -> Result<usize> {
-        self.enforce_collection_limit(value.len())?;
         let (strategy, payload_size, required) = string_layout(value)?;
         self.enforce_byte_limit(required)?;
         if output.len() < required {
@@ -145,7 +143,6 @@ impl AdaptiveConfig {
             return Err(Error::Adaptive("unknown string strategy"));
         }
         let length = cursor.usize_varint()?;
-        self.enforce_collection_limit(length)?;
         if output.len() < length {
             return Err(Error::BufferTooSmall {
                 required: length,
@@ -170,13 +167,7 @@ impl AdaptiveConfig {
                 let bytes = cursor.take(packed)?;
                 let mut reader = BitReader::new(bytes);
                 for slot in &mut output[..length] {
-                    let scalar = reader.read(7)? as u8;
-                    if !scalar.is_ascii() {
-                        return Err(Error::Adaptive(
-                            "ASCII7 payload contains a non-ASCII scalar",
-                        ));
-                    }
-                    *slot = scalar;
+                    *slot = reader.read(7)? as u8;
                 }
                 validate_ascii_padding(bytes, meaningful_bits)?;
             }
@@ -196,7 +187,6 @@ impl AdaptiveConfig {
         let mut cursor = Cursor::new(input);
         let strategy = cursor.byte()?;
         let length = cursor.usize_varint()?;
-        self.enforce_collection_limit(length)?;
         let value = match strategy {
             RAW_UTF8 => {
                 let bytes = cursor.take(length)?;
@@ -217,13 +207,9 @@ impl AdaptiveConfig {
                     .try_reserve_exact(length)
                     .map_err(|_| Error::SizeLimit { limit: u64::MAX })?;
                 for _ in 0..length {
-                    let scalar = reader.read(7)? as u8;
-                    if !scalar.is_ascii() {
-                        return Err(Error::Adaptive(
-                            "ASCII7 payload contains a non-ASCII scalar",
-                        ));
-                    }
-                    value.push(scalar as char);
+                    // A 7-bit read is always 0..=127, so every scalar is ASCII
+                    // by construction; truncation is the only failure mode.
+                    value.push(reader.read(7)? as u8 as char);
                 }
                 validate_ascii_padding(bytes, meaningful_bits)?;
                 Cow::Owned(value)
@@ -452,14 +438,9 @@ fn string_layout(value: &str) -> Result<(StringStrategy, usize, usize)> {
     } else {
         None
     };
-    let strategy = if packed_size.is_some_and(|size| size < raw_size) {
-        StringStrategy::Ascii7
-    } else {
-        StringStrategy::RawUtf8
-    };
-    let payload_size = match strategy {
-        StringStrategy::RawUtf8 => raw_size,
-        StringStrategy::Ascii7 => packed_size.expect("selected only for ASCII"),
+    let (strategy, payload_size) = match packed_size {
+        Some(size) if size < raw_size => (StringStrategy::Ascii7, size),
+        _ => (StringStrategy::RawUtf8, raw_size),
     };
     let required = 1usize
         .checked_add(varint_size(value.len() as u128))
@@ -645,24 +626,24 @@ impl<'a> Cursor<'a> {
         &self.input[self.position..]
     }
 
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEnd)
+    }
+
     fn varint(&mut self) -> Result<u128> {
         let marker = self.byte()?;
         let (value, minimum) = match marker {
             0..=250 => return Ok(marker as u128),
-            251 => (
-                u16::from_le_bytes(self.take(2)?.try_into().expect("fixed")) as u128,
-                251,
-            ),
-            252 => (
-                u32::from_le_bytes(self.take(4)?.try_into().expect("fixed")) as u128,
-                0x1_0000,
-            ),
+            251 => (u16::from_le_bytes(self.take_array()?) as u128, 251),
+            252 => (u32::from_le_bytes(self.take_array()?) as u128, 0x1_0000),
             253 => (
-                u64::from_le_bytes(self.take(8)?.try_into().expect("fixed")) as u128,
+                u64::from_le_bytes(self.take_array()?) as u128,
                 0x1_0000_0000,
             ),
             254 => (
-                u128::from_le_bytes(self.take(16)?.try_into().expect("fixed")),
+                u128::from_le_bytes(self.take_array()?),
                 0x1_0000_0000_0000_0000,
             ),
             marker => return Err(Error::InvalidVarintMarker(marker)),

@@ -154,10 +154,10 @@ impl BitPackedConfig {
     #[cfg(feature = "alloc")]
     pub fn serialize<T: BitPack>(self, value: &T) -> Result<Vec<u8>> {
         let maximum = bytes_for_bits(T::MAX_BITS);
-        if self.base.limit.is_some_and(|limit| maximum as u64 > limit) {
-            return Err(Error::SizeLimit {
-                limit: self.base.limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.limit {
+            if maximum as u64 > limit {
+                return Err(Error::SizeLimit { limit });
+            }
         }
         let mut output = vec![0; maximum];
         let written = self.serialize_into_slice(&mut output, value)?;
@@ -177,24 +177,20 @@ impl BitPackedConfig {
         let mut writer = BitWriter::new(output);
         value.pack(&mut writer)?;
         let written = writer.bytes_written();
-        if self.base.limit.is_some_and(|limit| written as u64 > limit) {
-            return Err(Error::SizeLimit {
-                limit: self.base.limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.limit {
+            if written as u64 > limit {
+                return Err(Error::SizeLimit { limit });
+            }
         }
         Ok(written)
     }
 
     /// Unpacks and validates canonical padding and trailing bytes.
     pub fn deserialize<T: BitPack>(self, input: &[u8]) -> Result<T> {
-        if self
-            .base
-            .limit
-            .is_some_and(|limit| input.len() as u64 > limit)
-        {
-            return Err(Error::SizeLimit {
-                limit: self.base.limit.expect("checked as some"),
-            });
+        if let Some(limit) = self.base.limit {
+            if input.len() as u64 > limit {
+                return Err(Error::SizeLimit { limit });
+            }
         }
         let mut reader = BitReader::new(input);
         let value = T::unpack(&mut reader)?;

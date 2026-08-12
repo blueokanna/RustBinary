@@ -81,6 +81,14 @@ impl Config {
         }
     }
     /// Creates the historical unbounded fixed-width RustBinary profile.
+    ///
+    /// This profile has no byte or collection limits, so it must only be used
+    /// with trusted, in-memory data. It is not a safe default for network
+    /// input. Decompression remains bounded even here: the compression wrapper
+    /// caps the decompressed size at [`DEFAULT_SIZE_LIMIT`] when no explicit
+    /// limit is configured. Prefer [`Config::standard`] and set explicit
+    /// [`Config::with_limit`] / [`Config::with_collection_limit`] values at
+    /// every trust boundary.
     pub const fn legacy() -> Self {
         Self {
             endian: Endian::Little,
@@ -125,6 +133,15 @@ impl Config {
         self
     }
     /// Removes the consumed-byte limit.
+    ///
+    /// # Security
+    ///
+    /// Without a byte limit the raw codec performs no size accounting, so this
+    /// mode is only for trusted, in-memory data. Decompression is an exception
+    /// that remains bounded: the compression wrapper (`with_zstd_compression`)
+    /// always caps the decompressed size at the crate-wide
+    /// [`DEFAULT_SIZE_LIMIT`] when no explicit limit is configured, so a
+    /// hostile frame cannot expand without bound.
     pub const fn with_no_limit(mut self) -> Self {
         self.limit = None;
         self

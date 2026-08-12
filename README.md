@@ -508,6 +508,15 @@ At every untrusted boundary, set realistic byte and collection limits, reject
 trailing bytes unless an outer protocol owns them, authenticate adversarial
 data, and treat decompression/deserialization errors as input failures.
 
+Decompression is always bounded, even without a configured byte limit: the
+decompressed size is validated against the frame header and capped at the
+crate-wide default limit when `with_no_limit` / the legacy profile is used, so
+a hostile frame cannot drive an unbounded expansion. The CBOR relay
+materializes a value tree before typed decoding, so its per-container element
+counts are enforced against the collection limit to bound single-container
+memory amplification. The collection limit applies to sequence and map element
+counts; strings are bounded by the byte limit.
+
 ## Error Model
 
 All operations return `rustbinary::Result<T>`. `Error` preserves I/O errors and

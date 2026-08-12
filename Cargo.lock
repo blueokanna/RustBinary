@@ -280,18 +280,18 @@ dependencies = [
 
 [[package]]
 name = "nextjson"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2d7922356b199dcc7e4b57594e0f5c19118333818cac85a3aae065921d5cf9"
+checksum = "779a197fc7309de19f4197542365bd49e9378ba1802c3b3d754e11bc8228cfba"
 dependencies = [
  "nextjson-derive",
 ]
 
 [[package]]
 name = "nextjson-derive"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a55ceadf1c65bc367beb74fb849a30d092d2fcbba5902bbae3acdc4de1e80b63"
+checksum = "9e45bfc32d8781df21c3a8538f82d684a39cab601b5bdc7af6f00c6fcb4df789"
 
 [[package]]
 name = "once_cell"
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "rustbinary"
-version = "0.1.5-alpha"
+version = "0.1.5-alpha.1"
 dependencies = [
  "chacha20poly1305",
  "getrandom",
