@@ -215,9 +215,7 @@ impl<'a> FrameCursor<'a> {
     }
 
     fn take_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| Error::UnexpectedEnd)
+        self.take(N)?.try_into().map_err(|_| Error::UnexpectedEnd)
     }
 
     fn u16(&mut self) -> Result<u16> {

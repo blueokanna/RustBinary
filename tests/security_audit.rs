@@ -4,6 +4,13 @@
 //! hostile nesting, malformed frames, backtracking state, and resource-limit
 //! semantics. Every case must return an error or a correct value; none may
 //! panic, overflow the stack, or bypass a configured limit.
+//!
+//! Every test drives round-trips through the owned `Config::serialize` API,
+//! so the suite requires the `alloc` feature. The `no_std` slice core is
+//! covered separately by `tests/core_profiles.rs`; this file compiles away
+//! under `cargo test --no-default-features` (the `core-no-std` CI job).
+
+#![cfg(feature = "alloc")]
 
 // ---------------------------------------------------------------------------
 // Resource limits
@@ -52,7 +59,9 @@ fn decompression_is_bounded_even_without_a_configured_limit() {
 
     for config in [
         rustbinary::legacy_options().with_zstd_compression(3),
-        rustbinary::options().with_no_limit().with_zstd_compression(3),
+        rustbinary::options()
+            .with_no_limit()
+            .with_zstd_compression(3),
     ] {
         assert!(
             matches!(
@@ -156,9 +165,7 @@ fn untagged_enum_backtracking_handles_hostile_input() {
     let hostile = rustbinary::options()
         .serialize(&nextjson::json!({ "x": "not-a-number", "y": 2 }))
         .unwrap();
-    let result = std::panic::catch_unwind(|| {
-        rustbinary::options().deserialize::<Shape>(&hostile)
-    });
+    let result = std::panic::catch_unwind(|| rustbinary::options().deserialize::<Shape>(&hostile));
     assert!(result.is_ok());
     assert!(result.unwrap().is_err());
 
@@ -166,10 +173,8 @@ fn untagged_enum_backtracking_handles_hostile_input() {
     for len in 0..hostile.len() {
         let truncated = &hostile[..len];
         assert!(
-            std::panic::catch_unwind(|| {
-                rustbinary::options().deserialize::<Shape>(truncated)
-            })
-            .is_ok(),
+            std::panic::catch_unwind(|| { rustbinary::options().deserialize::<Shape>(truncated) })
+                .is_ok(),
             "truncation at {len} panicked"
         );
     }
@@ -227,7 +232,13 @@ fn i128_min_encodes_without_panic() {
 
 #[test]
 fn f32_typed_round_trip_is_lossless() {
-    for value in [1.5f32, -0.0, f32::MAX, f32::MIN_POSITIVE, std::f32::consts::PI] {
+    for value in [
+        1.5f32,
+        -0.0,
+        f32::MAX,
+        f32::MIN_POSITIVE,
+        std::f32::consts::PI,
+    ] {
         let bytes = rustbinary::options().serialize(&value).unwrap();
         let decoded: f32 = rustbinary::options().deserialize(&bytes).unwrap();
         assert_eq!(decoded.to_bits(), value.to_bits(), "f32 {value} lost bits");
@@ -264,7 +275,9 @@ fn nextjson_bytes_encodes_as_array_spelling() {
     assert_eq!(*encoded.last().unwrap(), 0xff);
     // The same payload via Vec<u8> produces an identical array spelling.
     assert_eq!(
-        rustbinary::options().serialize(&value.as_bytes().to_vec()).unwrap(),
+        rustbinary::options()
+            .serialize(&value.as_bytes().to_vec())
+            .unwrap(),
         encoded
     );
     // Decoding into Vec<u8> (the lossless path) round-trips.

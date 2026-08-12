@@ -627,9 +627,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn take_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| Error::UnexpectedEnd)
+        self.take(N)?.try_into().map_err(|_| Error::UnexpectedEnd)
     }
 
     fn varint(&mut self) -> Result<u128> {
