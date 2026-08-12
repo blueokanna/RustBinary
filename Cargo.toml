@@ -6,7 +6,6 @@ resolver = "2"
 name = "rustbinary"
 version = "0.1.5-alpha.1"
 edition = "2021"
-rust-version = "1.87"
 authors = ["blueokanna", "HyphenTeam"]
 keywords = ["binary", "serialization", "rust", "networking"]
 categories = ["encoding", "data-structures", "network-programming"]
