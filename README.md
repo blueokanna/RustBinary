@@ -1,144 +1,92 @@
 # RustBinary
 
-RustBinary is a bounded binary codec for **nextjson** with explicit wire
-profiles and opt-in systems for adaptive encoding, bit packing, schema
-identity, CBOR, compression, authenticated encryption, schema evolution, and
-parallel batches.
+RustBinary is a bounded binary codec built on [nextjson](https://crates.io/crates/nextjson).
+It implements nextjson's `NsonSerialize` / `NsonDeserialize` and `FormatEncoder` /
+`FormatDecoder` contracts, so your types are described with the normal nextjson
+derives. The binary wire format is type-tagged and self-describing: every value
+starts with a one-byte type tag and containers are terminated with `0xff`, so
+`Option`, `Value`, untagged enums, and borrowed strings round-trip
+unambiguously.
 
-The codec is built directly on nextjson's format-neutral contracts
-(`NsonSerialize` / `NsonDeserialize` + `FormatEncoder` / `FormatDecoder`),
-replacing the former Serde dependency. The binary wire format is a
-type-tagged, self-describing stream: every value carries a one-byte type tag
-and containers are terminator-delimited, so `Option`, `Value`, untagged enums
-and borrowed strings round-trip unambiguously.
+The public API is split into three layers plus an optional archive surface:
 
-The product surface is deliberately split into three layers:
-
-| Layer | Public surface | Default | Scope |
-| --- | --- | --- | --- |
-| **Core** | `rustbinary::core` | Yes | Compact V1 encode/decode, limits, trailing policy, deterministic primitive encoding, caller buffers, `no_std` |
-| **Protocol** | `rustbinary::protocol` | No | evolution, fingerprints, reflection, static bounds, bit packing, compatibility profiles |
-| **Pipeline** | `rustbinary::pipeline` | No | CBOR, compression, encryption, ordered parallel transforms |
-
-Read-only memory-mapped object storage is an independent, opt-in
-`rustbinary::archive` surface. It is not enabled by the Core, Protocol, or
-Pipeline bundles and does not change their wire formats or `no_std` boundary.
+| Layer        | Module                | Default | Scope                                                          |
+| ------------ | --------------------- | ------- | -------------------------------------------------------------- |
+| **Core**     | `rustbinary::core`    | yes     | Compact V1 encode/decode, limits, trailing policy, caller buffers, `no_std` |
+| **Protocol** | `rustbinary::protocol`| no      | schema evolution, fingerprints, reflection, static bounds, bit packing |
+| **Pipeline** | `rustbinary::pipeline`| no      | CBOR, compression, encryption, ordered parallel batches        |
+| **Archive**  | `rustbinary::archive` | no      | validated read-only memory-mapped object stores                |
 
 [中文文档](README.zh-CN.md)
 
-## Design Identity
+## Features
 
-RustBinary is organized around its own explicit format model:
+| Capability                      | Status                    | Notes                                                    |
+| ------------------------------- | ------------------------- | -------------------------------------------------------- |
+| nextjson binary codec           | Implemented               | strict marker-varint profile and a fixed-width legacy profile |
+| Adaptive integers/strings       | Implemented               | per-value width selection, ZigZag signed values, ASCII7 packing |
+| Adaptive `i64` collections      | Implemented               | raw / delta / run-length frames                          |
+| SIMD                            | Hot scans only            | runtime AVX2/SSE2/NEON with scalar fallback; AVX-512/SVE/SME are detected but unused |
+| Zero-allocation codec paths     | Implemented               | exact-size output and caller-owned buffers               |
+| Borrowed zero-copy decoding     | Implemented               | nested `&str` fields point into the input frame          |
+| Bit packing                     | Implemented               | `BitPacked` derive, checked widths, canonical zero padding |
+| Schema fingerprinting           | Implemented               | structural hash including codec configuration            |
+| Compile-time bounds             | Implemented               | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}` |
+| RFC 8949 CBOR                   | Implemented               | nextjson CBOR relay; optional canonical map ordering     |
+| Schema evolution                | Implemented               | stable field IDs, versions, defaults, unknown-field skipping |
+| Compression                     | Implemented               | adaptive Zstandard; raw data is kept when it is smaller  |
+| Encryption                      | Implemented               | XChaCha20-Poly1305, random 192-bit nonce, authenticated header |
+| Parallel serialization          | Implemented               | ordered batch frames, scheduling-independent output      |
+| Runtime reflection              | Implemented               | allocation-free compile-time metadata (`Reflect`)        |
+| `std::io` streams               | Implemented               | reader/writer adapters keep the configured limits        |
+| `no_std`                        | Implemented               | Compact V1 slice codec and caller buffers need no default features |
+| `no_std + alloc`                | Implemented               | owned values, fingerprints, evolution, adaptive codecs   |
 
-1. Wire-format changes are visible in the configuration type chain. Enabling a
-   Cargo feature never silently rewrites ordinary fields.
-2. Adaptive strategies compare complete encoded costs, including tags and
-   lengths, and use stable tie-breaking rules.
-3. Caller-owned memory is an API contract, not an optimizer accident.
-4. Resource limits and trailing policy propagate through format wrappers.
-5. Compatibility hashing, deterministic encoding, compression, and AEAD have
-   separate responsibilities and are not presented as interchangeable safety
-   mechanisms.
+## Installation
 
-This produces a canonical data-aware frame family, a stable-field-ID evolution
-format, and a typed transform pipeline. Compatibility with a different binary
-format is not implied unless a profile explicitly documents it.
-
-## Implementation Status
-
-| Capability | Status | Implementation |
-| --- | --- | --- |
-| Binary nextjson codec | Implemented | Fixed-width compatibility and strict marker-varint profiles |
-| Adaptive integers | Implemented | Per-value marker width and ZigZag signed values |
-| Adaptive strings | Implemented | Runtime choice between raw UTF-8 and ASCII7 |
-| Adaptive collections | Implemented | Runtime minimum-size choice among raw, delta, and RLE `i64` frames |
-| SIMD | Implemented for hot scans | Runtime SSE2/AVX2 on x86_64 and NEON on AArch64; scalar fallback |
-| AVX-512, SVE, SME | Detection only | Reported by `hardware_capabilities`; no codec kernels are claimed |
-| Zero-allocation codec paths | Implemented | Exact-size nextjson output and caller-owned adaptive decode buffers |
-| Borrowed zero-copy decoding | Implemented | Nested `&str` fields point directly into the input frame |
-| Read-only relative-pointer archive | Implemented behind `archive` | Versioned envelope, explicit schema ID, bounded validation, and in-place mmap access |
-| Bit packing | Implemented | `BitPacked` derive, checked widths, canonical zero padding |
-| Schema fingerprinting | Implemented | Type structure plus complete binary/CBOR configuration |
-| Compile-time bounds | Implemented | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}` |
-| RFC 8949 CBOR | Implemented | nextjson CBOR relay plus recursive canonical map ordering mode |
-| Schema evolution | Implemented | Stable field IDs, versions, defaults, unknown-field skipping, migrations |
-| Compression | Implemented | Adaptive Zstandard frame; raw data retained when compression loses |
-| Encryption | Implemented | XChaCha20-Poly1305, random 192-bit nonce, authenticated frame header |
-| Deterministic encoding | Implemented in explicit modes | Bit-packed output, schema frames, parallel batches, deterministic CBOR |
-| Parallel serialization | Implemented | Ordered scoped-worker batch frames |
-| Runtime reflection | Implemented | Allocation-free static metadata generated by `Reflect` |
-| `std::io` streams | Implemented | Reader/writer APIs live in `adapters` with resource limits |
-| `no_std` | Implemented | Compact V1 slice encode/decode and caller-owned buffers require no default features |
-| `no_std + alloc` | Implemented | `Vec`, `String`, owned values, fingerprinting, evolution, and scalar adaptive codecs |
-| Async fiber/UFA | Not implemented | No fake async wrapper is exposed over blocking I/O |
-
-The distinction is deliberate: hardware detection is not described as hardware
-acceleration, and the nextjson codec and relative-pointer archive remain
-separate formats and APIs.
-
-## Install
+Add the crate and the nextjson framework to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustbinary = "0.1.4"
+rustbinary = "0.1"
 nextjson = { version = "0.1", features = ["derive"] }
 ```
 
-Enable a complete optional layer only when it is actually needed:
+Optional systems are enabled with Cargo features. Enable only what you use:
 
 ```toml
-rustbinary = { version = "0.1.4", features = ["protocol"] }
-# or select only the exact capability:
-rustbinary = { version = "0.1.4", features = ["fingerprint", "derive"] }
-# or select immutable memory-mapped archives without the other layers:
-rustbinary = { version = "0.1.4", features = ["archive"] }
+rustbinary = { version = "0.1", features = ["protocol"] }   # whole Protocol layer
+rustbinary = { version = "0.1", features = ["fingerprint", "derive"] }
+rustbinary = { version = "0.1", features = ["archive"] }    # mmap archives only
 ```
 
-The minimum supported Rust version is declared in `Cargo.toml`. Optional
-systems only compile when their feature is enabled.
+The minimum supported Rust version is 1.87 (declared as `rust-version` in
+`Cargo.toml`). The optional Zstandard dependency needs a C toolchain on the
+build platform.
 
-RustBinary requires Rust 1.87 or newer and uses Rust 2021 edition. The optional
-Zstandard dependency requires a platform C toolchain.
+### Feature matrix
 
-### Feature Matrix
+| Feature            | Default | Purpose                                                            |
+| ------------------ | ------- | ------------------------------------------------------------------ |
+| `std`              | yes     | owned Core and I/O APIs; required by Pipeline and SIMD             |
+| `alloc`            | via std | compatibility marker; owned APIs always available (nextjson's `FormatDecoder` needs `alloc`) |
+| `protocol`         | no      | convenience bundle: adaptive, bit-packing, derive, fingerprint, reflection, schema-evolution, static-size |
+| `pipeline`         | no      | convenience bundle: cbor, compression, encryption, parallel       |
+| `archive`          | no      | validated read-only mmap archives; requires `std`, rkyv, memmap2   |
+| `derive`           | no      | re-exports the procedural macros with their runtime feature        |
+| `fingerprint`      | no      | structural fingerprint runtime and frames                          |
+| `reflection`       | no      | allocation-free reflection runtime                                 |
+| `static-size`      | no      | compile-time bounds runtime                                        |
+| `simd`             | no      | runtime detection and hot-scan dispatch; never changes the wire bytes |
+| `bit-packing`      | no      | bit-level traits and caller-buffer codec                           |
+| `adaptive`         | no      | caller-buffer adaptive strings/collections; implies `bit-packing`  |
+| `cbor`             | no      | RFC 8949 CBOR through nextjson's relay                             |
+| `compression`      | no      | adaptive Zstandard frame                                           |
+| `encryption`       | no      | XChaCha20-Poly1305, OS randomness, zeroized keys                   |
+| `parallel`         | no      | scoped-thread ordered batch frames                                 |
+| `schema-evolution` | no      | stable-field-ID versioned frames                                   |
 
-| Feature | Default | Purpose and dependency |
-| --- | --- | --- |
-| `std` | Yes | Owned Core and I/O APIs; required by Pipeline and runtime SIMD features |
-| `alloc` | Via `std` | Compatibility marker; owned `Vec`/`String` APIs are always available (nextjson's `FormatDecoder` requires `alloc`) |
-| `protocol` | No | Complete Protocol layer convenience bundle |
-| `pipeline` | No | Complete Pipeline layer convenience bundle |
-| `archive` | No | Validated read-only mmap archives; requires `std`, rkyv, and memmap2 |
-| `derive` | No | Re-exports procedural macros selected with their runtime feature |
-| `fingerprint` | No | Structural fingerprint runtime and frames |
-| `reflection` | No | Allocation-free reflection runtime |
-| `static-size` | No | Compile-time bounds runtime |
-| `simd` | No | Runtime detection and hot-scan dispatch; never changes bytes |
-| `bit-packing` | No | Core bit-level traits and caller-buffer codec |
-| `adaptive` | No | Caller-buffer adaptive strings/collections; implies `bit-packing`; `alloc` adds owned APIs |
-| `cbor` | No | RFC 8949 through nextjson's CBOR relay |
-| `compression` | No | Adaptive Zstandard frame |
-| `encryption` | No | XChaCha20-Poly1305, OS randomness, zeroization |
-| `parallel` | No | Scoped-thread ordered batch frames |
-| `schema-evolution` | No | Stable-field-ID versioned frames |
-
-The primary architecture is RustBinary Compact V1: a pure `no_std` slice core,
-an `alloc` extension for owned data, and `std` adapters for streams and platform
-services.
-
-```powershell
-cargo build --no-default-features
-cargo build --no-default-features --features alloc
-cargo build --features std
-```
-
-## Binary Profiles
-
-The top-level `serialize` and `deserialize` functions and `options()` use the
-strict compact profile: little endian, canonical marker varints, ZigZag signed
-integers, a 64 MiB byte limit, a 1,000,000-element collection limit, and
-rejected trailing bytes. `legacy_options()` explicitly selects the former
-unbounded fixed-width profile and allowed trailing bytes.
+## Quick start
 
 ```rust
 use nextjson::{NsonDeserialize, NsonSerialize};
@@ -162,64 +110,84 @@ assert_eq!(config.deserialize::<Packet>(&bytes)?, packet);
 # Ok::<(), rustbinary::Error>(())
 ```
 
+The top-level `serialize` / `deserialize` functions and `options()` use the
+strict compact profile: little endian, canonical marker varints, ZigZag signed
+integers, a 64 MiB byte limit, a 1,000,000-element collection limit, and
+rejected trailing bytes. `legacy_options()` explicitly selects the old
+unbounded fixed-width profile with allowed trailing bytes; it is meant for
+trusted, in-memory data only.
+
+### Configuration chain
+
 Configuration values are small and copyable. Format-changing methods return a
-different wrapper, making transform order visible at compile time:
+different wrapper, so the transform order is visible in the type:
 
 ```text
 Config -> CborConfig -> CompressedConfig -> EncryptedConfig
 ```
 
-The allowed method order is the allowed processing order. Encryption cannot
-accidentally run before compression through this chain.
+`Config` chooses endianness, integer encoding, byte/collection limits, and the
+trailing-byte policy. The wrappers add one capability each. For example, with
+all features enabled:
 
-### Core Wire Specification
+```rust
+let secure = rustbinary::options()
+    .with_limit(16 * 1024 * 1024)
+    .with_cbor_format()
+    .with_deterministic_encoding()
+    .with_zstd_compression(3)
+    .with_compression_threshold(256)
+    .with_encryption(rustbinary::EncryptionKey::new([0xA5; 32]));
+# let value = vec![1u32, 2, 3];
+let frame = secure.serialize(&value)?;
+assert_eq!(secure.deserialize::<Vec<u32>>(&frame)?, value);
+# Ok::<(), rustbinary::Error>(())
+```
 
-The format encodes values, never Rust object memory. It does not serialize
-padding, native pointers, vtables, or `repr(Rust)` layout. Every value starts
-with a one-byte type tag; arrays and objects are terminator-delimited
-(`0xff`). The tags make the stream self-describing, so `Option`, `Value`,
-untagged enums and `peek_token` round-trip unambiguously.
+Keys must come from a real key-management system; hard-coded keys are only
+suitable for tests.
 
-| nextjson value | Wire representation |
-| --- | --- |
-| `null` / unit / `None` | Tag `0x00` |
-| `false` / `true` | Tags `0x01` / `0x02` |
-| `u64` / `u128` | Tags `0x03` / `0x04` + unsigned payload |
-| `i64` / `i128` | Tags `0x05` / `0x06` + ZigZag payload |
-| `f64` / `f32` | Tags `0x07` / `0x08` + IEEE 754 bits in configured endian |
-| String / char | Tag `0x09` + encoded byte length + UTF-8 |
-| Array | Tag `0x0a` + elements + `0xff` |
-| Object | Tag `0x0b` + (`string key` + value) pairs + `0xff` |
+## Wire format
 
-Integer and length payloads use the marker-varint scheme (or fixed `u64`
-width in the legacy profile, because nextjson's unified data model crosses
-all integers at `u64`/`i64` width).
+The format encodes values, never Rust object memory: no padding, native
+pointers, vtables, or `repr(Rust)` layout. Every value starts with a one-byte
+type tag; arrays and objects are terminated with `0xff`.
 
-Marker varints are canonical:
+| nextjson value         | Wire representation                                   |
+| ---------------------- | ----------------------------------------------------- |
+| `null` / unit / `None` | tag `0x00`                                            |
+| `false` / `true`       | tags `0x01` / `0x02`                                  |
+| `u64` / `u128`         | tags `0x03` / `0x04` + unsigned payload               |
+| `i64` / `i128`         | tags `0x05` / `0x06` + ZigZag payload                 |
+| `f64` / `f32`          | tags `0x07` / `0x08` + IEEE 754 bits in configured endian |
+| string / char          | tag `0x09` + encoded byte length + UTF-8              |
+| array                  | tag `0x0a` + elements + `0xff`                        |
+| object                 | tag `0x0b` + (`string key` + value) pairs + `0xff`    |
 
-| Marker | Payload | Minimum accepted value |
-| --- | --- | --- |
-| `0..=250` | None; marker is the value | 0 |
-| `251` | 2 bytes | 251 |
-| `252` | 4 bytes | 65,536 |
-| `253` | 8 bytes | 4,294,967,296 |
-| `254` | 16 bytes | 18,446,744,073,709,551,616 |
-| `255` | Reserved and invalid | Never accepted |
+Integer and length payloads use marker varints (or fixed `u64` width in the
+legacy profile, because nextjson's unified data model crosses all integers at
+`u64`/`i64` width). Marker varints are canonical:
 
-Decoders reject non-minimal forms, narrowing overflow, malformed UTF-8,
-invalid type tags, truncation, resource-limit violations, and disallowed
-trailing bytes.
+| Marker    | Payload   | Minimum accepted value     |
+| --------- | --------- | -------------------------- |
+| `0..=250` | none      | 0                          |
+| `251`     | 2 bytes   | 251                        |
+| `252`     | 4 bytes   | 65,536                     |
+| `253`     | 8 bytes   | 4,294,967,296              |
+| `254`     | 16 bytes  | 18,446,744,073,709,551,616 |
+| `255`     | reserved  | never accepted             |
 
-## Zero Allocation and Zero Copy
+The decoder rejects non-minimal forms, narrowing overflow, malformed UTF-8,
+invalid tags, truncation, limit violations, and disallowed trailing bytes.
 
-`serialized_size` uses a counting writer. `serialize_into_slice` serializes
-once into caller-owned memory and returns the exact initialized length. If the
-slice is too small, `Error::BufferTooSmall` contains the exact required size.
+## Zero allocation and zero copy
 
-Slice deserialization supports nested borrowed strings and byte slices. Their
-lifetime is tied to the input and no object or payload copy is performed.
-Packed ASCII7 strings necessarily expand into owned text; raw adaptive UTF-8
-can be returned as `Cow::Borrowed`.
+`serialized_size` uses a counting writer. `serialize_into_slice` serializes once
+into caller-owned memory and returns the exact initialized length; when the
+slice is too small, `Error::BufferTooSmall` carries the exact required size.
+
+Slice deserialization borrows nested `&str` and byte-slice fields directly from
+the input:
 
 ```rust
 use nextjson::{NsonDeserialize, NsonSerialize};
@@ -240,49 +208,22 @@ assert_eq!(view.payload, "frame");
 # Ok::<(), rustbinary::Error>(())
 ```
 
-The codec itself does not allocate on this path. A user-defined nextjson
-implementation can still allocate internally.
+The codec does not allocate on this path; a user-defined nextjson
+implementation may still allocate internally. Allocation-free codec paths
+include `serialized_size`, `serialize_into_slice`, the adaptive
+`encode_*_into_slice` / `decode_*_into_slice` APIs, and bit-packed caller
+buffers. Reader-based decoding requires owned targets (`DeserializeOwned`);
+returning a reference into a temporary reader buffer would be unsound.
 
-Codec-owned allocation-free paths include `serialized_size`,
-`serialize_into_slice`, adaptive `encode_*_into_slice`,
-`decode_i64_slice_into`, `decode_string_into_slice`, and bit-packed caller
-buffers. Reader-based decoding requires `DeserializeOwned`; returning a
-reference into a temporary reader buffer would be unsound.
+Packed ASCII7 strings must expand into owned text; raw adaptive UTF-8 can be
+returned as `Cow::Borrowed`. See [zero_copy.rs](examples/zero_copy.rs) for
+pointer-range assertions.
 
-Borrowed parsing is true zero-copy for borrowed string payloads. It is the
-nextjson stream path; [zero_copy.rs](examples/zero_copy.rs) contains its
-pointer-range assertions. Use the separate archive surface for mapped object
-graphs.
+## Adaptive encoding
 
-## Memory-Mapped Archives
-
-The optional `archive` feature is a distinct storage format based on rkyv's
-validated relative-pointer layout. `build` creates a 64-byte RustBinary
-envelope followed by a little-endian archive with 32-bit relative pointers.
-The envelope records a format version, fixed format flags, a non-zero
-application schema ID, and checked payload/file lengths. rkyv is pinned because
-an incompatible archive-layout dependency update requires a RustBinary format
-version review.
-
-`MappedArchive::open` enforces the file-size limit, validates the envelope,
-schema, alignment, and complete relative-pointer graph once, then `root()`
-performs no allocation or deserialization. Opening is `unsafe`: every process
-must keep the mapped file immutable and untruncated for the mapping lifetime.
-Publish a new file and atomically switch application references; never update a
-mapped file in place. The schema ID is application-owned and must change after
-an incompatible root layout change. It is an identity check, not cryptographic
-authentication.
-
-The complete [mmap_archive.rs](examples/mmap_archive.rs) program writes a new
-file, drops the construction buffer, maps it read-only, validates nested data,
-and proves that strings, vectors, and child records point inside the mapping.
-
-## Adaptive Encoding
-
-`with_adaptive_encoding()` retains the compact nextjson profile and adds
-explicit data-aware APIs. Strategy selection compares complete encoded sizes, uses a
-stable tag in the frame, and validates canonical varints, padding, lengths,
-delta overflow, and RLE runs while decoding.
+`with_adaptive_encoding()` keeps the compact nextjson profile and adds explicit
+data-aware APIs. Frames carry a stable strategy tag, and the decoder validates
+canonical varints, padding, lengths, delta overflow, and RLE runs.
 
 ```rust
 let adaptive = rustbinary::options()
@@ -294,57 +235,67 @@ let required = adaptive.encoded_i64_slice_size(&values)?;
 let mut output = vec![0; required];
 adaptive.encode_i64_slice_into_slice(&mut output, &values)?;
 assert_eq!(adaptive.decode_i64_vec(&output)?, values);
-let mut decoded_values = [0_i64; 4];
-adaptive.decode_i64_slice_into(&mut decoded_values, &output)?;
-assert_eq!(decoded_values, values);
 
 let encoded = adaptive.encode_string("telemetry/primary")?;
 assert_eq!(adaptive.decode_string(&encoded)?, "telemetry/primary");
-let mut decoded_text = [0_u8; 32];
-assert_eq!(
-    adaptive.decode_string_into_slice(&mut decoded_text, &encoded)?,
-    "telemetry/primary"
-);
 # Ok::<(), rustbinary::Error>(())
 ```
 
-Adaptive frames are explicit because silently changing the representation of
-ordinary fields would break protocol compatibility.
+String frames contain a strategy byte, a canonical decoded-length varint, and
+the payload. Strategy 0 is raw UTF-8; strategy 1 is ASCII7 packed
+least-significant-bit first. ASCII7 is only selected when every byte is ASCII
+and the packed form is strictly smaller; ties resolve to raw UTF-8.
 
-String frames contain `strategy:u8`, a canonical decoded-byte-length varint,
-and payload. Strategy 0 is raw UTF-8; strategy 1 is ASCII7 packed
-least-significant bit first. ASCII7 is eligible only when every byte is ASCII
-and the complete packed representation is strictly smaller. Equal sizes select
-raw UTF-8.
+`i64` collections compare three complete encodings: independent ZigZag values
+(`Raw`), first value plus checked `i128` deltas (`Delta`), and value/run pairs
+(`RunLength`). Delta wins only when strictly smaller than raw and no larger
+than RLE; RLE wins only when strictly smaller than raw; otherwise raw is used.
+See [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs).
 
-Integer collection frames compare `Raw` independent ZigZag values, `Delta`
-with checked `i128` reconstruction, and `RunLength` value/run pairs. Delta wins
-only when strictly smaller than raw and no larger than RLE. RLE wins only when
-strictly smaller than raw. Otherwise raw is canonical. Decoders validate
-varints, counts, run lengths, delta overflow, padding, limits, and trailing
-policy.
+## Bit packing
 
-See [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) for strategy
-inspection, borrowing, exact caller buffers, and insufficient-capacity errors.
-
-## SIMD Dispatch
-
-With `simd`, `simd_backend()` selects AVX2, SSE2, NEON, or scalar code at
-runtime. Adaptive ASCII classification and one-byte varint runs use these
-kernels. All unaligned loads are bounds-checked by the safe dispatcher; unsafe
-code is isolated in target-specific modules and `unsafe_op_in_unsafe_fn` is
-denied crate-wide.
-
-AVX-512BW, SVE, and SME are detected and reported separately. They are not
-selected today: wider vectors are not automatically faster for small codec
-records, SME is a matrix facility rather than a byte-scanning facility, and
-those backends require target hardware CI before becoming a wire-engine claim.
-
-## Derived Systems
+`BitPacked` derives a bit-level codec for bounded fields. Fields annotated with
+`#[bits = N]` use `BitValue` range validation; other fields recursively use
+`BitPack`. Enum tags use the minimum bit width and unknown decoded tags are
+rejected.
 
 ```rust
-use nextjson::{NsonDeserialize, NsonSerialize};
-use rustbinary::{Fingerprint as _, Reflect as _, StaticSize as _};
+#[derive(Debug, PartialEq, rustbinary::BitPacked)]
+struct Header {
+    #[bits = 3]
+    mode: u8,
+    enabled: bool,
+    #[bits = 7]
+    delta: i16,
+}
+
+let config = rustbinary::options().with_bit_packing();
+let header = Header { mode: 2, enabled: true, delta: -1 };
+let packed = config.serialize(&header)?;
+assert_eq!(config.deserialize::<Header>(&packed)?, header);
+# Ok::<(), rustbinary::Error>(())
+```
+
+`BitWriter` clears the output so terminal padding is canonical zero, and
+`BitReader` rejects non-zero padding and (when configured) trailing bytes.
+
+## SIMD
+
+With `simd`, `simd_backend()` picks AVX2, SSE2, NEON, or a scalar path at
+runtime, caching the result. Adaptive ASCII classification and one-byte varint
+scans use these kernels. All unaligned loads are bounds-checked by the safe
+dispatcher; unsafe code is confined to target-specific modules and
+`unsafe_op_in_unsafe_fn` is denied crate-wide.
+
+AVX-512, SVE, and SME are detected and reported separately via
+`hardware_capabilities()`, but no codec kernel uses them. Wider vectors are not
+automatically faster for small codec records, and they have no hardware CI
+coverage here.
+
+## Fingerprint, reflection, and static bounds
+
+```rust
+use rustbinary::StaticSize as _;
 
 #[derive(
     NsonSerialize,
@@ -367,167 +318,141 @@ assert!(Header::MAX_SIZE >= frame.len() - 16);
 # Ok::<(), rustbinary::Error>(())
 ```
 
-`Fingerprint` hashes field and variant names, declared types, declaration
-order, integer encoding, effective endianness, trailing policy, resource
-limits, format, and CBOR deterministic mode. Native-endian fingerprints are
-different on little- and big-endian targets.
+- `Fingerprint` hashes field and variant names, declared types, declaration
+  order, integer encoding, effective endianness, trailing policy, resource
+  limits, and CBOR deterministic mode. It is a compatibility identifier based
+  on FNV-1a — **not** a cryptographic hash, and it must not replace AEAD,
+  signatures, or authorization.
+- `StaticSize` provides worst-case normal and bit-packed size bounds for
+  statically sized types. Dynamically sized collections intentionally do not
+  implement it.
+- `Reflect` generates allocation-free metadata (type name, fields, variants)
+  at compile time, with no runtime registry. See
+  [metadata.rs](examples/metadata.rs).
 
-The current FNV-1a-based fingerprint is a compatibility identifier, not a
-cryptographic hash. It must not replace AEAD, signatures, or authorization.
+The derive package has its own [English](rustbinary-derive/README.md) and
+[Chinese](rustbinary-derive/README.zh-CN.md) guides covering the generated
+contracts, accepted data shapes, generic bounds, `#[bits = N]` validation,
+compile-fail cases, and production patterns.
 
-`BitPacked` accepts `#[bits = N]`, rejects values that do not fit, uses the
-minimum enum tag width, and validates unused padding bits. `StaticSize` excludes
-dynamically sized collections by design.
+## Schema evolution
 
-`Reflect` emits allocation-free descriptors for type names, field names,
-declared type tokens, declaration indexes, enum variants, and variant indexes.
-It is runtime-readable metadata generated at compile time and requires no
-registry. See [metadata.rs](examples/metadata.rs).
+The `schema-evolution` feature frames values with a stable schema ID, a schema
+version, canonical field-ID ordering, length-delimited fields, and
+unknown-field skipping. Field IDs and schema IDs are explicit protocol
+decisions, not hashes that can change during refactoring.
 
-The derive package has a dedicated
-[English guide](https://github.com/blueokanna/RustBinary/blob/main/rustbinary-derive/README.md)
-and [Chinese guide](https://github.com/blueokanna/RustBinary/blob/main/rustbinary-derive/README.zh-CN.md).
-They document the generated contracts, accepted data shapes, generic bounds,
-`#[bits = N]` validation, compile-fail cases, and production integration
-patterns.
+The frame starts with the magic `RBE1`, a format version, flags, the schema ID,
+the schema version, the field count, and `(field_id, payload)` entries. The
+encoder sorts IDs and rejects duplicates; the decoder requires strictly
+increasing IDs and validates all length arithmetic before slicing.
 
-## CBOR, Compression, and Encryption
-
-The pipeline is explicit and ordered: serialize, optionally compress, then
-encrypt. Deterministic CBOR recursively sorts canonical map keys. Compression
-has a size threshold and only stores Zstandard output when it is smaller.
-Encryption authenticates both ciphertext and frame metadata and always uses a
-fresh nonce, so encrypted bytes are intentionally nondeterministic.
-
-```rust
-let secure = rustbinary::options()
-    .with_limit(16 * 1024 * 1024)
-    .with_cbor_format()
-    .with_deterministic_encoding()
-    .with_zstd_compression(3)
-    .with_compression_threshold(256)
-    .with_encryption(rustbinary::EncryptionKey::new([0xA5; 32]));
-# let value = vec![1u32, 2, 3];
-let frame = secure.serialize(&value)?;
-assert_eq!(secure.deserialize::<Vec<u32>>(&frame)?, value);
-# Ok::<(), rustbinary::Error>(())
-```
-
-Applications must obtain keys from a real key-management system. Hard-coded
-keys are suitable only for tests.
-
-Compression headers record raw and stored lengths. Decoders reject unknown
-flags, inconsistent length relationships, decompression-length mismatches,
-truncation, and configured-limit violations. Compression is retained only when
-its output is strictly smaller.
-
-Encryption obtains a fresh 192-bit nonce from the operating system. The full
-header is AEAD associated data, authenticating the algorithm ID, nonce, and
-lengths with the ciphertext. `EncryptionKey` owns 32 bytes, redacts `Debug`,
-and zeroizes on drop; key derivation, rotation, storage, and access control are
-application/KMS responsibilities. See
-[secure_pipeline.rs](examples/secure_pipeline.rs).
-
-## Schema Evolution
-
-The `schema-evolution` feature uses a stable schema ID, version, canonical
-field-ID ordering, length-delimited fields, unknown-field skipping, defaults,
-borrowed fields, and application-controlled migrations. Field IDs and schema
-IDs remain explicit protocol decisions rather than hashes that can silently
-change during refactoring.
-
-The frame contains magic `RBE1`, format version, flags, stable schema ID,
-schema version, field count, and length-delimited `(field_id, payload)` entries.
-Encoders sort IDs and reject duplicates. Decoders require strictly increasing
-IDs and validate all length arithmetic before slicing.
-
-Application protocol rules:
+Application rules:
 
 1. Assign one permanent schema ID to a compatible type family.
 2. Never reuse a field ID for a different meaning or incompatible type.
-3. Preserve the ID when renaming a Rust field.
-4. Add optional/defaulted fields for backward compatibility.
+3. Keep the ID when renaming a Rust field.
+4. Add optional or defaulted fields for backward compatibility.
 5. Use the encoded version for deliberate semantic migrations.
 6. Inspect unknown fields when forwarding or preservation is required.
 
-See [schema_evolution.rs](examples/schema_evolution.rs) for complete V1/V2
-upgrade and downgrade behavior with a rename, default, and borrowed field.
+See [schema_evolution.rs](examples/schema_evolution.rs) for a complete V1/V2
+upgrade and downgrade example with a rename, a default, and a borrowed field.
 
-## Parallel and Streams
+## CBOR, compression, and encryption
+
+The pipeline is explicit and ordered: serialize, optionally compress, then
+encrypt. Deterministic CBOR recursively sorts canonical map keys. Compression
+runs only above a size threshold and stores the Zstandard output only when it
+is strictly smaller. Encryption authenticates the full frame header (algorithm,
+nonce, lengths) as AEAD associated data and uses a fresh 192-bit nonce every
+time, so encrypted bytes are intentionally nondeterministic.
+
+- CBOR (feature `cbor`) delegates to nextjson's RFC 8949 relay. The CBOR relay
+  materializes a value tree before typed decoding, so per-container element
+  counts are enforced against the collection limit to keep memory amplification
+  bounded. Trailing bytes are always rejected (the relay requires exactly one
+  root value).
+- Compression (feature `compression`) uses the magic `RBZ1`, a 24-byte header
+  recording raw and stored lengths, and decoders reject unknown flags,
+  inconsistent lengths, decompression-length mismatches, truncation, and limit
+  violations.
+- Encryption (feature `encryption`) uses the magic `RBX1`. `EncryptionKey`
+  owns 32 bytes, redacts `Debug`, and zeroizes on drop. Key derivation,
+  rotation, storage, and access control remain application/KMS
+  responsibilities. See [secure_pipeline.rs](examples/secure_pipeline.rs).
+
+## Parallel batches
 
 `with_parallel_serialization()` encodes independent batch elements on scoped
-workers and emits an ordered length table, so scheduling does not affect output
-bytes. It is intended for large independent records; small values should use
-the normal single-value API.
+worker threads and emits an ordered `u64` length table followed by the payload
+section, so the output bytes are independent of worker scheduling. It is meant
+for large independent records; small values may be slower due to worker and
+merge overhead. See [parallel_batch.rs](examples/parallel_batch.rs).
 
-`serialize_into` writes directly to `std::io::Write`. `deserialize_from` reads
+## Memory-mapped archives
+
+The optional `archive` feature is a separate storage format based on rkyv's
+validated relative-pointer layout. `build` produces a 64-byte RustBinary
+envelope followed by a little-endian archive with 32-bit relative pointers. The
+envelope records a format version, format flags, a non-zero application schema
+ID, and checked payload/file lengths. rkyv is pinned because an incompatible
+archive-layout dependency update requires a RustBinary format version review.
+
+`MappedArchive::open` enforces the file-size limit (1 GiB by default),
+validates the envelope, schema, alignment, and the complete relative-pointer
+graph once; `root()` afterwards performs no allocation or deserialization.
+Opening is `unsafe`: every process must keep the mapped file immutable and
+untruncated for the mapping lifetime. Publish a new file and atomically switch
+application references; never update a mapped file in place. The schema ID is
+application-owned and must change after an incompatible root layout change; it
+is an identity check, not cryptographic authentication. See
+[mmap_archive.rs](examples/mmap_archive.rs).
+
+## Streams
+
+`serialize_into` writes directly to `std::io::Write`; `deserialize_from` reads
 owned values from `std::io::Read`. Slice decoding is the only API that can
-return borrowed values. Every untrusted boundary should set both a byte limit
-and a collection limit.
+return borrowed values. Compression and encryption stream readers consume one
+declared frame when passed `&mut R`, leaving later frames unread, and validate
+header length relationships and configured raw/plaintext limits before
+allocating the body.
 
-Parallel encoding is intended for independent, sufficiently large records.
-Each item is encoded separately; an ordered `u64` length table and source-order
-payload section make output independent of worker scheduling. Small values may
-be slower because worker and merge overhead can dominate. See
-[parallel_batch.rs](examples/parallel_batch.rs).
-
-Compression and encryption stream readers consume one declared frame when
-passed `&mut R`, leaving later frames unread. Header relationships and
-configured raw/plaintext limits are checked before body allocation.
-
-## Determinism Contract
-
-- Endian, integer mode, and enum representation are explicit.
-- Adaptive tags and tie-breaking are canonical.
-- Bit-packed terminal padding must be zero.
-- Schema-evolution fields are sorted by stable numeric ID.
-- Parallel batches retain source order.
-- Deterministic CBOR recursively sorts canonical map keys.
-- Floating-point IEEE bit patterns, including NaN payloads, are preserved.
-
-Ordinary `HashMap` iteration is randomized and is not deterministic. Use
-`BTreeMap`, another ordered serializer, or deterministic CBOR. Encrypted frames
-are intentionally nondeterministic because nonce reuse would be a security
-failure.
-
-## Wire and Security Rules
+## Security
 
 - Every value starts with a one-byte type tag; `0xff` terminates containers.
 - Floats preserve their IEEE 754 bit pattern; endianness is explicit.
 - Variable integers reject marker 255 and non-minimal encodings.
 - Struct fields are encoded as named object keys.
-- Ordinary maps preserve nextjson iteration order and are not deterministic.
-- Deterministic map serialization requires deterministic CBOR or an ordered map.
+- Ordinary maps preserve nextjson iteration order and are not deterministic;
+  deterministic map serialization requires deterministic CBOR or an ordered map.
 - Compression and encryption frames validate versions, flags, lengths, and limits.
-- Stream decoders validate frame length relationships and configured limits before body allocation.
 - Decryption authenticates before deserialization.
 - Fingerprints are compatibility checks, not cryptographic authentication.
 - User-defined nextjson implementations may allocate or reject borrowed visitors.
 
-At every untrusted boundary, set realistic byte and collection limits, reject
+At every untrusted boundary: set realistic byte and collection limits, reject
 trailing bytes unless an outer protocol owns them, authenticate adversarial
 data, and treat decompression/deserialization errors as input failures.
 
-Decompression is always bounded, even without a configured byte limit: the
-decompressed size is validated against the frame header and capped at the
-crate-wide default limit when `with_no_limit` / the legacy profile is used, so
-a hostile frame cannot drive an unbounded expansion. The CBOR relay
-materializes a value tree before typed decoding, so its per-container element
-counts are enforced against the collection limit to bound single-container
-memory amplification. The collection limit applies to sequence and map element
-counts; strings are bounded by the byte limit.
+Two bounds are worth calling out. Decompression is always bounded even without
+a configured byte limit: the decompressed size is validated against the frame
+header and capped at the crate-wide default when `with_no_limit` / the legacy
+profile is used, so a hostile frame cannot drive unbounded expansion. The
+collection limit applies to sequence and map element counts; strings are
+bounded by the byte limit.
 
-## Error Model
+## Error model
 
 All operations return `rustbinary::Result<T>`. `Error` preserves I/O errors and
 has structured variants for limits, capacity, frames, schemas, compression,
 encryption, bit packing, adaptive data, worker failure, and malformed primitive
-values. It is `#[non_exhaustive]`; downstream exhaustive matches need a fallback
-arm. Frame offsets, length sums, delta reconstruction, and integer narrowing
-are checked instead of relying on panic recovery.
+values. It is `#[non_exhaustive]`; downstream exhaustive matches need a
+fallback arm. Frame offsets, length sums, delta reconstruction, and integer
+narrowing use checked arithmetic rather than panic recovery.
 
-`Error::category()` provides the stable operational mapping to `UserInput`,
-`Protocol`, `Configuration`, or `InternalBug`.
+`Error::category()` maps errors to a stable operational category:
+`UserInput`, `Protocol`, `Configuration`, or `InternalBug`.
 
 ## Verification
 
@@ -540,29 +465,24 @@ cargo doc --workspace --all-features --no-deps
 cargo bench --bench codec_comparison
 ```
 
-The benchmark compares RustBinary's owned and caller-buffer Compact V1 paths
-over the same nextjson shapes. It validates each round trip before collecting
-nine calibrated samples and prints the median as raw Markdown.
+### Examples
 
-### Executable Examples
+| Example                                                     | Covers                                     | Command                                                              |
+| ----------------------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
+| [complete.rs](examples/complete.rs)                         | end-to-end, all features                   | `cargo run --example complete --all-features`                        |
+| [core_codec.rs](examples/core_codec.rs)                     | bounded core, buffers, borrowing, errors   | `cargo run --example core_codec`                                     |
+| [zero_copy.rs](examples/zero_copy.rs)                       | nested borrowing and pointer proof         | `cargo run --example zero_copy`                                      |
+| [mmap_archive.rs](examples/mmap_archive.rs)                 | validated mmap object graph                | `cargo run --example mmap_archive --features archive`                |
+| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs)   | adaptive decisions and caller buffers      | `cargo run --example adaptive_zero_alloc --features adaptive`        |
+| [secure_pipeline.rs](examples/secure_pipeline.rs)           | deterministic CBOR, compression, AEAD      | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
+| [schema_evolution.rs](examples/schema_evolution.rs)         | bidirectional schema V1/V2                 | `cargo run --example schema_evolution --features schema-evolution`   |
+| [parallel_batch.rs](examples/parallel_batch.rs)             | ordered multi-worker batches               | `cargo run --example parallel_batch --features parallel`             |
+| [metadata.rs](examples/metadata.rs)                         | fingerprint, reflection, bounds, packing   | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 
-| Example | Scope | Command |
-| --- | --- | --- |
-| [complete.rs](examples/complete.rs) | End-to-end all-feature composition | `cargo run --example complete --all-features` |
-| [core_codec.rs](examples/core_codec.rs) | Bounded Core, caller buffers, borrowing, trailing and error policy | `cargo run --example core_codec` |
-| [zero_copy.rs](examples/zero_copy.rs) | Nested borrowing and pointer proof | `cargo run --example zero_copy` |
-| [mmap_archive.rs](examples/mmap_archive.rs) | Validated read-only mmap object graph and pointer proof | `cargo run --example mmap_archive --features archive` |
-| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | Adaptive decisions and caller buffers | `cargo run --example adaptive_zero_alloc --features adaptive` |
-| [secure_pipeline.rs](examples/secure_pipeline.rs) | Deterministic CBOR, compression, AEAD | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
-| [schema_evolution.rs](examples/schema_evolution.rs) | Bidirectional schema V1/V2 | `cargo run --example schema_evolution --features schema-evolution` |
-| [parallel_batch.rs](examples/parallel_batch.rs) | Ordered multi-worker batches | `cargo run --example parallel_batch --features parallel` |
-| [metadata.rs](examples/metadata.rs) | Fingerprint, reflection, bounds, packing | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
+## docs.rs and compatibility
 
-## docs.rs and Compatibility
-
-Package metadata builds docs.rs with all features. Public modules are grouped
-by subsystem and feature-gated APIs receive automatic docs.rs labels. Strict
-local documentation validation on PowerShell:
+The package metadata builds docs.rs with all features, and feature-gated APIs
+receive automatic docs.rs labels. To validate docs locally on PowerShell:
 
 ```powershell
 $env:RUSTDOCFLAGS='-D warnings'
@@ -575,7 +495,7 @@ called out in release notes. Long-lived deployments should pin the version,
 record the complete configuration, keep golden vectors, and use explicit schema
 IDs.
 
-## Current Non-Goals
+## Non-goals
 
 - Casting arbitrary Rust structs directly from serialized memory
 - Mutable shared-memory object graphs or in-place updates to mapped files
@@ -586,12 +506,11 @@ IDs.
 
 ## License
 
-RustBinary is licensed under the [Apache License, Version 2.0](LICENSE).
-
-You may use, reproduce, modify, and redistribute the project under the terms
-of that license. Redistributions must preserve the copyright notice, license
-text, and required attribution notices. Changes to the source should be
-identified clearly, and the Apache License patent terms and disclaimer apply.
+RustBinary is licensed under the [Apache License, Version 2.0](LICENSE). You
+may use, reproduce, modify, and redistribute the project under the terms of
+that license. Redistributions must preserve the copyright notice, license text,
+and required attribution notices. Changes to the source should be identified
+clearly, and the Apache License patent terms and disclaimer apply.
 
 The complete legal text is in [`LICENSE`](LICENSE). This project is provided
-without warranties or conditions of any kind. 
+without warranties or conditions of any kind.
