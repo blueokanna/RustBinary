@@ -32,6 +32,7 @@ use nextjson::Number;
 use alloc::vec::Vec;
 
 use crate::{
+    canonical::{encode_varint_le, zigzag_encode},
     config::{Config, IntEncoding},
     error::{Error, Result},
     tags::{
@@ -164,8 +165,10 @@ impl<W: EncodeWriter> Encoder<W> {
 
     fn signed(&mut self, value: i128, fixed_bytes: usize) -> NextjsonResult<()> {
         if self.config.integers == IntEncoding::Variable && fixed_bytes > 1 {
-            let bits = (fixed_bytes * 8) - 1;
-            return self.varint(((value << 1) ^ (value >> bits)) as u128);
+            // ZigZag: the signed value maps to an unsigned magnitude. Values
+            // are widened to i128 by the caller, so the 128-bit canonical form
+            // is identical to the width-specific shift.
+            return self.varint(zigzag_encode(value));
         }
         let little = value.to_le_bytes();
         let big = value.to_be_bytes();
@@ -178,47 +181,41 @@ impl<W: EncodeWriter> Encoder<W> {
     }
 
     fn varint(&mut self, value: u128) -> NextjsonResult<()> {
+        // The little-endian canonical path is the single implementation in
+        // `canonical` (shared with the decoder and the Kani proofs).
+        if self.config.endian.little() {
+            let (encoded, length) = encode_varint_le(value);
+            return self
+                .emit(&encoded[..length])
+                .map_err(|error| self.fail(error));
+        }
+        // Big-endian path (kept inline; only the canonical LE profile is
+        // covered by the formal proofs).
         match value {
             0..=250 => self.emit_tag(value as u8),
             251..=0xffff => {
-                let payload = if self.config.endian.little() {
-                    (value as u16).to_le_bytes()
-                } else {
-                    (value as u16).to_be_bytes()
-                };
+                let payload = (value as u16).to_be_bytes();
                 let mut encoded = [0_u8; 3];
                 encoded[0] = MARKER_U16;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }
             0x1_0000..=0xffff_ffff => {
-                let payload = if self.config.endian.little() {
-                    (value as u32).to_le_bytes()
-                } else {
-                    (value as u32).to_be_bytes()
-                };
+                let payload = (value as u32).to_be_bytes();
                 let mut encoded = [0_u8; 5];
                 encoded[0] = MARKER_U32;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }
             0x1_0000_0000..=0xffff_ffff_ffff_ffff => {
-                let payload = if self.config.endian.little() {
-                    (value as u64).to_le_bytes()
-                } else {
-                    (value as u64).to_be_bytes()
-                };
+                let payload = (value as u64).to_be_bytes();
                 let mut encoded = [0_u8; 9];
                 encoded[0] = MARKER_U64;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }
             _ => {
-                let payload = if self.config.endian.little() {
-                    value.to_le_bytes()
-                } else {
-                    value.to_be_bytes()
-                };
+                let payload = value.to_be_bytes();
                 let mut encoded = [0_u8; 17];
                 encoded[0] = MARKER_U128;
                 encoded[1..].copy_from_slice(&payload);

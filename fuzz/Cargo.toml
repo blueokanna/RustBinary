@@ -1,0 +1,27 @@
+[package]
+name = "rustbinary-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rustbinary = { path = "..", features = ["alloc"] }
+nextjson = { version = "0.1", features = ["derive"] }
+
+[[bin]]
+name = "decode_arbitrary_bytes"
+path = "fuzz_targets/decode_arbitrary_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_structured_roundtrip"
+path = "fuzz_targets/decode_structured_roundtrip.rs"
+test = false
+doc = false
+bench = false

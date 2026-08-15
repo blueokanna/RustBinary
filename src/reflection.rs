@@ -7,6 +7,15 @@ pub struct FieldInfo {
     pub type_name: &'static str,
     /// Zero-based declaration index.
     pub index: usize,
+    /// Exact symbol-alphabet size for entropy coding, or `0` when unknown.
+    ///
+    /// This is the schema-derived prior the static-model rANS coder uses for
+    /// the field. The derive fills it from `#[entropy(symbols = N)]`, from a
+    /// `#[bits = N]` range (`2^N`, when it fits the rANS alphabet), or from
+    /// known primitive alphabets (`bool` → 2, `u8`/`i8` → 256). A zero means
+    /// the field is not single-symbol encodable (wide integers, strings,
+    /// nested types) and must be coded byte-by-byte or skipped.
+    pub symbols: u32,
 }
 
 /// Description of one enum variant.

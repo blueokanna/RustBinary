@@ -25,6 +25,8 @@ jobs:
             command: cargo test --no-default-features --features protocol
           - profile: pipeline
             command: cargo test --no-default-features --features pipeline
+          - profile: sync
+            command: cargo test --no-default-features --features sync
           - profile: archive
             command: cargo test --no-default-features --features archive
     steps:
@@ -61,6 +63,10 @@ jobs:
           cargo run --quiet --example schema_evolution --features schema-evolution
           cargo run --quiet --example secure_pipeline --features cbor,compression,encryption
           cargo run --quiet --example parallel_batch --features parallel
+          cargo run --quiet --example entropy --features entropy,derive
+          cargo run --quiet --example merkle_archive --features archive
+          cargo run --quiet --example delta_sync --features reconcile
+          cargo run --quiet --example trust_session --features trust
           cargo run --quiet --example complete --all-features
       - run: cargo doc --workspace --all-features --no-deps
         env:

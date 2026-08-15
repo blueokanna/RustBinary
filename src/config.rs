@@ -186,6 +186,16 @@ impl Config {
     pub const fn with_adaptive_encoding(self) -> crate::AdaptiveConfig {
         crate::AdaptiveConfig::new(self.with_varint_encoding().with_little_endian())
     }
+    /// Enables framed static-model rANS entropy coding.
+    #[cfg(feature = "entropy")]
+    pub const fn with_entropy_encoding(self) -> crate::EntropyConfig {
+        crate::EntropyConfig::new(self.with_varint_encoding().with_little_endian())
+    }
+    /// Enables baseline-relative differential frames for state exchange.
+    #[cfg(feature = "reconcile")]
+    pub const fn with_delta_encoding(self) -> crate::DeltaConfig {
+        crate::DeltaConfig::new(self.with_varint_encoding().with_little_endian())
+    }
     /// Enables ordered parallel batch serialization and deserialization.
     #[cfg(feature = "parallel")]
     pub fn with_parallel_serialization(self) -> crate::ParallelConfig {

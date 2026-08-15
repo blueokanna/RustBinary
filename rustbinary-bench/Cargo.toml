@@ -1,0 +1,25 @@
+[package]
+name = "rustbinary-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone benchmark crate comparing rustbinary against bincode 1/2, postcard, cbor4ii, and minicbor"
+
+[workspace]
+
+[dependencies]
+rustbinary = { path = "..", features = ["entropy"] }
+nextjson = { version = "0.1", features = ["derive"] }
+
+# serde-family opponents (bench-only; never part of rustbinary itself).
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+bincode2 = { package = "bincode", version = "2.0.1", features = ["serde"] }
+postcard = { version = "1", features = ["use-std"] }
+cbor4ii = { version = "1.2.2", features = ["serde1"] }
+minicbor = { version = "2.3.0", features = ["derive", "alloc"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

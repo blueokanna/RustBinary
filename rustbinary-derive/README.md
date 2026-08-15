@@ -249,7 +249,24 @@ pub trait Reflect {
 
 `TypeShape::Struct` contains `FieldInfo` values. `TypeShape::Enum` contains
 `VariantInfo` values, each with its fields. A field descriptor includes its
-declared name (or tuple index), token-form type name, and declaration index.
+declared name (or tuple index), token-form type name, declaration index, and a
+`symbols` alphabet size consumed by the entropy coder.
+
+The `symbols` value is derived deterministically: an explicit
+`#[entropy(symbols = N)]` (1..=32768) wins, then a `#[bits = N]` range when
+`N <= 15`, then a known primitive alphabet (`bool` to 2, `u8`/`i8` to 256);
+anything else reports `0`, meaning the field is coded byte-by-byte. The
+`Reflect` derive accepts both the `entropy` and `bits` field attributes.
+
+```rust
+#[derive(Reflect)]
+struct Telemetry {
+    #[entropy(symbols = 10)]
+    priority: u8,
+    level: bool,
+    payload: u8,   // symbols = 256
+}
+```
 
 ```rust
 match Header::SHAPE {

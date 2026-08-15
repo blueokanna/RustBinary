@@ -103,6 +103,14 @@ pub enum Error {
     Randomness(String),
     BitPacking(&'static str),
     Adaptive(&'static str),
+    #[cfg(feature = "entropy")]
+    Entropy(&'static str),
+    #[cfg(feature = "reconcile")]
+    Delta(&'static str),
+    #[cfg(feature = "reconcile")]
+    Iblt(&'static str),
+    #[cfg(feature = "trust")]
+    Trust(&'static str),
     #[cfg(feature = "parallel")]
     ParallelWorkerPanic,
     SchemaEvolution(&'static str),
@@ -141,6 +149,14 @@ impl Error {
             | Self::Adaptive(_)
             | Self::SchemaEvolution(_)
             | Self::NonCanonicalVarint => ErrorCategory::Protocol,
+            #[cfg(feature = "entropy")]
+            Self::Entropy(_) => ErrorCategory::Protocol,
+            #[cfg(feature = "reconcile")]
+            Self::Delta(_) => ErrorCategory::Protocol,
+            #[cfg(feature = "reconcile")]
+            Self::Iblt(_) => ErrorCategory::Protocol,
+            #[cfg(feature = "trust")]
+            Self::Trust(_) => ErrorCategory::Protocol,
             #[cfg(feature = "cbor")]
             Self::Cbor(_) => ErrorCategory::Protocol,
             #[cfg(feature = "compression")]
@@ -195,6 +211,14 @@ impl fmt::Display for Error {
             Self::Randomness(message) => write!(f, "system randomness error: {message}"),
             Self::BitPacking(message) => write!(f, "bit-packing error: {message}"),
             Self::Adaptive(message) => write!(f, "adaptive encoding error: {message}"),
+            #[cfg(feature = "entropy")]
+            Self::Entropy(message) => write!(f, "entropy coding error: {message}"),
+            #[cfg(feature = "reconcile")]
+            Self::Delta(message) => write!(f, "delta frame error: {message}"),
+            #[cfg(feature = "reconcile")]
+            Self::Iblt(message) => write!(f, "IBLT reconciliation error: {message}"),
+            #[cfg(feature = "trust")]
+            Self::Trust(message) => write!(f, "trust calculus error: {message}"),
             #[cfg(feature = "parallel")]
             Self::ParallelWorkerPanic => f.write_str("parallel codec worker panicked"),
             Self::SchemaEvolution(message) => write!(f, "schema evolution error: {message}"),

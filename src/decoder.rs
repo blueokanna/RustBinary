@@ -16,6 +16,7 @@ use nextjson::Error as NextjsonError;
 use nextjson::{FormatDecoder, Number, Token};
 
 use crate::{
+    canonical::{decode_varint_le, zigzag_decode},
     config::{Config, IntEncoding, TrailingBytes},
     error::{Error, Result},
     tags::{
@@ -164,7 +165,7 @@ impl<'de> Decoder<'de> {
     fn signed(&mut self, fixed_bytes: usize, min: i128, max: i128) -> NextjsonResult<i128> {
         let value = if self.config.integers == IntEncoding::Variable && fixed_bytes > 1 {
             let encoded = self.varint()?;
-            ((encoded >> 1) as i128) ^ -((encoded & 1) as i128)
+            zigzag_decode(encoded)
         } else {
             let source = self.take(fixed_bytes).map_err(|error| self.fail(error))?;
             let fill = if source.first().is_some_and(|first| {
@@ -198,6 +199,25 @@ impl<'de> Decoder<'de> {
 
     fn varint(&mut self) -> NextjsonResult<u128> {
         let marker = self.byte().map_err(|error| self.fail(error))?;
+        // The little-endian canonical path is the single implementation in
+        // `canonical` (shared with the encoder and the Kani proofs).
+        if self.config.endian.little() {
+            let payload_len = match marker {
+                0..=250 => return Ok(marker as u128),
+                MARKER_U16 => 2,
+                MARKER_U32 => 4,
+                MARKER_U64 => 8,
+                MARKER_U128 => 16,
+                other => return Err(self.fail(Error::InvalidVarintMarker(other))),
+            };
+            let bytes = self.take(payload_len).map_err(|error| self.fail(error))?;
+            return match decode_varint_le(marker, bytes) {
+                Some(value) => Ok(value),
+                None => Err(self.fail(Error::NonCanonicalVarint)),
+            };
+        }
+        // Big-endian path (kept inline; only the canonical LE profile is
+        // covered by the formal proofs).
         let (value, minimum) = match marker {
             0..=250 => return Ok(marker as u128),
             MARKER_U16 => (self.literal_u16()? as u128, 251),

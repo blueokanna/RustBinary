@@ -60,12 +60,18 @@ pub fn derive_static_size(input: TokenStream) -> TokenStream {
         .into()
 }
 
-#[proc_macro_derive(Reflect)]
+#[proc_macro_derive(Reflect, attributes(bits, entropy))]
 /// Derives allocation-free structural reflection metadata.
 ///
 /// Generated metadata contains the declared type name, fields, field type
 /// tokens, declaration indexes, and enum variants. No registry or runtime
 /// initialization is generated.
+///
+/// Field alphabet sizes feed the static-model entropy coder. The derive
+/// records `symbols` from an explicit `#[entropy(symbols = N)]` (1..=32768),
+/// from a `#[bits = N]` range, or from primitive alphabets (`bool` → 2,
+/// `u8`/`i8` → 256); otherwise the field reports `0` and is coded
+/// byte-by-byte.
 pub fn derive_reflect(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     reflect_impl(&input)
@@ -320,13 +326,110 @@ fn type_name(ty: &Type) -> String {
     ty.to_token_stream().to_string().replace(' ', "")
 }
 
-fn reflect_fields(fields: &Fields) -> proc_macro2::TokenStream {
-    let descriptors = fields.iter().enumerate().map(|(index, field)| {
-        let name = field_name(index, field);
-        let ty = type_name(&field.ty);
-        quote!(::rustbinary::FieldInfo { name: #name, type_name: #ty, index: #index })
-    });
-    quote!(&[#(#descriptors),*])
+/// Explicit `#[entropy(symbols = N)]` alphabet declaration, if present.
+fn declared_symbols(field: &syn::Field) -> syn::Result<Option<u32>> {
+    let mut attributes = field
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("entropy"));
+    let Some(attribute) = attributes.next() else {
+        return Ok(None);
+    };
+    if let Some(duplicate) = attributes.next() {
+        return Err(syn::Error::new_spanned(
+            duplicate,
+            "duplicate #[entropy] attribute",
+        ));
+    }
+    let Meta::List(list) = &attribute.meta else {
+        return Err(syn::Error::new_spanned(
+            attribute,
+            "use #[entropy(symbols = N)]",
+        ));
+    };
+    // Parse and validate in one pass; the parsed value is the result.
+    let mut count = None;
+    list.parse_nested_meta(|meta| {
+        if meta.path.is_ident("symbols") {
+            let value: syn::LitInt = meta.value()?.parse()?;
+            let parsed: u32 = value.base10_parse()?;
+            // The rANS alphabet is capped by the total frequency M = 2^15.
+            if parsed == 0 || parsed > 1 << 15 {
+                return Err(meta.error("symbols must be in 1..=32768"));
+            }
+            count = Some(parsed);
+            Ok(())
+        } else {
+            Err(meta.error("unsupported entropy option"))
+        }
+    })?;
+    Ok(count)
+}
+
+/// Symbol alphabet for a field's declared `#[bits = N]` range, when it fits
+/// the rANS alphabet cap.
+fn bits_symbols(field: &syn::Field) -> syn::Result<Option<u32>> {
+    match declared_bits(field)? {
+        Some(bits) if bits <= 15 => Ok(Some(1u32 << bits)),
+        _ => Ok(None),
+    }
+}
+
+/// Symbol alphabet for known primitive field types, when single-symbol
+/// encodable. Wide integers are not single-symbol encodable in rANS
+/// (alphabet is capped at `2^15`), so they report `0` and the caller codes
+/// their bytes individually.
+fn primitive_symbols(ty: &Type) -> u32 {
+    match ty {
+        Type::Path(path) => {
+            let last = path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default();
+            match last.as_str() {
+                "bool" => 2,
+                "u8" | "i8" => 1 << 8,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Deterministic schema-derived symbol count for one field.
+fn field_symbols(field: &syn::Field) -> syn::Result<u32> {
+    if let Some(count) = declared_symbols(field)? {
+        return Ok(count);
+    }
+    if let Some(count) = bits_symbols(field)? {
+        return Ok(count);
+    }
+    Ok(primitive_symbols(&field.ty))
+}
+
+fn reflect_fields(fields: &Fields) -> syn::Result<proc_macro2::TokenStream> {
+    let descriptors: Vec<syn::Result<proc_macro2::TokenStream>> = fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let name = field_name(index, field);
+            let ty = type_name(&field.ty);
+            let symbols = field_symbols(field)?;
+            Ok(quote!(::rustbinary::FieldInfo {
+                name: #name,
+                type_name: #ty,
+                index: #index,
+                symbols: #symbols,
+            }))
+        })
+        .collect();
+    let mut items = Vec::new();
+    for descriptor in descriptors {
+        items.push(descriptor?);
+    }
+    Ok(quote!(&[#(#items),*]))
 }
 
 fn reflect_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -335,14 +438,21 @@ fn reflect_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     let shape = match &input.data {
         Data::Struct(DataStruct { fields, .. }) => {
-            let fields = reflect_fields(fields);
+            let fields = reflect_fields(fields)?;
             quote!(::rustbinary::TypeShape::Struct(#fields))
         }
         Data::Enum(data) => {
             let variants = data.variants.iter().enumerate().map(|(index, variant)| {
                 let variant_name = variant.ident.to_string();
                 let fields = reflect_fields(&variant.fields);
-                quote!(::rustbinary::VariantInfo { name: #variant_name, index: #index, fields: #fields })
+                match fields {
+                    Ok(fields) => quote!(::rustbinary::VariantInfo {
+                        name: #variant_name,
+                        index: #index,
+                        fields: #fields,
+                    }),
+                    Err(error) => error.to_compile_error(),
+                }
             });
             quote!(::rustbinary::TypeShape::Enum(&[#(#variants),*]))
         }

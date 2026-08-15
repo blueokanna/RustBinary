@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rustbinary"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["blueokanna", "HyphenTeam"]
 keywords = ["binary", "serialization", "rust", "networking", "middleware"]
@@ -20,9 +20,10 @@ description = "A bounded nextjson binary codec with adaptive frames, zero-alloca
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [profile.release]
-# The codec is a monomorphized generic hot path; link-time optimization and a
-# single codegen unit meaningfully improve release and bench throughput.
 lto = "thin"
 codegen-units = 1
 opt-level = 3
@@ -31,7 +32,6 @@ opt-level = 3
 default = ["std"]
 alloc = []
 std = ["alloc", "nextjson/std"]
-# Product-layer bundles. Individual capabilities remain independently selectable.
 protocol = [
     "adaptive",
     "bit-packing",
@@ -42,7 +42,11 @@ protocol = [
     "static-size",
 ]
 pipeline = ["cbor", "compression", "encryption", "parallel"]
+sync = ["entropy", "reconcile", "trust"]
 archive = ["std", "dep:memmap2", "dep:rkyv"]
+entropy = ["alloc", "reflection"]
+reconcile = ["alloc"]
+trust = ["alloc", "std"]
 derive = ["dep:rustbinary-derive", "nextjson/derive"]
 fingerprint = ["alloc"]
 reflection = []
@@ -103,6 +107,22 @@ required-features = [
 name = "mmap_archive"
 required-features = ["archive"]
 
+[[example]]
+name = "entropy"
+required-features = ["entropy", "derive"]
+
+[[example]]
+name = "merkle_archive"
+required-features = ["archive"]
+
+[[example]]
+name = "delta_sync"
+required-features = ["reconcile"]
+
+[[example]]
+name = "trust_session"
+required-features = ["trust"]
+
 [dependencies]
 nextjson = { version = "0.1.3", default-features = false }
 rustbinary-derive = { version = "0.1.4", path = "rustbinary-derive", optional = true }
@@ -122,7 +142,4 @@ rkyv = { version = "0.8.18", optional = true, default-features = false, features
 
 [dev-dependencies]
 nextjson = { version = "0.1" }
-
-[[bench]]
-name = "codec_comparison"
-harness = false
+proptest = "1.6.0"

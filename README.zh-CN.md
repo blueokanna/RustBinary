@@ -1,48 +1,85 @@
 # RustBinary
 
 RustBinary 是一个基于 [nextjson](https://crates.io/crates/nextjson) 的有界二进制编解码库。
-它实现了 nextjson 的 `NsonSerialize` / `NsonDeserialize` 与 `FormatEncoder` /
-`FormatDecoder` 契约，类型直接用 nextjson 的 derive 描述。二进制线格式是带类型标签的
-自描述流：每个值前有一字节类型标签，容器以 `0xff` 终结，因此 `Option`、`Value`、
-无标签枚举和借用字符串都能无歧义往返。
+它实现 nextjson 的 `NsonSerialize` / `NsonDeserialize` 与 `FormatEncoder` /
+`FormatDecoder` 契约，类型直接用 nextjson 的 derive 描述。这个库是一套"把字节放到线上、
+再从线上读回来"的工具箱，每个特性都对应一个具体问题。本文档说明这些问题的答案，以及
+每个答案的代价。
 
-公开 API 分为三层，外加一个可选的归档产品面：
+## 格式身份
 
-| 层           | 模块                   | 默认启用 | 职责                                                          |
-| ------------ | ---------------------- | -------- | ------------------------------------------------------------- |
-| **Core**     | `rustbinary::core`     | 是       | Compact V1 编解码、资源上限、尾随策略、调用方缓冲区、`no_std` |
-| **Protocol** | `rustbinary::protocol` | 否       | Schema 演进、指纹、反射、静态上界、位打包                     |
-| **Pipeline** | `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理                              |
-| **Archive**  | `rustbinary::archive`  | 否       | 经校验的只读内存映射对象存储                                  |
+流线格式是**带类型标签的自描述字节流**：每个值前有一字节类型标签，数组与对象以 `0xff`
+终结。这就是格式身份。它不是 bincode 式的紧凑布局，也不是 CBOR 式的长度前缀布局，
+也不会悄悄变成这两种中的任何一种。
+
+这个身份换来三条整个设计都依赖的性质：
+
+- `Option`、无标签枚举、`nextjson::Value` 无需旁路元数据即可无歧义往返。
+- 借用 `&str` 字段直接指向输入 frame，零复制。
+- 解码器永远知道一个值在哪里结束、一个 frame 是否完整。
+
+代价是每个值付一字节标签，数值数组每个元素各付一字节标签。这笔税是真实的，而且被
+测量过而不是被藏起来——本仓库的 benchmark crate 在同样的数据上把它与 bincode 1、
+bincode 2、postcard、cbor4ii、minicbor 对比。如果你的负载是一大堆 `f64` 别的什么都没有，
+无 schema 的紧凑编解码器在体积和速度上会胜过本库，那就去用那个。如果你的负载是异构
+记录、必须无歧义往返、且在没有带外 schema 的情况下可读，标签税买来的就是这些。
+
+`archive` 特性**不是第二种流格式**。它是独立的存储格式——rkyv 扁平相对指针 + RustBinary
+信封——用于只读内存映射对象存储，并独立版本化（`RBARC002`）。流编解码器从不做内存强转、
+从不产生相对指针、也从不因为某个 Cargo feature 改变自己的行为。
+
+## 依赖策略
+
+流路径依赖 nextjson，以及可选的派生 crate。可选 pipeline 增加 zstd、
+chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
+**刻意没有任何第三方哈希依赖**：
+
+- 熵层完全不使用哈希来校验帧——见熵编码一节。
+- 归档的 Merkle 树是唯一结构性无法避免哈希的地方（Merkle 树由哈希函数定义），
+  因此 `src/hash.rs` 内含一份紧凑、零依赖的 SHA-256，用 NIST FIPS 180-2 测试向量
+  （含一百万字符 `a` 的向量）验证。
+
+## 分层
+
+| 层          | 模块                   | 默认启用 | 职责                                                                 |
+| ----------- | ---------------------- | -------- | -------------------------------------------------------------------- |
+| **Core**    | `rustbinary::core`     | 是       | 紧凑编解码、资源上限、尾随策略、调用方缓冲区、`no_std`              |
+| **Protocol**| `rustbinary::protocol` | 否       | Schema 演进、指纹、反射、静态上界、位打包                           |
+| **Pipeline**| `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理                                    |
+| **Sync**    | `sync`                 | 否       | rANS 熵编码、差分帧、IBLT 集合协调、信任演算                        |
+| **Archive** | `rustbinary::archive`  | 否       | Merkle 校验的只读内存映射对象存储                                   |
 
 [English](README.md)
 
 ## 特性
 
-| 能力                  | 状态     | 说明                                                          |
-| --------------------- | -------- | ------------------------------------------------------------- |
-| nextjson 二进制编解码 | 已实现   | 严格 marker-varint 模式与固定宽度 legacy 模式                 |
-| 整数/字符串自适应编码 | 已实现   | 按值选宽度、ZigZag 有符号数、ASCII7 打包                      |
-| `i64` 集合自适应编码  | 已实现   | raw / delta / run-length 三种 frame                           |
-| SIMD                  | 仅热路径 | 运行时 AVX2/SSE2/NEON，标量回退；AVX-512/SVE/SME 只探测不使用 |
-| 零分配编解码路径      | 已实现   | 精确长度输出与调用方缓冲区                                    |
-| 借用式零复制反序列化  | 已实现   | 嵌套 `&str` 字段直接指向输入 frame                            |
-| 位打包                | 已实现   | `BitPacked` derive、宽度检查、规范零 padding                  |
-| Schema 指纹           | 已实现   | 结构哈希，包含编解码配置                                      |
-| 编译期内存上界        | 已实现   | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`    |
-| RFC 8949 CBOR         | 已实现   | nextjson CBOR 中继；可选 canonical map 排序                   |
-| Schema 演进           | 已实现   | 稳定字段 ID、版本、默认值、跳过未知字段                       |
-| 压缩                  | 已实现   | 自适应 Zstandard；压缩后更大则保留原文                        |
-| 加密                  | 已实现   | XChaCha20-Poly1305、随机 192-bit nonce、认证 header           |
-| 并行序列化            | 已实现   | 有序 batch frame，输出与调度无关                              |
-| 运行时反射            | 已实现   | 编译期生成、无分配的静态元数据（`Reflect`）                   |
-| `std::io` 流          | 已实现   | reader/writer 适配器保留配置的资源上限                        |
-| `no_std`              | 已实现   | Compact V1 slice 编解码与调用方缓冲区无需默认 feature         |
-| `no_std + alloc`      | 已实现   | owned 值、指纹、演进、自适应 codec                            |
+| 能力                    | 状态       | 说明                                                                        |
+| ----------------------- | ---------- | --------------------------------------------------------------------------- |
+| nextjson 二进制编解码   | 已实现     | 严格 marker-varint 模式与固定宽度 legacy 模式                               |
+| 整数/字符串自适应编码   | 已实现     | 按值选宽度、ZigZag 有符号数、ASCII7 打包                                    |
+| `i64` 集合自适应编码    | 已实现     | raw / delta / run-length 三种 frame                                         |
+| rANS 熵编码             | 已实现     | 自研静态模型编码器；无哈希重放校验                                          |
+| SIMD                    | 仅热路径   | 运行时 AVX2/SSE2/NEON，标量回退；AVX-512/SVE/SME 只探测不使用               |
+| 零分配编解码路径        | 已实现     | 精确长度输出与调用方缓冲区                                                   |
+| 借用式零复制反序列化    | 已实现     | 嵌套 `&str` 字段直接指向输入 frame                                          |
+| 位打包                  | 已实现     | `BitPacked` derive、宽度检查、规范零 padding                                |
+| Schema 指纹             | 已实现     | 结构哈希，包含编解码配置（FNV-1a，**非**密码学）                             |
+| 编译期内存上界          | 已实现     | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                  |
+| RFC 8949 CBOR           | 已实现     | nextjson CBOR 中继；可选 canonical map 排序                                 |
+| Schema 演进             | 已实现     | 稳定字段 ID、版本、默认值、跳过未知字段                                     |
+| 压缩                    | 已实现     | 自适应 Zstandard；压缩后更大则保留原文                                      |
+| 加密                    | 已实现     | XChaCha20-Poly1305、随机 192-bit nonce、认证 header                         |
+| 并行序列化              | 已实现     | 有序 batch frame，输出与调度无关                                            |
+| 运行时反射              | 已实现     | 编译期生成、无分配的静态元数据（`Reflect`），含逐字段符号表                  |
+| 差分帧                  | 已实现     | 基准相对整数差分 + 确定性 HPACK 式动态表                                    |
+| IBLT 集合协调           | 已实现     | 自研可逆布隆查找表（Goodrich 与 Mitzenmacher）                              |
+| 信任演算                | 已实现     | 类型级认证状态机；未认证接收在类型层面不可表达                              |
+| Merkle 归档             | 已实现     | 零依赖 SHA-256 树，O(log n) 证明，仅信封打开                                |
+| 形式化验证              | Kani 证明  | varint/ZigZag 核心的往返、有界、规范唯一性                                   |
+| `no_std`                | 已实现     | Compact slice 编解码与调用方缓冲区无需默认 feature                          |
+| `no_std + alloc`        | 已实现     | owned 值、指纹、演进、自适应、熵、集合协调                                  |
 
 ## 安装
-
-在 `Cargo.toml` 中加入本 crate 与 nextjson 框架：
 
 ```toml
 [dependencies]
@@ -50,37 +87,42 @@ rustbinary = "0.1"
 nextjson = { version = "0.1", features = ["derive"] }
 ```
 
-可选能力通过 Cargo feature 启用，按需选择即可：
+按需启用：
 
 ```toml
 rustbinary = { version = "0.1", features = ["protocol"] }   # 整个 Protocol 层
-rustbinary = { version = "0.1", features = ["fingerprint", "derive"] }
-rustbinary = { version = "0.1", features = ["archive"] }    # 仅 mmap 归档
+rustbinary = { version = "0.1", features = ["sync"] }       # 熵 + 集合协调 + 信任
+rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap 归档
 ```
 
-可选的 Zstandard 依赖需要构建平台具备 C 工具链。
+Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵编码器与归档的 SHA-256
+零依赖。
 
-### Feature 矩阵
+### 特性矩阵
 
-| Feature            | 默认启用 | 用途                                                                                        |
-| ------------------ | -------- | ------------------------------------------------------------------------------------------- |
-| `std`              | 是       | owned Core 与 I/O API；Pipeline 与 SIMD 以它为前提                                          |
-| `alloc`            | 随 std   | 兼容性标记；owned API 始终可用（nextjson 的 `FormatDecoder` 需要 alloc）                    |
-| `protocol`         | 否       | 聚合：adaptive、bit-packing、derive、fingerprint、reflection、schema-evolution、static-size |
-| `pipeline`         | 否       | 聚合：cbor、compression、encryption、parallel                                               |
-| `archive`          | 否       | 经校验的只读 mmap 归档；依赖 `std`、rkyv、memmap2                                           |
-| `derive`           | 否       | 与对应 runtime feature 一起导出过程宏                                                       |
-| `fingerprint`      | 否       | 结构指纹 runtime 与 frame                                                                   |
-| `reflection`       | 否       | 零分配反射 runtime                                                                          |
-| `static-size`      | 否       | 编译期上界 runtime                                                                          |
-| `simd`             | 否       | 运行时能力探测与热扫描分派，不改变线格式                                                    |
-| `bit-packing`      | 否       | 位级 trait 与调用方缓冲区 codec                                                             |
-| `adaptive`         | 否       | 调用方缓冲区自适应字符串/集合；隐含 `bit-packing`                                           |
-| `cbor`             | 否       | 基于 nextjson 中继的 RFC 8949 CBOR                                                          |
-| `compression`      | 否       | 自适应 Zstandard frame                                                                      |
-| `encryption`       | 否       | XChaCha20-Poly1305、系统随机数、密钥清零                                                    |
-| `parallel`         | 否       | scoped thread 有序批处理                                                                    |
-| `schema-evolution` | 否       | 稳定字段 ID 版本化 frame                                                                    |
+| Feature            | 默认 | 用途                                                                        |
+| ------------------ | ---- | --------------------------------------------------------------------------- |
+| `std`              | 是   | owned Core 与 I/O API；Pipeline、SIMD、trust 需要                           |
+| `alloc`            | via std | 兼容标记；owned API 始终可用                                          |
+| `protocol`         | 否   | 聚合：adaptive, bit-packing, derive, fingerprint, reflection, schema-evolution, static-size |
+| `pipeline`         | 否   | 聚合：cbor, compression, encryption, parallel                               |
+| `sync`             | 否   | 聚合：entropy, reconcile, trust                                             |
+| `archive`          | 否   | Merkle 校验的 mmap 归档；需要 `std`, rkyv, memmap2                          |
+| `derive`           | 否   | 重导出过程宏及其运行时 feature                                              |
+| `fingerprint`      | 否   | 结构指纹运行时与 frame                                                      |
+| `reflection`       | 否   | 无分配反射运行时                                                            |
+| `static-size`      | 否   | 编译期上界运行时                                                            |
+| `simd`             | 否   | 运行时探测与热路径分发；绝不改变线格式                                      |
+| `bit-packing`      | 否   | 位级 trait 与调用方缓冲区 codec                                             |
+| `adaptive`         | 否   | 调用方缓冲的自适应字符串/集合；隐含 `bit-packing`                          |
+| `entropy`          | 否   | 静态模型 rANS 熵编码；隐含 `reflection`                                     |
+| `reconcile`        | 否   | 差分帧（`delta`）与 IBLT（`ibl`）                                          |
+| `trust`            | 否   | 类型级信任演算与会话状态机                                                  |
+| `cbor`             | 否   | 经 nextjson 中继的 RFC 8949 CBOR                                           |
+| `compression`      | 否   | 自适应 Zstandard frame                                                      |
+| `encryption`       | 否   | XChaCha20-Poly1305、OS 随机、zeroize 密钥                                   |
+| `parallel`         | 否   | scoped 线程有序 batch frame                                                 |
+| `schema-evolution` | 否   | 稳定字段 ID 版本化 frame                                                    |
 
 ## 快速开始
 
@@ -106,21 +148,17 @@ assert_eq!(config.deserialize::<Packet>(&bytes)?, packet);
 # Ok::<(), rustbinary::Error>(())
 ```
 
-顶层 `serialize` / `deserialize` 函数与 `options()` 都使用严格紧凑模式：小端、
-规范 marker-varint、ZigZag 有符号整数、默认 64 MiB 字节上限、一百万元素集合上限，
-并拒绝尾随字节。`legacy_options()` 显式选择旧的无界定宽模式并允许尾随字节，只适合
-可信的内存数据。
+`options()` 与顶层函数使用严格紧凑模式：小端、规范 marker-varint、ZigZag 有符号数、
+64 MiB 字节上限、1,000,000 元素集合上限、拒绝尾随字节。`legacy_options()` 是旧的
+无限定固定宽度模式，只适合可信的内存内数据——它被命名成这样就是让你注意到它。
 
 ### 配置链
 
-配置值体积小且可复制。改变格式的方法返回不同的 wrapper，处理顺序在类型上可见：
+改变格式的方法返回不同的包装类型，因此变换顺序在类型中可见：
 
 ```text
 Config -> CborConfig -> CompressedConfig -> EncryptedConfig
 ```
-
-`Config` 决定端序、整数表示、字节/集合上限和尾随策略；各 wrapper 每次增加一项能力。
-例如（启用全部相关 feature 时）：
 
 ```rust
 let secure = rustbinary::options()
@@ -140,43 +178,42 @@ assert_eq!(secure.deserialize::<Vec<u32>>(&frame)?, value);
 
 ## 线格式
 
-格式编码的是值，不是 Rust 对象内存：不写 padding、原生指针、vtable 或
-`repr(Rust)` 布局。每个值前有一字节类型标签；数组和对象以 `0xff` 终结。
+该格式编码的是值，不是 Rust 对象内存：没有 padding、原生指针、vtable 或 `repr(Rust)`
+布局。
 
-| nextjson 值            | 线表示                                              |
-| ---------------------- | --------------------------------------------------- |
-| `null` / unit / `None` | 标签 `0x00`                                         |
-| `false` / `true`       | 标签 `0x01` / `0x02`                                |
-| `u64` / `u128`         | 标签 `0x03` / `0x04` + 无符号 payload               |
-| `i64` / `i128`         | 标签 `0x05` / `0x06` + ZigZag payload               |
-| `f64` / `f32`          | 标签 `0x07` / `0x08` + 按配置端序的 IEEE 754 位模式 |
-| 字符串 / char          | 标签 `0x09` + 编码字节长度 + UTF-8                  |
-| 数组                   | 标签 `0x0a` + 元素 + `0xff`                         |
-| 对象                   | 标签 `0x0b` + (`字符串键` + 值) 对 + `0xff`         |
+| nextjson 值             | 线表示                                                    |
+| ----------------------- | --------------------------------------------------------- |
+| `null` / unit / `None`  | tag `0x00`                                                |
+| `false` / `true`        | tags `0x01` / `0x02`                                      |
+| `u64` / `u128`          | tags `0x03` / `0x04` + 无符号负载                         |
+| `i64` / `i128`          | tags `0x05` / `0x06` + ZigZag 负载                        |
+| `f64` / `f32`           | tags `0x07` / `0x08` + 配置端序下的 IEEE 754 位           |
+| string / char           | tag `0x09` + 编码字节长度 + UTF-8                         |
+| array                   | tag `0x0a` + 元素 + `0xff`                                |
+| object                  | tag `0x0b` + (`字符串键` + 值) 对 + `0xff`                |
 
-整数与长度 payload 使用 marker-varint（legacy 模式下为定宽 `u64`，因为 nextjson
-的统一数据模型把所有整数按 `u64`/`i64` 宽度跨线传输）。Marker varint 必须使用最短
-规范形式：
+默认模式下整数与长度负载使用规范 marker-varint：
 
-| Marker    | Payload | 最小合法值                 |
-| --------- | ------- | -------------------------- |
-| `0..=250` | 无      | 0                          |
-| `251`     | 2 字节  | 251                        |
-| `252`     | 4 字节  | 65,536                     |
-| `253`     | 8 字节  | 4,294,967,296              |
-| `254`     | 16 字节 | 18,446,744,073,709,551,616 |
-| `255`     | 保留    | 永不接受                   |
+| Marker    | 负载     | 可接受的最小值           |
+| --------- | -------- | ------------------------ |
+| `0..=250` | 无       | 0                        |
+| `251`     | 2 字节   | 251                      |
+| `252`     | 4 字节   | 65,536                   |
+| `253`     | 8 字节   | 4,294,967,296            |
+| `254`     | 16 字节  | 18,446,744,073,709,551,616 |
+| `255`     | 保留     | 永不接受                 |
 
-解码器拒绝非最短形式、窄化溢出、非法 UTF-8、非法标签、截断、上限违规和不允许的
-尾随字节。
+解码器拒绝非最小形式、收窄溢出、畸形 UTF-8、非法标签、截断、越限与不允许的尾随
+字节。varint 与 ZigZag 机制只存在于一处（`canonical`），编解码两侧共用，Kani 证明其
+往返、有界与规范唯一性（见验证一节）。
 
 ## 零分配与零复制
 
-`serialized_size` 通过计数 writer 得到精确长度；`serialize_into_slice` 只执行一次
-序列化并写入调用方内存，返回精确初始化长度。容量不足时，`Error::BufferTooSmall`
-携带精确所需容量。
+`serialized_size` 用一次计数写入完成测量，不分配。`serialize_into_slice` 一次写入
+调用方内存并返回精确初始化长度；slice 过小时 `Error::BufferTooSmall` 携带精确所需
+大小。
 
-从 slice 反序列化时，嵌套的 `&str` 与字节切片字段直接借用输入：
+Slice 反序列化把嵌套 `&str` 字段直接从输入借用：
 
 ```rust
 use nextjson::{NsonDeserialize, NsonSerialize};
@@ -197,18 +234,14 @@ assert_eq!(view.payload, "frame");
 # Ok::<(), rustbinary::Error>(())
 ```
 
-这条路径上 codec 自身不分配；用户自定义的 nextjson 实现仍可能自行分配。codec 自身
-保证无分配的路径包括 `serialized_size`、`serialize_into_slice`、adaptive 的
-`encode_*_into_slice` / `decode_*_into_slice` 以及位打包调用方缓冲区。Reader 解码
-要求 owned 目标（`DeserializeOwned`）；返回指向临时 reader buffer 的引用不安全。
-
-ASCII7 打包必然展开为 owned 文本；adaptive raw UTF-8 可返回 `Cow::Borrowed`。
-指针范围断言见 [zero_copy.rs](examples/zero_copy.rs)。
+该路径上 codec 不分配；用户自定义的 nextjson 实现内部仍可能分配。基于 reader 的解码
+要求 owned 目标；把引用返回到临时 reader 缓冲区内是不健全的。打包后的 ASCII7 字符串
+展开为 owned 文本；原始自适应 UTF-8 可以 `Cow::Borrowed` 返回。
 
 ## 自适应编码
 
-`with_adaptive_encoding()` 保留紧凑 nextjson 配置，并提供显式的数据感知 API。
-frame 携带稳定策略标签；解码器校验规范 varint、padding、长度、delta 溢出和 RLE run。
+`with_adaptive_encoding()` 保持紧凑模式并增加显式的数据感知 API。frame 携带稳定策略
+标签，解码器校验规范 varint、padding、长度、delta 溢出与 RLE 游程。
 
 ```rust
 let adaptive = rustbinary::options()
@@ -226,19 +259,72 @@ assert_eq!(adaptive.decode_string(&encoded)?, "telemetry/primary");
 # Ok::<(), rustbinary::Error>(())
 ```
 
-字符串 frame 由策略字节、规范化解码长度 varint 和 payload 组成。策略 0 是原始
-UTF-8；策略 1 是最低有效位优先的 ASCII7。只有输入全部为 ASCII 且打包结果严格更小
-时才选 ASCII7；大小相等时选 raw UTF-8。
+字符串 frame 含策略字节、规范解码长度 varint 与负载。策略 0 是原始 UTF-8；策略 1 是
+低位在前的 ASCII7 打包，仅当每个字节都是 ASCII 且打包形式严格更小时才选。`i64` 集合
+比较三种完整编码——独立 ZigZag 值、首值 + 带检查差分、值/游程对——按文档规定的平局
+顺序选严格最小者。
 
-`i64` 集合比较三种完整编码：独立 ZigZag 值（`Raw`）、首值加受检 `i128` delta
-（`Delta`）、value/run 对（`RunLength`）。Delta 必须严格小于 raw 且不大于 RLE；
-RLE 必须严格小于 raw；否则用 raw。完整示例见
-[adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs)。
+## rANS 熵编码
+
+`with_entropy_encoding()` 启用 `entropy` 模块：自研 rANS 编码器（range Asymmetric
+Numeral Systems；16 位重归一化；64 位状态），配以**由 `Reflect` schema 推导的静态模型**。
+它不是 zstd 或任何东西的包装：无 C、不传输字典、`no_std` + `alloc`。
+
+模型在不传输任何东西的情况下推导：
+
+- `#[derive(Reflect)]` 逐字段记录精确符号表：枚举变体基数、`#[bits = N]` 范围、
+  显式 `#[entropy(symbols = N)]`，或已知原语（`bool` 到 2、`u8`/`i8` 到 256）。
+- `Model::from_uniform` 在该精确符号表上建立均匀先验；`Model::from_weights` 从应用
+  权重建立静态先验。
+- `SchemaModel::from_reflect` 遍历 shape，逐字段产出一个模型。两端编译同一类型，
+  因此推导出同一张表；解码器除了它已有的 schema 之外不需要任何东西。
+
+### 不使用哈希如何检测损坏
+
+rANS 流不是自认证的。最终状态检查能拒绝截断和大部分替换，但对"字节变了但仍然能解码"
+的情况有非零漏检率。这个模块的第一版用帧内 SHA-256 摘要掩盖了这个问题；这一版把哈希
+整个去掉，换成精确的东西：
+
+**重放校验。** 解码器用同一组模型把解码结果重新编码，并要求结果与帧中存储的负载和
+最终状态逐字节一致。只有当帧是"它解码出的负载的规范编码"时才被接受——即
+`frame == encode(decode(frame))`。
+
+于是保证是精确的：
+
+- 截断会在状态与消费检查处失败。
+- 任何让帧仍可解码的字节变更都会改变解码负载，因此重放不一致、帧被拒绝——除非被损坏
+  的帧恰好是另一个负载的规范编码，而这种情况下任何非认证方案都无法区分（哈希也做不到：
+  它只会认证被替换掉的负载）。
+- raw 回退帧存储字面输入、无冗余，因此只做长度校验。`without_raw_fallback()` 关闭该
+  回退，让每个帧都保持编码态、都可被重放校验。
+
+重放校验默认开启，代价是解码时多一次编码（基准表可见）。`without_replay_verification()`
+可在传输层已认证字节的场景下关闭。
+
+```rust
+use rustbinary::{Model, RansEncoder, RansDecoder};
+
+// 精确 5 符号表每个符号约 log2(5) = 2.32 位，而不是 3 位。
+let model = Model::from_uniform(5)?;
+let mut encoder = RansEncoder::new();
+for _ in 0..100 { encoder.put_symbol(&model, 3)?; }
+let (final_state, payload) = encoder.finish();
+let mut decoder = RansDecoder::new(final_state, &payload);
+let mut kinds = Vec::new();
+for _ in 0..100 { kinds.push(decoder.get_symbol(&model)?); }
+decoder.finish()?;
+kinds.reverse();
+# assert!(kinds.iter().all(|&k| k == 3));
+# Ok::<(), rustbinary::Error>(())
+```
+
+见 [entropy.rs](examples/entropy.rs) 的 schema 驱动流程与带偏斜先验的独立字节 codec
+（重复遥测数据 2 倍以上压缩，已在基准 crate 中实测）。
 
 ## 位打包
 
-`BitPacked` 为有界字段派生位级 codec。标注 `#[bits = N]` 的字段使用 `BitValue`
-范围校验；其他字段递归使用 `BitPack`。枚举标签使用最小位宽，未知解码标签被拒绝。
+`BitPacked` 为有界字段派生位级 codec。`#[bits = N]` 字段用 `BitValue` 范围校验；其他
+字段递归使用 `BitPack`。枚举标签用最小位宽并拒绝未知解码标签。
 
 ```rust
 #[derive(Debug, PartialEq, rustbinary::BitPacked)]
@@ -257,18 +343,17 @@ assert_eq!(config.deserialize::<Header>(&packed)?, header);
 # Ok::<(), rustbinary::Error>(())
 ```
 
-`BitWriter` 会清零输出，使末尾 padding 为规范零；`BitReader` 拒绝非零 padding 以及
-（配置时）尾随字节。
+`BitWriter` 清空输出使末端 padding 为规范零；`BitReader` 拒绝非零 padding 与（配置时）
+尾随字节。
 
 ## SIMD
 
-启用 `simd` 后，`simd_backend()` 在运行时选择 AVX2、SSE2、NEON 或标量路径并缓存
-结果。adaptive 的 ASCII 分类和单字节 varint 扫描已接入这些内核。所有非对齐读取都由
-安全分派层保证边界；unsafe 只存在于目标架构模块，crate 全局启用
-`deny(unsafe_op_in_unsafe_fn)`。
+`simd_backend()` 在运行时选择 AVX2、SSE2、NEON 或标量路径并缓存结果。自适应 ASCII
+分类与单字节 varint 扫描使用这些内核。所有非对齐加载都由安全分发器做边界检查；
+unsafe 代码局限于目标特定模块，crate 全局拒绝 `unsafe_op_in_unsafe_fn`。
 
-AVX-512、SVE、SME 会通过 `hardware_capabilities()` 独立探测并报告，但没有 codec
-内核使用它们。宽向量对小 record 不一定更快，且这些后端目前没有硬件 CI 覆盖。
+AVX-512、SVE、SME 由 `hardware_capabilities()` 探测并报告，但没有任何内核使用它们；
+更宽的向量对小型 codec 记录未必更快，这里也没有对应的硬件 CI 覆盖。
 
 ## 指纹、反射与静态上界
 
@@ -296,113 +381,199 @@ assert!(Header::MAX_SIZE >= frame.len() - 16);
 # Ok::<(), rustbinary::Error>(())
 ```
 
-- `Fingerprint` 覆盖字段/variant 名称、声明类型、声明顺序、整数编码、实际端序、
-  尾随策略、资源限制以及 CBOR deterministic 模式。它基于 FNV-1a，是兼容性标识，
-  **不是**密码学哈希，不能替代 AEAD、签名或权限判断。
-- `StaticSize` 为静态定长类型提供最坏情况普通/位打包大小上界。动态集合有意不实现。
-- `Reflect` 在编译期生成无分配元数据（类型名、字段、variant），无需运行时注册表。
-  完整示例见 [metadata.rs](examples/metadata.rs)。
-
-derive package 提供独立的[中文详细指南](rustbinary-derive/README.zh-CN.md)和
-[英文详细指南](rustbinary-derive/README.md)，说明生成的 trait 契约、支持的数据形状、
-泛型约束、`#[bits = N]` 校验、编译期错误与生产集成方式。
+- `Fingerprint` 对字段与变体名、声明类型、声明顺序、整数编码、有效端序、尾随策略、
+  资源上限与 CBOR 确定性模式求哈希。它是基于 FNV-1a 的兼容性标识——**不是**密码学
+  哈希，不能替代 AEAD、签名或授权。
+- `StaticSize` 为静态类型提供最坏情况普通与位打包大小上界；动态集合刻意不实现它。
+- `Reflect` 在编译期生成无分配元数据（类型名、字段、变体），无运行时注册表。每个
+  `FieldInfo` 还携带字段符号表（`symbols`），供 rANS schema 模型消费。
 
 ## Schema 演进
 
-`schema-evolution` feature 用稳定 schema ID、schema 版本、规范字段 ID 排序、
-长度分隔字段和未知字段跳过为值加框。字段 ID 与 schema ID 是显式的协议决策，不是
-会在重构中悄然变化的哈希。
+`schema-evolution` 特性以稳定 schema ID、schema 版本、规范字段 ID 排序、长度分隔字段
+与未知字段跳过为值加框。字段 ID 与 schema ID 是显式的协议决策，不是重构时会变化的
+哈希。
 
-frame 以 magic `RBE1` 开头，后接格式版本、flags、schema ID、schema 版本、字段数量，
-以及 `(field_id, payload)` 条目。编码器对 ID 排序并拒绝重复；解码器要求 ID 严格
-递增，并在切片前校验全部长度运算。
+frame 以 magic `RBE1`、格式版本、flags、schema ID、schema 版本、字段数与
+`(field_id, payload)` 条目开头。编码器对 ID 排序并拒绝重复；解码器要求严格递增的 ID，
+并在切片前校验全部长度运算。
 
-应用协议规则：
-
-1. 为一个兼容类型族分配唯一的 schema ID。
-2. 永远不要为不同含义或不兼容类型复用字段 ID。
-3. 重命名 Rust 字段时保留字段 ID。
-4. 向后兼容靠新增可选/带默认值字段实现。
-5. 用编码版本驱动有意的语义迁移。
-6. 需要转发或保留时检查未知字段。
-
-完整的 V1/V2 升级与降级示例（含重命名、默认值和借用字段）见
-[schema_evolution.rs](examples/schema_evolution.rs)。
+应用规则：每个兼容类型族一个永久 schema ID；永不把字段 ID 复用于不同含义或不相容的
+类型；重命名 Rust 字段时保留 ID；为向后兼容添加可选或默认字段；用编码版本表达刻意的
+语义迁移；需要转发或保留时检查未知字段。
 
 ## CBOR、压缩与加密
 
-流水线顺序固定且显式：先序列化，再可选压缩，最后加密。Deterministic CBOR 递归
-排序 canonical map key。压缩超过阈值才尝试，且结果没有变小时保留原文。加密把完整
-frame header（算法、nonce、长度）作为 AEAD 关联数据认证，每次使用全新的 192-bit
-nonce，因此加密结果有意不确定。
+pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR 递归排序规范 map 键。压缩
+只在超过大小阈值时运行，且仅当 Zstandard 输出严格更小时才存储。加密把完整 frame 头
+（算法、nonce、长度）作为 AEAD 关联数据认证，每次使用全新 192-bit nonce，因此密文
+刻意不确定。
 
-- CBOR（`cbor`）委托 nextjson 的 RFC 8949 中继。中继在类型化解码前物化 Value 树，
-  因此单容器元素数量受集合上限约束，以限制内存放大。尾随字节始终被拒绝（中继要求
-  恰好一个根值）。
-- 压缩（`compression`）使用 magic `RBZ1`，24 字节 header 记录 raw/stored 长度；
-  解码器拒绝未知 flags、不一致长度、解压长度不匹配、截断和上限违规。
-- 加密（`encryption`）使用 magic `RBX1`。`EncryptionKey` 持有 32 字节密钥，
-  `Debug` 输出脱敏，drop 时清零。密钥派生、轮换、存储和访问控制属于应用/KMS
-  职责。完整示例见 [secure_pipeline.rs](examples/secure_pipeline.rs)。
+- CBOR 委托给 nextjson 的 RFC 8949 中继。中继在类型化解码前物化值树，因此按集合上限
+  强制逐容器元素数，控制内存放大。
+- 压缩使用 magic `RBZ1`、记录 raw 与 stored 长度的 24 字节头；解码器拒绝未知 flags、
+  不一致长度、解压长度不匹配、截断与越限。即使未配置上限，解压始终有界。
+- 加密使用 magic `RBX1`。`EncryptionKey` 拥有 32 字节、`Debug` 脱敏、析构时 zeroize。
+  密钥派生、轮换、存储与访问控制仍是应用/KMS 的职责。
 
 ## 并行批处理
 
-`with_parallel_serialization()` 在 scoped worker 上编码独立 batch 元素，输出有序
-`u64` 长度表和按源顺序排列的 payload 段，因此输出字节与 worker 调度无关。它面向
-大型独立 record；小值可能因 worker 与合并开销而更慢。完整示例见
-[parallel_batch.rs](examples/parallel_batch.rs)。
+`with_parallel_serialization()` 在 scoped 工作线程上编码独立 batch 元素，并输出有序
+`u64` 长度表后跟负载区，因此输出字节与调度无关。它面向大型独立记录；小值可能因线程
+与合并开销而更慢。
 
-## 内存映射归档
+## 带 Merkle 证明的内存映射归档
 
-可选 `archive` feature 是基于 rkyv 经校验相对指针布局的独立存储格式。`build` 生成
-64 字节 RustBinary 包头，后接小端、32 位相对指针归档。包头记录格式版本、格式
-flags、非零应用 schema ID，以及经过检查的 payload/文件长度。rkyv 版本已固定；
-归档布局依赖若发生不兼容升级，必须重新审查并升级 RustBinary 格式版本。
+`archive` 特性是存储格式：rkyv 扁平相对指针布局包在 128 字节 RustBinary 信封里。`build`
+产出信封、小端负载，以及覆盖固定大小负载块的 SHA-256 Merkle 树——哈希来自
+`src/hash.rs` 的零依赖实现。信封记录格式版本、flags、非零应用 schema ID、负载/文件
+长度、块大小与块数、Merkle 根与哈希区位置。
 
-`MappedArchive::open` 先检查文件大小上限（默认 1 GiB），再一次性校验包头、schema、
-对齐及完整相对指针图；之后 `root()` 不分配、不反序列化。打开操作是 `unsafe`：映射
-存活期间，所有进程都必须保证文件不被修改或截断。生产发布应创建新文件并原子切换
-应用引用，绝不能原地更新已映射文件。schema ID 由应用管理，不兼容根布局变更后必须
-更新；它是身份检查，不是密码学认证。完整示例见 [mmap_archive.rs](examples/mmap_archive.rs)。
+两种访问模式：
+
+- `MappedArchive::open` 一次性校验信封、schema、对齐、完整相对指针图，**以及** Merkle
+  根；之后的 `root()` 是零复制的。
+- `MappedArchive::open_header_only` 只校验信封（O(1)），**没有 `root()`**——类型化零
+  复制访问需要完整校验或已验证的证明。`proof_for` 为任意负载字节区间以 O(log n) 构建
+  自包含的 `MerkleProof`，从存储的哈希区读取兄弟哈希。`verify()` 由携带的块与兄弟
+  哈希重算根；`extract()` 返回已验证字节。证明自包含，因此只持有根的轻客户端可以在
+  没有文件其余部分的情况下验证区间。
+
+对固定区间宽度，证明构建与验证都是 O(log n)，这把归档验证从一次性成本变成按访问成本。
+树是补齐到 2 的幂的完全二叉树，使用域分离哈希，因此根是 `(payload, block_size)` 的纯
+函数；默认每块一个 4 KiB 叶子。
+
+打开任何归档都是 `unsafe`：每个进程必须在映射存活期内保持映射文件不可变且不被截断。
+发布新文件并原子切换应用引用；绝不在原地更新映射文件。schema ID 由应用拥有，根布局
+不兼容变更后必须改变；它是身份检查，不是密码学认证。
+
+## 差分帧与 IBLT 集合协调
+
+`reconcile` 特性面向 gossip/共识传输——接收方往往已持有基准状态：
+
+- `DeltaConfig::encode_delta` 把 `value - base` 编码为规范 ZigZag varint。基准带外协商
+  （例如最后提交状态的哈希），永不重复。
+- `DeltaTable` 是确定性 HPACK 式 FIFO 表。`DeltaConfig::encode_updates` 对已见值发表
+  引用，否则发字面量；两侧重放完全相同的插入/逐出规则，因此表状态是更新流的纯函数，
+  永不传输。
+- `Iblt`（可逆布隆查找表）协调**无序集合**：两个对等方编码各自的集合，一方相减，剥离
+  后精确恢复 `mine \ theirs` 与 `theirs \ mine`。自研实现，三个 splitmix64 哈希，
+  `no_std` + `alloc`，无依赖。
+
+过小 IBLT 的解码以 `Error::Iblt` 干净失败，而不是返回错误数据。
+
+## 信任演算
+
+`trust` 特性把配置链提升为认证状态机：
+
+- `TrustedConfig<C, Untrusted>` 可以反序列化，但只能通过显式命名的
+  `deserialize_untrusted`。到认证状态不存在 `From`/`Into` 路径——唯一迁移是
+  `authenticate`，它要求一个 `Verifier`。
+- `TrustedConfig<C, Authenticated>` 是唯一拥有朴素 `deserialize` 名字的配置。
+  `deserialize_verified` 把结果包进 `Verified`，其唯一构造函数是认证路径。
+- `Session<C, Handshake, _>` **没有 `recv` 方法**。只有 `authenticate` 把会话移到认证
+  状态后接收才出现；`close` 把会话移到终态 `Closed`，它不暴露任何东西。"反序列化未
+  认证数据"因此不可表示，而不只是不鼓励。会话对任意 `Codec` 泛型，因此能与链上每个
+  配置组合。
+
+`EncryptedConfig`（XChaCha20-Poly1305）是内置的认证 `Codec`；应用验证器（MAC、签名、
+握手证明）实现 `Verifier`。
 
 ## 流
 
-`serialize_into` 直接写入 `std::io::Write`；`deserialize_from` 从 `std::io::Read`
-读取 owned 值。只有 slice 解码可以返回借用值。压缩与加密的流式读取器在传入
-`&mut R` 时只消费一个声明 frame，后续 frame 保持未读，并在为 body 分配内存之前
-校验 header 长度关系和配置的 raw/plaintext 上限。
+`serialize_into` 直接写 `std::io::Write`；`deserialize_from` 从 `std::io::Read` 读 owned
+值。只有 slice 解码能返回借用值。压缩与加密流 reader 传入 `&mut R` 时消费一个声明帧，
+留下后续帧未读，并在分配正文前校验头长度关系与配置的上限。
 
-## 安全
+## 安全与审计
 
-- 每个值前有一字节类型标签；`0xff` 终结容器。
-- 浮点保留 IEEE 754 位模式；端序是显式的。
-- 可变整数拒绝 marker 255 和非最短编码。
-- 结构体字段编码为命名对象键。
-- 普通 map 保留 nextjson 迭代顺序，不确定；确定性 map 需要 deterministic CBOR
-  或有序 map。
-- 压缩与加密 frame 校验版本、flags、长度和上限。
-- 解密在反序列化之前完成认证。
+安全姿态是：处处有界、该认证的地方认证、对不受保护的部分诚实交代。
+
+- 每个值以一字节类型标签开头；`0xff` 终结容器。
+- 浮点保留 IEEE 754 位模式；端序显式。
+- 变长整数拒绝 marker 255 与非最小编码。
+- 压缩与加密 frame 校验版本、flags、长度与上限；解密先认证后反序列化。
+- 熵帧只有在规范时被接受（无哈希重放）；截断与替换被捕获，除了"损坏帧恰好是另一个
+  负载的合法帧"这一情况——任何非认证方案都无法区分它。
+- 归档携带 Merkle 根；证明与完整打开都做校验。
 - 指纹是兼容性检查，不是密码学认证。
-- 用户自定义的 nextjson 实现可能分配或拒绝借用访问者。
 
-在每个不可信边界：设置现实的字节与集合上限，除非外层协议持有尾随字节否则拒绝之，
-对敌对数据做认证，并把解压/反序列化错误视为输入失败。
+本轮审计发现并修复了四个问题：
 
-两个上限值得单独说明。解压始终有界，即使未配置字节上限：解压后大小先与 frame
-header 交叉校验，使用 `with_no_limit` / legacy profile 时以 crate 全局默认上限封顶，
-恶意 frame 无法无界膨胀。集合上限只约束序列/映射的元素数量；字符串由字节上限约束。
+| 发现 | 严重度 | 修复 |
+| ---- | ------ | ---- |
+| `delta` 变长整数解码器在恶意输入下可能把最后一组移位越过第 127 位（debug 下 panic / release 下回绕） | 高 | 移位前拒绝溢出 `u128` 的组 |
+| 仅信封打开未按树几何校验哈希区长度；畸形文件可能驱动 `read_section_hash` 越界 | 高 | 在信封解析时校验 `hash_len == (leaf_count - 1) * 32` |
+| `build` 与 `validate_archive` 各自重复计算了一次 Merkle 树 | 低 | 只算一次层级，根取自顶层 |
+| `Session` 硬编码 `Config`，而 `TrustedConfig` 对 `Codec` 泛型 | 低（耦合） | `Session<C: Codec, S, R>` 并带显式帧长上限 |
 
-## 错误模型
+在每个不可信边界：设置现实的字节与集合上限、除非外层协议拥有它们否则拒绝尾随字节、
+对对抗数据做认证、把解压/反序列化错误当作输入失败。
 
-所有操作返回 `rustbinary::Result<T>`。`Error` 保留 I/O 错误，并为上限、容量、
-frame、schema、压缩、加密、位打包、自适应数据、worker 失败和畸形基础值提供结构化
-变体。它是 `#[non_exhaustive]`；下游穷尽匹配需要兜底分支。frame 偏移、长度求和、
-delta 重建和整数收窄都使用受检运算，而不是依赖 panic 恢复。
-
-`Error::category()` 提供稳定的运维分类：`UserInput`、`Protocol`、`Configuration`
-或 `InternalBug`。
+两条边界值得单独说明。即使未配置字节上限，解压始终有界：解压大小对照 frame 头校验，
+并在 `with_no_limit` / legacy 模式下封顶于 crate 级默认值。集合上限作用于序列与 map
+元素数；字符串由字节上限约束。
 
 ## 验证
+
+### 机器证明（Kani）
+
+`src/canonical.rs` 是规范小端 varint 与 ZigZag 的单一实现，编解码器共用。
+`src/kani_proofs.rs` 中的 Kani harness 在完整 `u128`/`i128` 域上符号化证明：
+
+- 往返：对所有 `u128` 有 `decode(encode(v)) == v`；ZigZag 双向往返。
+- 有界：编码形式至多 17 字节且使用规范（最小）宽度。
+- 规范唯一：往返加上 `decode` 的确定性蕴含任意两个不同值不会共享同一编码。
+
+```text
+cargo kani -p rustbinary --harness canonical::varint_roundtrip
+cargo kani -p rustbinary --harness canonical::zigzag_roundtrip
+cargo kani -p rustbinary --harness canonical::zigzag_injective
+cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
+```
+
+归档的零依赖 SHA-256 用 NIST FIPS 180-2 向量校验，包括一百万字符 `a` 的摘要。
+
+### 属性测试（proptest）
+
+`tests/entropy_roundtrip.rs` 与 `tests/canonical_proptest.rs` 对公开 API 做随机化：
+字节与均匀符号表往返、逐字节损坏性质（报错，或**不同的**负载——绝不可能是原始负载）、
+截断拒绝、非规范形式拒绝、整数往返。
+
+### 模糊测试（cargo-fuzz）
+
+`fuzz/` crate（独立，非 workspace 成员）向紧凑与 legacy 解码器喂任意字节（不得 panic、
+每个错误都可分类），并对结构化随机记录做往返。
+
+```text
+cargo +nightly fuzz run decode_arbitrary_bytes
+cargo +nightly fuzz run decode_structured_roundtrip
+```
+
+### 基准测试
+
+`rustbinary-bench/` 是独立 crate（非 workspace 成员），在共享数据集（小型头部、遥测帧、
+大批数值、大批字符串）上对比 rustbinary 与 bincode 1、bincode 2、postcard、cbor4ii、
+minicbor，外加独立 rANS 字节 codec 与精确符号表枚举编码。使用预热 + `black_box` 的
+9 次中位数。代表性输出（Windows，release 构建；在 crate 内以 `cargo run --release`
+重新生成）：
+
+| codec | dataset | encode ns | decode ns | bytes |
+|---|---|---:|---:|---:|
+| rustbinary | small | 1375 | 612 | 49 |
+| bincode 1 | small | 88 | 6 | 14 |
+| postcard | small | 119 | 12 | 8 |
+| rustbinary | bulk-strings | 14481 | 62922 | 7955 |
+| bincode 1 | bulk-strings | 2084 | 34356 | 9488 |
+| rustbinary entropy | bulk-strings | 60566 | 151406 | 3570（2.08x）|
+| rustbinary entropy | enum x1000 | 9022 | 20100 | 2.51 bits/symbol |
+
+读这张表要带着格式身份来读：rustbinary 是带类型标签的自描述格式，因此以字节与编码
+开销换取自描述、借用与有界解码。熵行的解码数高于带标签流，因为重放校验在解码时多做
+一次编码；传输层已认证字节时可 `without_replay_verification()` 关掉。数字随机器与
+构建变化；基准 crate 存在就是为了让对比可以被重新生成，而不是被断言。
+
+### 完整验证命令
 
 ```text
 cargo fmt --all -- --check
@@ -410,50 +581,51 @@ cargo test --workspace --all-targets --all-features
 cargo test --workspace --all-features --release
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --all-features --no-deps
-cargo bench --bench codec_comparison
 ```
 
 ### 示例
 
-| 示例                                                      | 覆盖内容                          | 命令                                                                                            |
-| --------------------------------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------- |
-| [complete.rs](examples/complete.rs)                       | 全 feature 端到端组合             | `cargo run --example complete --all-features`                                                   |
-| [core_codec.rs](examples/core_codec.rs)                   | 有界 Core、缓冲区、借用、错误策略 | `cargo run --example core_codec`                                                                |
-| [zero_copy.rs](examples/zero_copy.rs)                     | 嵌套借用和指针范围证明            | `cargo run --example zero_copy`                                                                 |
-| [mmap_archive.rs](examples/mmap_archive.rs)               | 经校验的 mmap 对象图              | `cargo run --example mmap_archive --features archive`                                           |
-| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | 自适应决策与调用方缓冲区          | `cargo run --example adaptive_zero_alloc --features adaptive`                                   |
-| [secure_pipeline.rs](examples/secure_pipeline.rs)         | 确定性 CBOR、压缩、AEAD           | `cargo run --example secure_pipeline --features cbor,compression,encryption`                    |
-| [schema_evolution.rs](examples/schema_evolution.rs)       | Schema V1/V2 双向演进             | `cargo run --example schema_evolution --features schema-evolution`                              |
-| [parallel_batch.rs](examples/parallel_batch.rs)           | 有序多 worker 批处理              | `cargo run --example parallel_batch --features parallel`                                        |
-| [metadata.rs](examples/metadata.rs)                       | 指纹、反射、上界、位打包          | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
+| 示例                                                       | 覆盖内容                               | 命令                                                                                           |
+| ---------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| [complete.rs](examples/complete.rs)                        | 端到端、全特性                         | `cargo run --example complete --all-features`                                                  |
+| [core_codec.rs](examples/core_codec.rs)                    | 有界核心、缓冲区、借用、错误           | `cargo run --example core_codec`                                                               |
+| [zero_copy.rs](examples/zero_copy.rs)                      | 嵌套借用与指针证明                     | `cargo run --example zero_copy`                                                                |
+| [entropy.rs](examples/entropy.rs)                          | schema 驱动 rANS 编码                  | `cargo run --example entropy --features entropy,derive`                                        |
+| [merkle_archive.rs](examples/merkle_archive.rs)            | Merkle 证明、仅信封访问                | `cargo run --example merkle_archive --features archive`                                        |
+| [mmap_archive.rs](examples/mmap_archive.rs)                | 校验的 mmap 对象图                     | `cargo run --example mmap_archive --features archive`                                          |
+| [delta_sync.rs](examples/delta_sync.rs)                    | 差分帧 + IBLT 集合协调                 | `cargo run --example delta_sync --features reconcile`                                          |
+| [trust_session.rs](examples/trust_session.rs)              | 信任演算 + 会话状态机                  | `cargo run --example trust_session --features trust`                                           |
+| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs)  | 自适应决策与调用方缓冲区               | `cargo run --example adaptive_zero_alloc --features adaptive`                                  |
+| [secure_pipeline.rs](examples/secure_pipeline.rs)          | 确定性 CBOR、压缩、AEAD                | `cargo run --example secure_pipeline --features cbor,compression,encryption`                   |
+| [schema_evolution.rs](examples/schema_evolution.rs)        | 双向 schema V1/V2                      | `cargo run --example schema_evolution --features schema-evolution`                             |
+| [parallel_batch.rs](examples/parallel_batch.rs)            | 有序多线程批次                         | `cargo run --example parallel_batch --features parallel`                                       |
+| [metadata.rs](examples/metadata.rs)                        | 指纹、反射、上界、打包                 | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 
 ## docs.rs 与兼容性
 
-包元数据以全部 feature 构建 docs.rs，feature 门控的 API 会获得 docs.rs 自动标签。
-PowerShell 下的严格本地文档校验：
-
-```powershell
-$env:RUSTDOCFLAGS='-D warnings'
-cargo doc --workspace --all-features --no-deps
-```
-
-版本化 wrapper 拒绝未知版本和保留 flags，而不是猜测。1.0 之前，线格式可能在 minor
-release 之间变化，并必须在 release notes 中明确说明。长期部署应固定版本、记录完整
-配置、保留 golden vectors，并使用显式 schema ID。
+包元数据以全特性构建 docs.rs。版本化 wrapper 拒绝未知版本与保留 flags，而不是猜测。
+1.0 之前，线格式可能在 minor 版本之间变化，并必须在发布说明中点名。长期部署应锁定
+版本、记录完整配置、保留 golden vectors、使用显式 schema ID。存在两个独立版本化的
+格式族：流格式（`RBAN` 熵 frame、`RBZ1`/`RBX1` pipeline frame）与归档存储格式
+（`RBARC002`）。一个格式族的变更绝不静默影响另一个。
 
 ## 非目标
 
-- 从序列化内存直接转换任意 Rust 结构体
-- 可变共享内存对象图或对映射文件进行原地更新
-- 把阻塞 I/O 包装成误导性的 async facade
-- 在核心 profile 中自动排序随机化 map
-- 在没有经过测试的内核时宣称 AVX-512/SVE 加速
-- 取代应用密钥管理、授权或 schema 治理
+- 在**流** codec 中直接从序列化内存强转任意 Rust 结构体（archive 特性是独立的、
+  显式校验的存储格式，有自己的信封与 Merkle 根）。
+- 可变共享内存对象图或对映射文件的原地更新。
+- 用误导性的 async 门面包装阻塞 I/O。
+- 在核心模式自动排序随机化 map。
+- 在没有测试内核的情况下宣称 AVX-512/SVE 加速。
+- 替代应用密钥管理、授权或 schema 治理。
+- 用无 schema 紧凑格式替换带标签流格式：格式身份固定，对体积敏感的路径走 entropy、
+  delta 或 archive 层。
+- 宣称 FNV-1a 指纹或无密钥重放检查具备密码学强度；认证完整性属于 AEAD/信任层。
 
 ## 许可证
 
-RustBinary 以 [Apache License, Version 2.0](LICENSE) 授权。你可以在该许可条款下
-使用、复制、修改和再分发本项目。再分发必须保留版权声明、许可文本和必需的署名
-声明；源代码的修改应明确标识，并适用 Apache 许可的专利条款和免责声明。
+RustBinary 以 [Apache License, Version 2.0](LICENSE) 授权。你可以按该许可条款使用、
+复制、修改与再分发本项目。再分发必须保留版权声明、许可文本与要求的署名声明。源码
+变更应被清晰标识，Apache License 专利条款与免责声明同样适用。
 
-完整法律文本见 [`LICENSE`](LICENSE)。本项目不附带任何形式的保证或条件。
+完整法律文本见 [`LICENSE`](LICENSE)。本项目不附带任何形式的担保或条件。
