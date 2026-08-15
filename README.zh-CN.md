@@ -8,37 +8,37 @@ RustBinary 是一个基于 [nextjson](https://crates.io/crates/nextjson) 的有�
 
 公开 API 分为三层，外加一个可选的归档产品面：
 
-| 层           | 模块                   | 默认启用 | 职责                                                                 |
-| ------------ | ---------------------- | -------- | -------------------------------------------------------------------- |
-| **Core**     | `rustbinary::core`     | 是       | Compact V1 编解码、资源上限、尾随策略、调用方缓冲区、`no_std`        |
-| **Protocol** | `rustbinary::protocol` | 否       | Schema 演进、指纹、反射、静态上界、位打包                            |
-| **Pipeline** | `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理                                     |
-| **Archive**  | `rustbinary::archive`  | 否       | 经校验的只读内存映射对象存储                                         |
+| 层           | 模块                   | 默认启用 | 职责                                                          |
+| ------------ | ---------------------- | -------- | ------------------------------------------------------------- |
+| **Core**     | `rustbinary::core`     | 是       | Compact V1 编解码、资源上限、尾随策略、调用方缓冲区、`no_std` |
+| **Protocol** | `rustbinary::protocol` | 否       | Schema 演进、指纹、反射、静态上界、位打包                     |
+| **Pipeline** | `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理                              |
+| **Archive**  | `rustbinary::archive`  | 否       | 经校验的只读内存映射对象存储                                  |
 
 [English](README.md)
 
 ## 特性
 
-| 能力                        | 状态                   | 说明                                                              |
-| --------------------------- | ---------------------- | ----------------------------------------------------------------- |
-| nextjson 二进制编解码       | 已实现                 | 严格 marker-varint 模式与固定宽度 legacy 模式                     |
-| 整数/字符串自适应编码       | 已实现                 | 按值选宽度、ZigZag 有符号数、ASCII7 打包                          |
-| `i64` 集合自适应编码        | 已实现                 | raw / delta / run-length 三种 frame                               |
-| SIMD                        | 仅热路径               | 运行时 AVX2/SSE2/NEON，标量回退；AVX-512/SVE/SME 只探测不使用     |
-| 零分配编解码路径            | 已实现                 | 精确长度输出与调用方缓冲区                                        |
-| 借用式零复制反序列化        | 已实现                 | 嵌套 `&str` 字段直接指向输入 frame                                |
-| 位打包                      | 已实现                 | `BitPacked` derive、宽度检查、规范零 padding                      |
-| Schema 指纹                 | 已实现                 | 结构哈希，包含编解码配置                                          |
-| 编译期内存上界              | 已实现                 | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`        |
-| RFC 8949 CBOR               | 已实现                 | nextjson CBOR 中继；可选 canonical map 排序                       |
-| Schema 演进                 | 已实现                 | 稳定字段 ID、版本、默认值、跳过未知字段                           |
-| 压缩                        | 已实现                 | 自适应 Zstandard；压缩后更大则保留原文                            |
-| 加密                        | 已实现                 | XChaCha20-Poly1305、随机 192-bit nonce、认证 header               |
-| 并行序列化                  | 已实现                 | 有序 batch frame，输出与调度无关                                  |
-| 运行时反射                  | 已实现                 | 编译期生成、无分配的静态元数据（`Reflect`）                       |
-| `std::io` 流                | 已实现                 | reader/writer 适配器保留配置的资源上限                            |
-| `no_std`                    | 已实现                 | Compact V1 slice 编解码与调用方缓冲区无需默认 feature             |
-| `no_std + alloc`            | 已实现                 | owned 值、指纹、演进、自适应 codec                                |
+| 能力                  | 状态     | 说明                                                          |
+| --------------------- | -------- | ------------------------------------------------------------- |
+| nextjson 二进制编解码 | 已实现   | 严格 marker-varint 模式与固定宽度 legacy 模式                 |
+| 整数/字符串自适应编码 | 已实现   | 按值选宽度、ZigZag 有符号数、ASCII7 打包                      |
+| `i64` 集合自适应编码  | 已实现   | raw / delta / run-length 三种 frame                           |
+| SIMD                  | 仅热路径 | 运行时 AVX2/SSE2/NEON，标量回退；AVX-512/SVE/SME 只探测不使用 |
+| 零分配编解码路径      | 已实现   | 精确长度输出与调用方缓冲区                                    |
+| 借用式零复制反序列化  | 已实现   | 嵌套 `&str` 字段直接指向输入 frame                            |
+| 位打包                | 已实现   | `BitPacked` derive、宽度检查、规范零 padding                  |
+| Schema 指纹           | 已实现   | 结构哈希，包含编解码配置                                      |
+| 编译期内存上界        | 已实现   | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`    |
+| RFC 8949 CBOR         | 已实现   | nextjson CBOR 中继；可选 canonical map 排序                   |
+| Schema 演进           | 已实现   | 稳定字段 ID、版本、默认值、跳过未知字段                       |
+| 压缩                  | 已实现   | 自适应 Zstandard；压缩后更大则保留原文                        |
+| 加密                  | 已实现   | XChaCha20-Poly1305、随机 192-bit nonce、认证 header           |
+| 并行序列化            | 已实现   | 有序 batch frame，输出与调度无关                              |
+| 运行时反射            | 已实现   | 编译期生成、无分配的静态元数据（`Reflect`）                   |
+| `std::io` 流          | 已实现   | reader/writer 适配器保留配置的资源上限                        |
+| `no_std`              | 已实现   | Compact V1 slice 编解码与调用方缓冲区无需默认 feature         |
+| `no_std + alloc`      | 已实现   | owned 值、指纹、演进、自适应 codec                            |
 
 ## 安装
 
@@ -58,30 +58,29 @@ rustbinary = { version = "0.1", features = ["fingerprint", "derive"] }
 rustbinary = { version = "0.1", features = ["archive"] }    # 仅 mmap 归档
 ```
 
-最低 Rust 版本为 1.87（已声明为 `Cargo.toml` 中的 `rust-version`）。可选的
-Zstandard 依赖需要构建平台具备 C 工具链。
+可选的 Zstandard 依赖需要构建平台具备 C 工具链。
 
 ### Feature 矩阵
 
-| Feature            | 默认启用 | 用途                                                                  |
-| ------------------ | -------- | --------------------------------------------------------------------- |
-| `std`              | 是       | owned Core 与 I/O API；Pipeline 与 SIMD 以它为前提                    |
-| `alloc`            | 随 std   | 兼容性标记；owned API 始终可用（nextjson 的 `FormatDecoder` 需要 alloc） |
+| Feature            | 默认启用 | 用途                                                                                        |
+| ------------------ | -------- | ------------------------------------------------------------------------------------------- |
+| `std`              | 是       | owned Core 与 I/O API；Pipeline 与 SIMD 以它为前提                                          |
+| `alloc`            | 随 std   | 兼容性标记；owned API 始终可用（nextjson 的 `FormatDecoder` 需要 alloc）                    |
 | `protocol`         | 否       | 聚合：adaptive、bit-packing、derive、fingerprint、reflection、schema-evolution、static-size |
-| `pipeline`         | 否       | 聚合：cbor、compression、encryption、parallel                         |
-| `archive`          | 否       | 经校验的只读 mmap 归档；依赖 `std`、rkyv、memmap2                     |
-| `derive`           | 否       | 与对应 runtime feature 一起导出过程宏                                 |
-| `fingerprint`      | 否       | 结构指纹 runtime 与 frame                                             |
-| `reflection`       | 否       | 零分配反射 runtime                                                    |
-| `static-size`      | 否       | 编译期上界 runtime                                                    |
-| `simd`             | 否       | 运行时能力探测与热扫描分派，不改变线格式                              |
-| `bit-packing`      | 否       | 位级 trait 与调用方缓冲区 codec                                       |
-| `adaptive`         | 否       | 调用方缓冲区自适应字符串/集合；隐含 `bit-packing`                     |
-| `cbor`             | 否       | 基于 nextjson 中继的 RFC 8949 CBOR                                    |
-| `compression`      | 否       | 自适应 Zstandard frame                                                |
-| `encryption`       | 否       | XChaCha20-Poly1305、系统随机数、密钥清零                              |
-| `parallel`         | 否       | scoped thread 有序批处理                                              |
-| `schema-evolution` | 否       | 稳定字段 ID 版本化 frame                                              |
+| `pipeline`         | 否       | 聚合：cbor、compression、encryption、parallel                                               |
+| `archive`          | 否       | 经校验的只读 mmap 归档；依赖 `std`、rkyv、memmap2                                           |
+| `derive`           | 否       | 与对应 runtime feature 一起导出过程宏                                                       |
+| `fingerprint`      | 否       | 结构指纹 runtime 与 frame                                                                   |
+| `reflection`       | 否       | 零分配反射 runtime                                                                          |
+| `static-size`      | 否       | 编译期上界 runtime                                                                          |
+| `simd`             | 否       | 运行时能力探测与热扫描分派，不改变线格式                                                    |
+| `bit-packing`      | 否       | 位级 trait 与调用方缓冲区 codec                                                             |
+| `adaptive`         | 否       | 调用方缓冲区自适应字符串/集合；隐含 `bit-packing`                                           |
+| `cbor`             | 否       | 基于 nextjson 中继的 RFC 8949 CBOR                                                          |
+| `compression`      | 否       | 自适应 Zstandard frame                                                                      |
+| `encryption`       | 否       | XChaCha20-Poly1305、系统随机数、密钥清零                                                    |
+| `parallel`         | 否       | scoped thread 有序批处理                                                                    |
+| `schema-evolution` | 否       | 稳定字段 ID 版本化 frame                                                                    |
 
 ## 快速开始
 
@@ -144,29 +143,29 @@ assert_eq!(secure.deserialize::<Vec<u32>>(&frame)?, value);
 格式编码的是值，不是 Rust 对象内存：不写 padding、原生指针、vtable 或
 `repr(Rust)` 布局。每个值前有一字节类型标签；数组和对象以 `0xff` 终结。
 
-| nextjson 值            | 线表示                                                 |
-| ---------------------- | ------------------------------------------------------ |
-| `null` / unit / `None` | 标签 `0x00`                                            |
-| `false` / `true`       | 标签 `0x01` / `0x02`                                   |
-| `u64` / `u128`         | 标签 `0x03` / `0x04` + 无符号 payload                  |
-| `i64` / `i128`         | 标签 `0x05` / `0x06` + ZigZag payload                  |
-| `f64` / `f32`          | 标签 `0x07` / `0x08` + 按配置端序的 IEEE 754 位模式    |
-| 字符串 / char          | 标签 `0x09` + 编码字节长度 + UTF-8                     |
-| 数组                   | 标签 `0x0a` + 元素 + `0xff`                            |
-| 对象                   | 标签 `0x0b` + (`字符串键` + 值) 对 + `0xff`            |
+| nextjson 值            | 线表示                                              |
+| ---------------------- | --------------------------------------------------- |
+| `null` / unit / `None` | 标签 `0x00`                                         |
+| `false` / `true`       | 标签 `0x01` / `0x02`                                |
+| `u64` / `u128`         | 标签 `0x03` / `0x04` + 无符号 payload               |
+| `i64` / `i128`         | 标签 `0x05` / `0x06` + ZigZag payload               |
+| `f64` / `f32`          | 标签 `0x07` / `0x08` + 按配置端序的 IEEE 754 位模式 |
+| 字符串 / char          | 标签 `0x09` + 编码字节长度 + UTF-8                  |
+| 数组                   | 标签 `0x0a` + 元素 + `0xff`                         |
+| 对象                   | 标签 `0x0b` + (`字符串键` + 值) 对 + `0xff`         |
 
 整数与长度 payload 使用 marker-varint（legacy 模式下为定宽 `u64`，因为 nextjson
 的统一数据模型把所有整数按 `u64`/`i64` 宽度跨线传输）。Marker varint 必须使用最短
 规范形式：
 
-| Marker    | Payload   | 最小合法值                 |
-| --------- | --------- | -------------------------- |
-| `0..=250` | 无        | 0                          |
-| `251`     | 2 字节    | 251                        |
-| `252`     | 4 字节    | 65,536                     |
-| `253`     | 8 字节    | 4,294,967,296              |
-| `254`     | 16 字节   | 18,446,744,073,709,551,616 |
-| `255`     | 保留      | 永不接受                   |
+| Marker    | Payload | 最小合法值                 |
+| --------- | ------- | -------------------------- |
+| `0..=250` | 无      | 0                          |
+| `251`     | 2 字节  | 251                        |
+| `252`     | 4 字节  | 65,536                     |
+| `253`     | 8 字节  | 4,294,967,296              |
+| `254`     | 16 字节 | 18,446,744,073,709,551,616 |
+| `255`     | 保留    | 永不接受                   |
 
 解码器拒绝非最短形式、窄化溢出、非法 UTF-8、非法标签、截断、上限违规和不允许的
 尾随字节。
@@ -416,17 +415,17 @@ cargo bench --bench codec_comparison
 
 ### 示例
 
-| 示例                                                      | 覆盖内容                                        | 命令                                                                                             |
-| --------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| [complete.rs](examples/complete.rs)                       | 全 feature 端到端组合                           | `cargo run --example complete --all-features`                                                    |
-| [core_codec.rs](examples/core_codec.rs)                   | 有界 Core、缓冲区、借用、错误策略               | `cargo run --example core_codec`                                                                 |
-| [zero_copy.rs](examples/zero_copy.rs)                     | 嵌套借用和指针范围证明                          | `cargo run --example zero_copy`                                                                  |
-| [mmap_archive.rs](examples/mmap_archive.rs)               | 经校验的 mmap 对象图                            | `cargo run --example mmap_archive --features archive`                                            |
-| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | 自适应决策与调用方缓冲区                        | `cargo run --example adaptive_zero_alloc --features adaptive`                                    |
-| [secure_pipeline.rs](examples/secure_pipeline.rs)         | 确定性 CBOR、压缩、AEAD                         | `cargo run --example secure_pipeline --features cbor,compression,encryption`                     |
-| [schema_evolution.rs](examples/schema_evolution.rs)       | Schema V1/V2 双向演进                           | `cargo run --example schema_evolution --features schema-evolution`                               |
-| [parallel_batch.rs](examples/parallel_batch.rs)           | 有序多 worker 批处理                            | `cargo run --example parallel_batch --features parallel`                                         |
-| [metadata.rs](examples/metadata.rs)                       | 指纹、反射、上界、位打包                        | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size`  |
+| 示例                                                      | 覆盖内容                          | 命令                                                                                            |
+| --------------------------------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [complete.rs](examples/complete.rs)                       | 全 feature 端到端组合             | `cargo run --example complete --all-features`                                                   |
+| [core_codec.rs](examples/core_codec.rs)                   | 有界 Core、缓冲区、借用、错误策略 | `cargo run --example core_codec`                                                                |
+| [zero_copy.rs](examples/zero_copy.rs)                     | 嵌套借用和指针范围证明            | `cargo run --example zero_copy`                                                                 |
+| [mmap_archive.rs](examples/mmap_archive.rs)               | 经校验的 mmap 对象图              | `cargo run --example mmap_archive --features archive`                                           |
+| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | 自适应决策与调用方缓冲区          | `cargo run --example adaptive_zero_alloc --features adaptive`                                   |
+| [secure_pipeline.rs](examples/secure_pipeline.rs)         | 确定性 CBOR、压缩、AEAD           | `cargo run --example secure_pipeline --features cbor,compression,encryption`                    |
+| [schema_evolution.rs](examples/schema_evolution.rs)       | Schema V1/V2 双向演进             | `cargo run --example schema_evolution --features schema-evolution`                              |
+| [parallel_batch.rs](examples/parallel_batch.rs)           | 有序多 worker 批处理              | `cargo run --example parallel_batch --features parallel`                                        |
+| [metadata.rs](examples/metadata.rs)                       | 指纹、反射、上界、位打包          | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 
 ## docs.rs 与兼容性
 

@@ -10,37 +10,37 @@ unambiguously.
 
 The public API is split into three layers plus an optional archive surface:
 
-| Layer        | Module                | Default | Scope                                                          |
-| ------------ | --------------------- | ------- | -------------------------------------------------------------- |
-| **Core**     | `rustbinary::core`    | yes     | Compact V1 encode/decode, limits, trailing policy, caller buffers, `no_std` |
-| **Protocol** | `rustbinary::protocol`| no      | schema evolution, fingerprints, reflection, static bounds, bit packing |
-| **Pipeline** | `rustbinary::pipeline`| no      | CBOR, compression, encryption, ordered parallel batches        |
-| **Archive**  | `rustbinary::archive` | no      | validated read-only memory-mapped object stores                |
+| Layer        | Module                 | Default | Scope                                                                       |
+| ------------ | ---------------------- | ------- | --------------------------------------------------------------------------- |
+| **Core**     | `rustbinary::core`     | yes     | Compact V1 encode/decode, limits, trailing policy, caller buffers, `no_std` |
+| **Protocol** | `rustbinary::protocol` | no      | schema evolution, fingerprints, reflection, static bounds, bit packing      |
+| **Pipeline** | `rustbinary::pipeline` | no      | CBOR, compression, encryption, ordered parallel batches                     |
+| **Archive**  | `rustbinary::archive`  | no      | validated read-only memory-mapped object stores                             |
 
 [中文文档](README.zh-CN.md)
 
 ## Features
 
-| Capability                      | Status                    | Notes                                                    |
-| ------------------------------- | ------------------------- | -------------------------------------------------------- |
-| nextjson binary codec           | Implemented               | strict marker-varint profile and a fixed-width legacy profile |
-| Adaptive integers/strings       | Implemented               | per-value width selection, ZigZag signed values, ASCII7 packing |
-| Adaptive `i64` collections      | Implemented               | raw / delta / run-length frames                          |
-| SIMD                            | Hot scans only            | runtime AVX2/SSE2/NEON with scalar fallback; AVX-512/SVE/SME are detected but unused |
-| Zero-allocation codec paths     | Implemented               | exact-size output and caller-owned buffers               |
-| Borrowed zero-copy decoding     | Implemented               | nested `&str` fields point into the input frame          |
-| Bit packing                     | Implemented               | `BitPacked` derive, checked widths, canonical zero padding |
-| Schema fingerprinting           | Implemented               | structural hash including codec configuration            |
-| Compile-time bounds             | Implemented               | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}` |
-| RFC 8949 CBOR                   | Implemented               | nextjson CBOR relay; optional canonical map ordering     |
-| Schema evolution                | Implemented               | stable field IDs, versions, defaults, unknown-field skipping |
-| Compression                     | Implemented               | adaptive Zstandard; raw data is kept when it is smaller  |
-| Encryption                      | Implemented               | XChaCha20-Poly1305, random 192-bit nonce, authenticated header |
-| Parallel serialization          | Implemented               | ordered batch frames, scheduling-independent output      |
-| Runtime reflection              | Implemented               | allocation-free compile-time metadata (`Reflect`)        |
-| `std::io` streams               | Implemented               | reader/writer adapters keep the configured limits        |
-| `no_std`                        | Implemented               | Compact V1 slice codec and caller buffers need no default features |
-| `no_std + alloc`                | Implemented               | owned values, fingerprints, evolution, adaptive codecs   |
+| Capability                  | Status         | Notes                                                                                |
+| --------------------------- | -------------- | ------------------------------------------------------------------------------------ |
+| nextjson binary codec       | Implemented    | strict marker-varint profile and a fixed-width legacy profile                        |
+| Adaptive integers/strings   | Implemented    | per-value width selection, ZigZag signed values, ASCII7 packing                      |
+| Adaptive `i64` collections  | Implemented    | raw / delta / run-length frames                                                      |
+| SIMD                        | Hot scans only | runtime AVX2/SSE2/NEON with scalar fallback; AVX-512/SVE/SME are detected but unused |
+| Zero-allocation codec paths | Implemented    | exact-size output and caller-owned buffers                                           |
+| Borrowed zero-copy decoding | Implemented    | nested `&str` fields point into the input frame                                      |
+| Bit packing                 | Implemented    | `BitPacked` derive, checked widths, canonical zero padding                           |
+| Schema fingerprinting       | Implemented    | structural hash including codec configuration                                        |
+| Compile-time bounds         | Implemented    | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                           |
+| RFC 8949 CBOR               | Implemented    | nextjson CBOR relay; optional canonical map ordering                                 |
+| Schema evolution            | Implemented    | stable field IDs, versions, defaults, unknown-field skipping                         |
+| Compression                 | Implemented    | adaptive Zstandard; raw data is kept when it is smaller                              |
+| Encryption                  | Implemented    | XChaCha20-Poly1305, random 192-bit nonce, authenticated header                       |
+| Parallel serialization      | Implemented    | ordered batch frames, scheduling-independent output                                  |
+| Runtime reflection          | Implemented    | allocation-free compile-time metadata (`Reflect`)                                    |
+| `std::io` streams           | Implemented    | reader/writer adapters keep the configured limits                                    |
+| `no_std`                    | Implemented    | Compact V1 slice codec and caller buffers need no default features                   |
+| `no_std + alloc`            | Implemented    | owned values, fingerprints, evolution, adaptive codecs                               |
 
 ## Installation
 
@@ -60,31 +60,30 @@ rustbinary = { version = "0.1", features = ["fingerprint", "derive"] }
 rustbinary = { version = "0.1", features = ["archive"] }    # mmap archives only
 ```
 
-The minimum supported Rust version is 1.87 (declared as `rust-version` in
-`Cargo.toml`). The optional Zstandard dependency needs a C toolchain on the
+The optional Zstandard dependency needs a C toolchain on the
 build platform.
 
 ### Feature matrix
 
-| Feature            | Default | Purpose                                                            |
-| ------------------ | ------- | ------------------------------------------------------------------ |
-| `std`              | yes     | owned Core and I/O APIs; required by Pipeline and SIMD             |
-| `alloc`            | via std | compatibility marker; owned APIs always available (nextjson's `FormatDecoder` needs `alloc`) |
+| Feature            | Default | Purpose                                                                                                   |
+| ------------------ | ------- | --------------------------------------------------------------------------------------------------------- |
+| `std`              | yes     | owned Core and I/O APIs; required by Pipeline and SIMD                                                    |
+| `alloc`            | via std | compatibility marker; owned APIs always available (nextjson's `FormatDecoder` needs `alloc`)              |
 | `protocol`         | no      | convenience bundle: adaptive, bit-packing, derive, fingerprint, reflection, schema-evolution, static-size |
-| `pipeline`         | no      | convenience bundle: cbor, compression, encryption, parallel       |
-| `archive`          | no      | validated read-only mmap archives; requires `std`, rkyv, memmap2   |
-| `derive`           | no      | re-exports the procedural macros with their runtime feature        |
-| `fingerprint`      | no      | structural fingerprint runtime and frames                          |
-| `reflection`       | no      | allocation-free reflection runtime                                 |
-| `static-size`      | no      | compile-time bounds runtime                                        |
-| `simd`             | no      | runtime detection and hot-scan dispatch; never changes the wire bytes |
-| `bit-packing`      | no      | bit-level traits and caller-buffer codec                           |
-| `adaptive`         | no      | caller-buffer adaptive strings/collections; implies `bit-packing`  |
-| `cbor`             | no      | RFC 8949 CBOR through nextjson's relay                             |
-| `compression`      | no      | adaptive Zstandard frame                                           |
-| `encryption`       | no      | XChaCha20-Poly1305, OS randomness, zeroized keys                   |
-| `parallel`         | no      | scoped-thread ordered batch frames                                 |
-| `schema-evolution` | no      | stable-field-ID versioned frames                                   |
+| `pipeline`         | no      | convenience bundle: cbor, compression, encryption, parallel                                               |
+| `archive`          | no      | validated read-only mmap archives; requires `std`, rkyv, memmap2                                          |
+| `derive`           | no      | re-exports the procedural macros with their runtime feature                                               |
+| `fingerprint`      | no      | structural fingerprint runtime and frames                                                                 |
+| `reflection`       | no      | allocation-free reflection runtime                                                                        |
+| `static-size`      | no      | compile-time bounds runtime                                                                               |
+| `simd`             | no      | runtime detection and hot-scan dispatch; never changes the wire bytes                                     |
+| `bit-packing`      | no      | bit-level traits and caller-buffer codec                                                                  |
+| `adaptive`         | no      | caller-buffer adaptive strings/collections; implies `bit-packing`                                         |
+| `cbor`             | no      | RFC 8949 CBOR through nextjson's relay                                                                    |
+| `compression`      | no      | adaptive Zstandard frame                                                                                  |
+| `encryption`       | no      | XChaCha20-Poly1305, OS randomness, zeroized keys                                                          |
+| `parallel`         | no      | scoped-thread ordered batch frames                                                                        |
+| `schema-evolution` | no      | stable-field-ID versioned frames                                                                          |
 
 ## Quick start
 
@@ -153,29 +152,29 @@ The format encodes values, never Rust object memory: no padding, native
 pointers, vtables, or `repr(Rust)` layout. Every value starts with a one-byte
 type tag; arrays and objects are terminated with `0xff`.
 
-| nextjson value         | Wire representation                                   |
-| ---------------------- | ----------------------------------------------------- |
-| `null` / unit / `None` | tag `0x00`                                            |
-| `false` / `true`       | tags `0x01` / `0x02`                                  |
-| `u64` / `u128`         | tags `0x03` / `0x04` + unsigned payload               |
-| `i64` / `i128`         | tags `0x05` / `0x06` + ZigZag payload                 |
+| nextjson value         | Wire representation                                       |
+| ---------------------- | --------------------------------------------------------- |
+| `null` / unit / `None` | tag `0x00`                                                |
+| `false` / `true`       | tags `0x01` / `0x02`                                      |
+| `u64` / `u128`         | tags `0x03` / `0x04` + unsigned payload                   |
+| `i64` / `i128`         | tags `0x05` / `0x06` + ZigZag payload                     |
 | `f64` / `f32`          | tags `0x07` / `0x08` + IEEE 754 bits in configured endian |
-| string / char          | tag `0x09` + encoded byte length + UTF-8              |
-| array                  | tag `0x0a` + elements + `0xff`                        |
-| object                 | tag `0x0b` + (`string key` + value) pairs + `0xff`    |
+| string / char          | tag `0x09` + encoded byte length + UTF-8                  |
+| array                  | tag `0x0a` + elements + `0xff`                            |
+| object                 | tag `0x0b` + (`string key` + value) pairs + `0xff`        |
 
 Integer and length payloads use marker varints (or fixed `u64` width in the
 legacy profile, because nextjson's unified data model crosses all integers at
 `u64`/`i64` width). Marker varints are canonical:
 
-| Marker    | Payload   | Minimum accepted value     |
-| --------- | --------- | -------------------------- |
-| `0..=250` | none      | 0                          |
-| `251`     | 2 bytes   | 251                        |
-| `252`     | 4 bytes   | 65,536                     |
-| `253`     | 8 bytes   | 4,294,967,296              |
-| `254`     | 16 bytes  | 18,446,744,073,709,551,616 |
-| `255`     | reserved  | never accepted             |
+| Marker    | Payload  | Minimum accepted value     |
+| --------- | -------- | -------------------------- |
+| `0..=250` | none     | 0                          |
+| `251`     | 2 bytes  | 251                        |
+| `252`     | 4 bytes  | 65,536                     |
+| `253`     | 8 bytes  | 4,294,967,296              |
+| `254`     | 16 bytes | 18,446,744,073,709,551,616 |
+| `255`     | reserved | never accepted             |
 
 The decoder rejects non-minimal forms, narrowing overflow, malformed UTF-8,
 invalid tags, truncation, limit violations, and disallowed trailing bytes.
@@ -467,17 +466,17 @@ cargo bench --bench codec_comparison
 
 ### Examples
 
-| Example                                                     | Covers                                     | Command                                                              |
-| ----------------------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
-| [complete.rs](examples/complete.rs)                         | end-to-end, all features                   | `cargo run --example complete --all-features`                        |
-| [core_codec.rs](examples/core_codec.rs)                     | bounded core, buffers, borrowing, errors   | `cargo run --example core_codec`                                     |
-| [zero_copy.rs](examples/zero_copy.rs)                       | nested borrowing and pointer proof         | `cargo run --example zero_copy`                                      |
-| [mmap_archive.rs](examples/mmap_archive.rs)                 | validated mmap object graph                | `cargo run --example mmap_archive --features archive`                |
-| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs)   | adaptive decisions and caller buffers      | `cargo run --example adaptive_zero_alloc --features adaptive`        |
-| [secure_pipeline.rs](examples/secure_pipeline.rs)           | deterministic CBOR, compression, AEAD      | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
-| [schema_evolution.rs](examples/schema_evolution.rs)         | bidirectional schema V1/V2                 | `cargo run --example schema_evolution --features schema-evolution`   |
-| [parallel_batch.rs](examples/parallel_batch.rs)             | ordered multi-worker batches               | `cargo run --example parallel_batch --features parallel`             |
-| [metadata.rs](examples/metadata.rs)                         | fingerprint, reflection, bounds, packing   | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
+| Example                                                   | Covers                                   | Command                                                                                         |
+| --------------------------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [complete.rs](examples/complete.rs)                       | end-to-end, all features                 | `cargo run --example complete --all-features`                                                   |
+| [core_codec.rs](examples/core_codec.rs)                   | bounded core, buffers, borrowing, errors | `cargo run --example core_codec`                                                                |
+| [zero_copy.rs](examples/zero_copy.rs)                     | nested borrowing and pointer proof       | `cargo run --example zero_copy`                                                                 |
+| [mmap_archive.rs](examples/mmap_archive.rs)               | validated mmap object graph              | `cargo run --example mmap_archive --features archive`                                           |
+| [adaptive_zero_alloc.rs](examples/adaptive_zero_alloc.rs) | adaptive decisions and caller buffers    | `cargo run --example adaptive_zero_alloc --features adaptive`                                   |
+| [secure_pipeline.rs](examples/secure_pipeline.rs)         | deterministic CBOR, compression, AEAD    | `cargo run --example secure_pipeline --features cbor,compression,encryption`                    |
+| [schema_evolution.rs](examples/schema_evolution.rs)       | bidirectional schema V1/V2               | `cargo run --example schema_evolution --features schema-evolution`                              |
+| [parallel_batch.rs](examples/parallel_batch.rs)           | ordered multi-worker batches             | `cargo run --example parallel_batch --features parallel`                                        |
+| [metadata.rs](examples/metadata.rs)                       | fingerprint, reflection, bounds, packing | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 
 ## docs.rs and compatibility
 
