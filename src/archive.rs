@@ -39,7 +39,7 @@ use rkyv::{
     Portable,
 };
 
-use crate::hash::sha256;
+use crate::hash::blake3;
 use crate::ErrorCategory;
 
 /// Re-exported derives and traits used to define archive-native types.
@@ -291,13 +291,13 @@ impl From<io::Error> for ArchiveError {
 /// Merkle leaf hash over one payload block.
 ///
 /// The input is the domain tag, the 64-bit big-endian leaf index, and the
-/// block bytes, hashed with the dependency-free SHA-256 from `hash`.
+/// block bytes, hashed with the dependency-free BLAKE3 from `hash`.
 fn leaf_hash(index: u64, block: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(9 + block.len());
     input.push(LEAF_DOMAIN);
     input.extend_from_slice(&index.to_be_bytes());
     input.extend_from_slice(block);
-    sha256(&input)
+    blake3(&input)
 }
 
 /// Hash of an absent (padding) leaf at `index`.
@@ -305,7 +305,7 @@ fn pad_hash(index: u64) -> [u8; 32] {
     let mut input = [0_u8; 9];
     input[0] = PAD_DOMAIN;
     input[1..9].copy_from_slice(&index.to_be_bytes());
-    sha256(&input)
+    blake3(&input)
 }
 
 /// Merkle internal node hash.
@@ -314,7 +314,7 @@ fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     input[0] = NODE_DOMAIN;
     input[1..33].copy_from_slice(left);
     input[33..65].copy_from_slice(right);
-    sha256(&input)
+    blake3(&input)
 }
 
 /// Computes the tree height (levels above the leaves) for `block_count`

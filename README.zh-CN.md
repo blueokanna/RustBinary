@@ -35,9 +35,10 @@ chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
 **刻意没有任何第三方哈希依赖**：
 
 - 熵层完全不使用哈希来校验帧——见熵编码一节。
-- 归档的 Merkle 树是唯一结构性无法避免哈希的地方（Merkle 树由哈希函数定义），
-  因此 `src/hash.rs` 内含一份紧凑、零依赖的 SHA-256，用 NIST FIPS 180-2 测试向量
-  （含一百万字符 `a` 的向量）验证。
+- 归档的 Merkle 树是唯一结构性无法避免哈希的地方（Merkle 树由哈希函数定义）。
+  为守住“零第三方哈希”约束，`src/hash.rs` 用约 150 行实现 BLAKE3，并以官方
+  BLAKE3 测试向量校验。请把它当作内部实现细节而非卖点：模块文档说明了审计局限
+  （测试向量不是实现级审查），换成审计过的 crate 也不改动任何调用点。
 
 ## 分层
 
@@ -65,7 +66,7 @@ chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
 | 位打包                  | 已实现     | `BitPacked` derive、宽度检查、规范零 padding                                |
 | Schema 指纹             | 已实现     | 结构哈希，包含编解码配置（FNV-1a，**非**密码学）                             |
 | 编译期内存上界          | 已实现     | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                  |
-| RFC 8949 CBOR           | 已实现     | nextjson CBOR 中继；可选 canonical map 排序                                 |
+| RFC 8949 CBOR           | 已实现     | 自研流式 CBOR 编解码（无值树）；可选 canonical map 排序                     |
 | Schema 演进             | 已实现     | 稳定字段 ID、版本、默认值、跳过未知字段                                     |
 | 压缩                    | 已实现     | 自适应 Zstandard；压缩后更大则保留原文                                      |
 | 加密                    | 已实现     | XChaCha20-Poly1305、随机 192-bit nonce、认证 header                         |
@@ -74,7 +75,7 @@ chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
 | 差分帧                  | 已实现     | 基准相对整数差分 + 确定性 HPACK 式动态表                                    |
 | IBLT 集合协调           | 已实现     | 自研可逆布隆查找表（Goodrich 与 Mitzenmacher）                              |
 | 信任演算                | 已实现     | 类型级认证状态机；未认证接收在类型层面不可表达                              |
-| Merkle 归档             | 已实现     | 零依赖 SHA-256 树，O(log n) 证明，仅信封打开                                |
+| Merkle 归档             | 已实现     | 零依赖 BLAKE3 树，O(log n) 证明，仅信封打开                                |
 | 形式化验证              | Kani 证明  | varint/ZigZag 核心的往返、有界、规范唯一性                                   |
 | `no_std`                | 已实现     | Compact slice 编解码与调用方缓冲区无需默认 feature                          |
 | `no_std + alloc`        | 已实现     | owned 值、指纹、演进、自适应、熵、集合协调                                  |
@@ -95,7 +96,7 @@ rustbinary = { version = "0.1", features = ["sync"] }       # 熵 + 集合协调
 rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap 归档
 ```
 
-Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵编码器与归档的 SHA-256
+Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵编码器与归档的 BLAKE3
 零依赖。
 
 ### 特性矩阵
@@ -289,12 +290,15 @@ rANS 流不是自认证的。最终状态检查能拒绝截断和大部分替换
 最终状态逐字节一致。只有当帧是"它解码出的负载的规范编码"时才被接受——即
 `frame == encode(decode(frame))`。
 
-于是保证是精确的：
+接受规则就是全部保证，失败模式如下：
 
-- 截断会在状态与消费检查处失败。
-- 任何让帧仍可解码的字节变更都会改变解码负载，因此重放不一致、帧被拒绝——除非被损坏
-  的帧恰好是另一个负载的规范编码，而这种情况下任何非认证方案都无法区分（哈希也做不到：
-  它只会认证被替换掉的负载）。
+- 截断或状态/计数损坏会在消费与状态检查处失败。
+- 仍可解码的字节变更会产生**不同的**负载，而它的规范编码几乎不可能等于被损坏的帧，
+  因此重放不一致、帧被拒绝。
+- 残余缺口：被损坏的帧原则上可能是**另一个**负载的规范编码（`frame == encode(x)` 且
+  `x` 不同于原文），此时重放会带着错误内容接受它。任何无哈希方案都关不掉这个缺口。
+  注意：无密钥的帧摘要**能**捕获这类意外翻转——重放校验是用这点检测缺口换取零哈希。
+  无论重放还是摘要都挡不住能改写帧的攻击者；认证完整性属于 AEAD/信任层。
 - raw 回退帧存储字面输入、无冗余，因此只做长度校验。`without_raw_fallback()` 关闭该
   回退，让每个帧都保持编码态、都可被重放校验。
 
@@ -409,8 +413,11 @@ pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR �
 （算法、nonce、长度）作为 AEAD 关联数据认证，每次使用全新 192-bit nonce，因此密文
 刻意不确定。
 
-- CBOR 委托给 nextjson 的 RFC 8949 中继。中继在类型化解码前物化值树，因此按集合上限
-  强制逐容器元素数，控制内存放大。
+- CBOR 是 crate 自有的流式 RFC 8949 编解码器（`src/cbor_codec.rs`）：值直接在 `T` 与
+  字节之间编码/解码，没有中间值树、没有 JSON 文本往返，解码值的内存峰值就是解码值
+  本身。支持定长/不定长容器、bignum tag 2/3、半精度浮点与原生字节串；字节与集合上限
+  在解码过程中内联强制。确定性 canonical map 排序是唯一的显式例外，需要物化值树来
+  排序键（opt-in）。
 - 压缩使用 magic `RBZ1`、记录 raw 与 stored 长度的 24 字节头；解码器拒绝未知 flags、
   不一致长度、解压长度不匹配、截断与越限。即使未配置上限，解压始终有界。
 - 加密使用 magic `RBX1`。`EncryptionKey` 拥有 32 字节、`Debug` 脱敏、析构时 zeroize。
@@ -425,8 +432,9 @@ pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR �
 ## 带 Merkle 证明的内存映射归档
 
 `archive` 特性是存储格式：rkyv 扁平相对指针布局包在 128 字节 RustBinary 信封里。`build`
-产出信封、小端负载，以及覆盖固定大小负载块的 SHA-256 Merkle 树——哈希来自
-`src/hash.rs` 的零依赖实现。信封记录格式版本、flags、非零应用 schema ID、负载/文件
+产出信封、小端负载，以及覆盖固定大小负载块的 BLAKE3 Merkle 树——哈希来自
+`src/hash.rs`（内部零依赖实现，见依赖策略）。信封记录格式版本、flags、非零应用 schema
+ID、负载/文件
 长度、块大小与块数、Merkle 根与哈希区位置。
 
 两种访问模式：
@@ -532,7 +540,8 @@ cargo kani -p rustbinary --harness canonical::zigzag_injective
 cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
 ```
 
-归档的零依赖 SHA-256 用 NIST FIPS 180-2 向量校验，包括一百万字符 `a` 的摘要。
+归档的 BLAKE3 用官方 BLAKE3 测试向量校验，覆盖单块、块组边界与多块组长度。
+测试向量只校验正确性，不是实现级审计——见依赖策略。
 
 ### 属性测试（proptest）
 

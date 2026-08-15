@@ -48,9 +48,12 @@ dependency**:
 - The entropy layer verifies frames without any hash — see the entropy
   section.
 - The archive's Merkle tree is the one place a hash is structurally
-  unavoidable (a Merkle tree is defined by a hash function), so `src/hash.rs`
-  contains a compact, dependency-free SHA-256 verified against the NIST FIPS
-  180-2 test vectors, including the one-million-`a` vector.
+  unavoidable (a Merkle tree is defined by a hash function). To keep the
+  zero-third-party-hash constraint, `src/hash.rs` implements BLAKE3 in about
+  150 lines and checks it against the official BLAKE3 test vectors. Treat that
+  as an internal implementation detail, not a feature: the module documents its
+  audit limits (test vectors are not an implementation-level review), and
+  swapping in a vetted crate changes no call site.
 
 ## Layers
 
@@ -78,7 +81,7 @@ dependency**:
 | Bit packing                 | Implemented    | `BitPacked` derive, checked widths, canonical zero padding                                  |
 | Schema fingerprinting       | Implemented    | structural hash including codec configuration (FNV-1a, **not** cryptographic)               |
 | Compile-time bounds         | Implemented    | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                                  |
-| RFC 8949 CBOR               | Implemented    | nextjson CBOR relay; optional canonical map ordering                                        |
+| RFC 8949 CBOR               | Implemented    | crate-owned streaming CBOR codec (no value tree); optional canonical map ordering           |
 | Schema evolution            | Implemented    | stable field IDs, versions, defaults, unknown-field skipping                                |
 | Compression                 | Implemented    | adaptive Zstandard; raw data is kept when it is smaller                                     |
 | Encryption                  | Implemented    | XChaCha20-Poly1305, random 192-bit nonce, authenticated header                              |
@@ -87,7 +90,7 @@ dependency**:
 | Differential frames         | Implemented    | baseline-relative integer deltas + deterministic HPACK-style dynamic tables                 |
 | IBLT set reconciliation     | Implemented    | from-scratch invertible Bloom lookup tables (Goodrich and Mitzenmacher)                     |
 | Trust calculus              | Implemented    | type-level authentication state machine; unauthenticated receive is unrepresentable         |
-| Merkle archives             | Implemented    | dependency-free SHA-256 tree, O(log n) proofs, header-only open                             |
+| Merkle archives             | Implemented    | dependency-free BLAKE3 tree, O(log n) proofs, header-only open                            |
 | Formal verification         | Kani harnesses | roundtrip / boundedness / canonical uniqueness for the varint and ZigZag core               |
 | `no_std`                    | Implemented    | compact slice codec and caller buffers need no default features                             |
 | `no_std + alloc`            | Implemented    | owned values, fingerprints, evolution, adaptive, entropy, reconcile                        |
@@ -109,7 +112,7 @@ rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap archiv
 ```
 
 Zstandard needs a C toolchain on the build host. Everything else is pure Rust;
-the entropy coder and the archive's SHA-256 are dependency-free.
+the entropy coder and the archive's BLAKE3 are dependency-free.
 
 ### Feature matrix
 
@@ -131,7 +134,7 @@ the entropy coder and the archive's SHA-256 are dependency-free.
 | `entropy`          | no      | static-model rANS entropy coding; implies `reflection`                                                  |
 | `reconcile`        | no      | differential frames (`delta`) and IBLT (`ibl`)                                                          |
 | `trust`            | no      | type-level trust calculus and session state machine                                                      |
-| `cbor`             | no      | RFC 8949 CBOR through nextjson's relay                                                                   |
+| `cbor`             | no      | crate-owned streaming RFC 8949 CBOR codec; optional canonical ordering                             |
 | `compression`      | no      | adaptive Zstandard frame                                                                                |
 | `encryption`       | no      | XChaCha20-Poly1305, OS randomness, zeroized keys                                                         |
 | `parallel`         | no      | scoped-thread ordered batch frames                                                                       |
@@ -323,15 +326,20 @@ same models and requires the result to match the frame's stored payload and
 final state byte-for-byte. A frame is accepted only when it is the canonical
 encoding of the payload it decodes to — i.e., `frame == encode(decode(frame))`.
 
-The guarantees are then exact:
+That acceptance rule is the entire guarantee; the failure modes are:
 
-- Truncation fails the state and consumption checks.
-- Any byte change that leaves the frame decodable changes the decoded
-  payload, so the replay differs and the frame is rejected — *unless* the
-  corrupted frame happens to be the canonical encoding of a different
-  payload, which is indistinguishable from a genuine payload by any
-  non-authenticated scheme. A hash cannot do better: it would simply
-  authenticate the replaced payload.
+- Truncation or a corrupt state/count fails the consumption and state checks.
+- A byte change that still decodes yields a *different* payload, whose
+  canonical encoding almost never equals the corrupted frame, so the replay
+  differs and the frame is rejected.
+- The residual gap: a corrupted frame can in principle be the canonical
+  encoding of a *different* payload (`frame == encode(x)` with `x` different
+  from the original). Replay then accepts it with the wrong content; no
+  hash-free scheme can close that gap. Note that an unkeyed frame digest
+  *would* catch every accidental flip of this kind — replay verification
+  trades that small detection gap for zero hashing. Neither replay nor a
+  digest resists an attacker who can rewrite the frame; authenticated
+  integrity belongs to the AEAD/trust layer.
 - Raw-fallback frames store the literal input and carry no redundancy, so
   they are only length-checked. `EntropyConfig::without_raw_fallback()`
   disables that fallback, keeping every frame coded and replay-verified.
@@ -466,9 +474,14 @@ strictly smaller. Encryption authenticates the full frame header (algorithm,
 nonce, lengths) as AEAD associated data and uses a fresh 192-bit nonce each
 time, so ciphertext is intentionally nondeterministic.
 
-- CBOR delegates to nextjson's RFC 8949 relay. The relay materializes a value
-  tree before typed decoding, so per-container element counts are enforced
-  against the collection limit to keep memory amplification bounded.
+- CBOR is the crate's own streaming RFC 8949 codec (`src/cbor_codec.rs`):
+  values encode and decode directly between `T` and the bytes with no
+  intermediate value tree and no JSON text round-trip, so the memory peak of
+  a decoded value is the decoded value itself. Definite- and
+  indefinite-length containers, bignum tags 2/3, half-precision floats, and
+  native byte strings are supported; byte and collection limits are enforced
+  inline. Deterministic canonical map ordering is the one explicit exception
+  and materializes a value tree to sort keys (opt-in).
 - Compression uses the magic `RBZ1` and a 24-byte header recording raw and
   stored lengths; decoders reject unknown flags, inconsistent lengths,
   decompression-length mismatches, truncation, and limit violations.
@@ -489,8 +502,9 @@ overhead.
 
 The `archive` feature is a storage format: rkyv's flat relative-pointer
 layout inside a 128-byte RustBinary envelope. `build` produces the envelope,
-the little-endian payload, and a stored SHA-256 Merkle tree over fixed-size
-payload blocks, using the dependency-free SHA-256 from `src/hash.rs`. The
+the little-endian payload, and a stored BLAKE3 Merkle tree over fixed-size
+payload blocks (the hash comes from `src/hash.rs` — an internal,
+dependency-free implementation; see the dependency policy). The
 envelope records the format version, flags, a non-zero application schema ID,
 payload/file lengths, block size and count, the Merkle root, and the
 hash-section location.
@@ -632,8 +646,10 @@ cargo kani -p rustbinary --harness canonical::zigzag_injective
 cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
 ```
 
-The archive's dependency-free SHA-256 is checked against the NIST FIPS 180-2
-vectors, including the one-million-`a` digest.
+The archive's BLAKE3 is checked against the official BLAKE3 test vectors
+across single-block, chunk-boundary, and multi-chunk lengths. Test vectors
+check correctness; they are not an implementation-level audit — see the
+dependency policy.
 
 ### Property tests (proptest)
 

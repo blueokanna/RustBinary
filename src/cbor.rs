@@ -1,18 +1,24 @@
-//! RFC 8949 CBOR configuration driven by nextjson's CBOR relay.
+//! RFC 8949 CBOR configuration on top of the crate's own streaming CBOR
+//! codec (the private `cbor_codec` module).
 //!
-//! Encoding and decoding delegate to [`nextjson::formats::Cbor`], which
-//! relays JSON-compatible events through the crate's validated
-//! `cross_format` engine (arrays and maps use RFC 8949 indefinite-length
-//! forms). Deterministic mode sorts object keys with RFC 8949 canonical
-//! ordering before encoding. Resource limits from the base [`Config`] are
-//! enforced around the relay; trailing bytes are always rejected because the
-//! relay requires exactly one CBOR root value.
+//! Values encode and decode directly between `T` and the CBOR bytes with no
+//! intermediate value tree and no JSON text round-trip: the memory peak of a
+//! decoded value is the decoded value itself. The wire profile is the
+//! JSON-compatible RFC 8949 subset plus native byte strings and bignum tags,
+//! so payloads interoperate with any standards-compliant CBOR library.
+//! Resource limits from the base [`Config`] are enforced inline during
+//! encoding and decoding; trailing bytes are rejected by default.
+//!
+//! Deterministic mode (`with_deterministic_encoding`) is the one explicit
+//! exception to the streaming design: sorting arbitrary map keys requires
+//! retaining them, so that mode materializes a normalized value tree before
+//! encoding. It is opt-in and its cost is documented on the method itself.
 
 use std::io::{Read, Write};
 
-use nextjson::formats::{Cbor, Format};
 use nextjson::Value;
 
+use crate::cbor_codec::{CborDecoder, CborEncoder};
 use crate::{Config, Error, Result};
 
 #[cfg(feature = "fingerprint")]
@@ -96,8 +102,8 @@ impl CborConfig {
 
     /// Encodes CBOR directly into a writer.
     ///
-    /// Deterministic mode allocates a normalized value tree because arbitrary
-    /// maps cannot be sorted without retaining their encoded keys.
+    /// The payload is produced by the crate's streaming CBOR encoder, so no
+    /// intermediate representation is built beyond the emitted bytes.
     pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
         self,
         mut writer: W,
@@ -109,15 +115,19 @@ impl CborConfig {
     }
 
     fn encode_value<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
-        let bytes = if self.deterministic {
+        let mut output = Vec::new();
+        if self.deterministic {
+            // Deterministic map ordering must retain and sort object keys, so
+            // this mode materializes a normalized value tree first. It is
+            // explicitly opt-in; the default path streams without it.
             let value = nextjson::to_value(value).map_err(cbor_error)?;
             let value = canonicalize(value)?;
-            Cbor.encode(&value).map_err(cbor_error)?
+            CborEncoder::new(&mut output, self.base).finish(&value)?;
         } else {
-            Cbor.encode(value).map_err(cbor_error)?
-        };
-        self.enforce_byte_limit(bytes.len())?;
-        Ok(bytes)
+            CborEncoder::new(&mut output, self.base).finish(value)?;
+        }
+        self.enforce_byte_limit(output.len())?;
+        Ok(output)
     }
 
     fn enforce_byte_limit(self, length: usize) -> Result<()> {
@@ -136,48 +146,16 @@ impl CborConfig {
     }
 
     /// Decodes one owned CBOR value from a slice.
+    ///
+    /// Values are decoded straight from the input into `T` by the crate's
+    /// streaming CBOR decoder: no value tree and no JSON text is materialized,
+    /// and the byte/collection/depth limits are enforced inline.
     pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de>>(
         self,
         input: &[u8],
     ) -> Result<T> {
         self.enforce_byte_limit(input.len())?;
-        // The nextjson CBOR relay first materializes a value tree before typed
-        // decode, so the collection limit must be enforced on that tree to keep
-        // single-container memory amplification bounded (each element expands
-        // from one input byte to roughly a 32-byte `Value`).
-        let json = nextjson::cross_format::cbor_to_json(input).map_err(cbor_error)?;
-        let value: nextjson::Value = nextjson::from_slice(&json).map_err(cbor_error)?;
-        self.enforce_collection_limits(&value)?;
-        nextjson::from_value(value).map_err(cbor_error)
-    }
-
-    /// Recursively enforces the configured per-container element limit.
-    fn enforce_collection_limits(self, value: &nextjson::Value) -> Result<()> {
-        match value {
-            nextjson::Value::Array(items) => {
-                self.enforce_collection_limit(items.len())?;
-                for item in items {
-                    self.enforce_collection_limits(item)?;
-                }
-            }
-            nextjson::Value::Object(map) => {
-                self.enforce_collection_limit(map.len())?;
-                for (_, item) in map.iter() {
-                    self.enforce_collection_limits(item)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn enforce_collection_limit(self, length: usize) -> Result<()> {
-        if let Some(limit) = self.base.collection_limit {
-            if length as u64 > limit {
-                return Err(Error::CollectionLimit { limit });
-            }
-        }
-        Ok(())
+        CborDecoder::new(input, self.base).decode()
     }
 
     /// Decodes one owned CBOR value from a reader.

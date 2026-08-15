@@ -95,6 +95,9 @@ mod canonical;
 #[cfg(feature = "cbor")]
 /// RFC 8949 CBOR configuration and deterministic encoding.
 pub mod cbor;
+#[cfg(feature = "cbor")]
+/// Streaming RFC 8949 CBOR encoder/decoder (crate-private).
+mod cbor_codec;
 #[cfg(feature = "compression")]
 /// Adaptive Zstandard framing.
 pub mod compression;
@@ -1095,11 +1098,11 @@ mod tests {
         trailing.push(0);
         assert!(matches!(
             deterministic.deserialize::<HashMap<String, u8>>(&trailing),
-            Err(Error::Cbor(_))
+            Err(Error::TrailingBytes { .. })
         ));
         assert!(matches!(
             deterministic.deserialize_from::<_, HashMap<String, u8>>(Cursor::new(&trailing)),
-            Err(Error::Cbor(_))
+            Err(Error::TrailingBytes { .. })
         ));
         assert_eq!(
             options()
