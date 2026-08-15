@@ -35,19 +35,12 @@ use crate::{
     config::{Config, IntEncoding},
     error::{Error, Result},
     tags::{
-        TAG_ARRAY, TAG_END, TAG_F32, TAG_F64, TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT,
-        TAG_STRING, TAG_TRUE, TAG_U128, TAG_U64,
+        MARKER_U128, MARKER_U16, MARKER_U32, MARKER_U64, MAX_DEPTH, TAG_ARRAY, TAG_END, TAG_F32,
+        TAG_F64, TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TRUE,
+        TAG_U128, TAG_U64,
     },
     writer::{CountWriter, EncodeWriter, SliceWriter},
 };
-
-/// Maximum container nesting depth (mirrors nextjson's default).
-const MAX_DEPTH: usize = 128;
-
-const U16_MARKER: u8 = 251;
-const U32_MARKER: u8 = 252;
-const U64_MARKER: u8 = 253;
-const U128_MARKER: u8 = 254;
 
 type NextjsonResult<T> = core::result::Result<T, NextjsonError>;
 
@@ -194,7 +187,7 @@ impl<W: EncodeWriter> Encoder<W> {
                     (value as u16).to_be_bytes()
                 };
                 let mut encoded = [0_u8; 3];
-                encoded[0] = U16_MARKER;
+                encoded[0] = MARKER_U16;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }
@@ -205,7 +198,7 @@ impl<W: EncodeWriter> Encoder<W> {
                     (value as u32).to_be_bytes()
                 };
                 let mut encoded = [0_u8; 5];
-                encoded[0] = U32_MARKER;
+                encoded[0] = MARKER_U32;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }
@@ -216,7 +209,7 @@ impl<W: EncodeWriter> Encoder<W> {
                     (value as u64).to_be_bytes()
                 };
                 let mut encoded = [0_u8; 9];
-                encoded[0] = U64_MARKER;
+                encoded[0] = MARKER_U64;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }
@@ -227,7 +220,7 @@ impl<W: EncodeWriter> Encoder<W> {
                     value.to_be_bytes()
                 };
                 let mut encoded = [0_u8; 17];
-                encoded[0] = U128_MARKER;
+                encoded[0] = MARKER_U128;
                 encoded[1..].copy_from_slice(&payload);
                 self.emit(&encoded).map_err(|error| self.fail(error))
             }

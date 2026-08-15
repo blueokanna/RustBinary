@@ -146,3 +146,91 @@ fn alloc_profile_preserves_owned_values() {
     let decoded: (String, Vec<u32>) = rustbinary::options().deserialize(&bytes).unwrap();
     assert_eq!(decoded, value);
 }
+
+#[cfg(feature = "alloc")]
+#[test]
+fn type_mismatch_errors_name_the_expecting_type() {
+    // nextjson 0.1.3's `FormatDecoder::set_expecting` lets a derived decoder
+    // install a type description so container mismatches name the type the
+    // caller actually tried to decode instead of a bare structural token.
+    #[derive(Debug, NsonDeserialize, NsonSerialize)]
+    #[njson(expecting = "a telemetry packet")]
+    struct TelemetryPacket {
+        sequence: u64,
+    }
+
+    // A scalar where the struct is expected: the error must name the type.
+    let scalar = rustbinary::options().serialize(&42_u64).unwrap();
+    let error = rustbinary::options()
+        .deserialize::<TelemetryPacket>(&scalar)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("a telemetry packet"),
+        "container mismatch should name the expecting type, got: {message}"
+    );
+    assert!(
+        message.contains("number"),
+        "container mismatch should report the found token, got: {message}"
+    );
+
+    // An array where the struct is expected: same richer diagnostic.
+    let array = rustbinary::options().serialize(&vec![1_u64]).unwrap();
+    let error = rustbinary::options()
+        .deserialize::<TelemetryPacket>(&array)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("a telemetry packet"),
+        "array mismatch should also name the expecting type, got: {error}"
+    );
+
+    // Scalar expectations stay descriptive even with `set_expecting` installed
+    // (they are already meaningful without the surrounding type), matching
+    // nextjson 0.1.3's `expecting_for` behavior.
+    #[derive(Debug, NsonDeserialize, NsonSerialize)]
+    #[njson(expecting = "a labeled sample")]
+    struct LabeledSample {
+        label: String,
+    }
+    let bool_frame = rustbinary::options().serialize(&true).unwrap();
+    let error = rustbinary::options()
+        .deserialize::<LabeledSample>(&bool_frame)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("a labeled sample"),
+        "expected the container mismatch to name the type, got: {message}"
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn collection_limit_applies_to_nested_sibling_containers() {
+    // Per-collection accounting: each nested container gets its own element
+    // budget, so many small siblings are legal while one oversized container
+    // is rejected. This locks the `container_sep` counting contract.
+    #[derive(Debug, NsonDeserialize, NsonSerialize)]
+    struct Grid {
+        rows: Vec<Vec<u64>>,
+    }
+
+    let limit = rustbinary::options().with_collection_limit(4);
+    let ok = Grid {
+        rows: vec![vec![1, 2], vec![3, 4]],
+    };
+    let frame = limit.serialize(&ok).unwrap();
+    let decoded: Grid = limit.deserialize(&frame).unwrap();
+    assert_eq!(decoded.rows, ok.rows);
+
+    let too_many = Grid {
+        rows: vec![vec![1, 2, 3, 4, 5]],
+    };
+    // The encoder enforces the collection limit too, so serialize under an
+    // unlimited config and decode under the strict limit to exercise the
+    // decoder-side per-collection accounting.
+    let frame = rustbinary::options().serialize(&too_many).unwrap();
+    assert!(matches!(
+        limit.deserialize::<Grid>(&frame),
+        Err(rustbinary::Error::CollectionLimit { limit: 4 })
+    ));
+}

@@ -19,18 +19,11 @@ use crate::{
     config::{Config, IntEncoding, TrailingBytes},
     error::{Error, Result},
     tags::{
-        TAG_ARRAY, TAG_END, TAG_F32, TAG_F64, TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT,
-        TAG_STRING, TAG_TRUE, TAG_U128, TAG_U64,
+        MARKER_U128, MARKER_U16, MARKER_U32, MARKER_U64, MAX_DEPTH, TAG_ARRAY, TAG_END, TAG_F32,
+        TAG_F64, TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TRUE,
+        TAG_U128, TAG_U64,
     },
 };
-
-/// Maximum container nesting depth (mirrors nextjson's default).
-const MAX_DEPTH: usize = 128;
-
-const U16_MARKER: u8 = 251;
-const U32_MARKER: u8 = 252;
-const U64_MARKER: u8 = 253;
-const U128_MARKER: u8 = 254;
 
 type NextjsonResult<T> = core::result::Result<T, NextjsonError>;
 
@@ -61,6 +54,7 @@ pub(crate) fn from_slice_with_consumed<'de, T: nextjson::NsonDeserialize<'de>>(
         counts: [0; MAX_DEPTH],
         lookahead: None,
         wire_error: None,
+        expecting: None,
     };
     let value = T::nextdecode(&mut decoder).map_err(|error| {
         decoder
@@ -85,6 +79,11 @@ struct Decoder<'de> {
     counts: [u64; MAX_DEPTH],
     lookahead: Option<Token<'de>>,
     wire_error: Option<Error>,
+    /// Type description installed by [`nextjson::FormatDecoder::set_expecting`]
+    /// (nextjson 0.1.3). Derived `NsonDeserialize` implementations call it with
+    /// [`nextjson::NsonDeserialize::expecting`], so container type-mismatch
+    /// errors can name the type the caller actually tried to decode.
+    expecting: Option<&'static str>,
 }
 
 impl<'de> Decoder<'de> {
@@ -94,6 +93,18 @@ impl<'de> Decoder<'de> {
     fn fail(&mut self, error: Error) -> NextjsonError {
         self.wire_error = Some(error);
         NextjsonError::custom("rustbinary wire error")
+    }
+
+    /// Builds a type-mismatch error, preferring the type description installed
+    /// by `set_expecting` for container expectations (matching nextjson 0.1.3's
+    /// richer diagnostics). Scalar expectations stay descriptive because they
+    /// are already meaningful without the surrounding type.
+    fn invalid_type(&self, expected: &'static str, found: &Token<'_>) -> NextjsonError {
+        let expected = match (self.expecting, expected) {
+            (Some(expecting), "an object" | "an array") => expecting,
+            _ => expected,
+        };
+        NextjsonError::invalid_type(expected, token_name(found))
     }
 
     fn take(&mut self, len: usize) -> Result<&'de [u8]> {
@@ -189,10 +200,10 @@ impl<'de> Decoder<'de> {
         let marker = self.byte().map_err(|error| self.fail(error))?;
         let (value, minimum) = match marker {
             0..=250 => return Ok(marker as u128),
-            U16_MARKER => (self.literal_u16()? as u128, 251),
-            U32_MARKER => (self.literal_u32()? as u128, 0x1_0000),
-            U64_MARKER => (self.literal_u64()? as u128, 0x1_0000_0000),
-            U128_MARKER => (self.literal_u128()?, 0x1_0000_0000_0000_0000),
+            MARKER_U16 => (self.literal_u16()? as u128, 251),
+            MARKER_U32 => (self.literal_u32()? as u128, 0x1_0000),
+            MARKER_U64 => (self.literal_u64()? as u128, 0x1_0000_0000),
+            MARKER_U128 => (self.literal_u128()?, 0x1_0000_0000_0000_0000),
             other => return Err(self.fail(Error::InvalidVarintMarker(other))),
         };
         if value < minimum {
@@ -354,10 +365,12 @@ impl<'de> Decoder<'de> {
 
     /// Probes the entry separator: `true` if more entries follow, `false` at
     /// the container end (the terminator is left for `end_array` / `end_object`).
+    ///
+    /// The element is counted before the pending-lookahead shortcut so the
+    /// collection limit is enforced on every reachable path. A pending
+    /// lookahead token always implies at least one more element, so the
+    /// boolean result is `true` either way.
     fn container_sep(&mut self) -> NextjsonResult<bool> {
-        if self.lookahead.is_some() {
-            return Ok(true);
-        }
         let index = self.depth.checked_sub(1).ok_or_else(|| {
             self.fail(Error::Custom(
                 "container separator outside any container".into(),
@@ -372,6 +385,9 @@ impl<'de> Decoder<'de> {
             }
         }
         self.counts[index] = count;
+        if self.lookahead.is_some() {
+            return Ok(true);
+        }
         Ok(self.peek_byte().map_err(|error| self.fail(error))? != TAG_END)
     }
 
@@ -438,9 +454,7 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     fn begin_object(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
             Token::BeginObject => {}
-            other => {
-                return Err(NextjsonError::invalid_type("an object", token_name(&other)));
-            }
+            other => return Err(self.invalid_type("an object", &other)),
         }
         self.push_frame()
     }
@@ -455,10 +469,7 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
         }
         match self.take_token()? {
             Token::Str(key) => Ok(Some(key)),
-            other => Err(NextjsonError::invalid_type(
-                "an object key string",
-                token_name(&other),
-            )),
+            other => Err(self.invalid_type("an object key string", &other)),
         }
     }
 
@@ -469,9 +480,7 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     fn begin_array(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
             Token::BeginArray => {}
-            other => {
-                return Err(NextjsonError::invalid_type("an array", token_name(&other)));
-            }
+            other => return Err(self.invalid_type("an array", &other)),
         }
         self.push_frame()
     }
@@ -491,28 +500,28 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     fn unit(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
             Token::Null => Ok(()),
-            other => Err(NextjsonError::invalid_type("null", token_name(&other))),
+            other => Err(self.invalid_type("null", &other)),
         }
     }
 
     fn bool(&mut self) -> NextjsonResult<bool> {
         match self.take_token()? {
             Token::Bool(value) => Ok(value),
-            other => Err(NextjsonError::invalid_type("a boolean", token_name(&other))),
+            other => Err(self.invalid_type("a boolean", &other)),
         }
     }
 
     fn number(&mut self) -> NextjsonResult<Number> {
         match self.take_token()? {
             Token::Number(value) => Ok(value),
-            other => Err(NextjsonError::invalid_type("a number", token_name(&other))),
+            other => Err(self.invalid_type("a number", &other)),
         }
     }
 
     fn string(&mut self) -> NextjsonResult<Cow<'de, str>> {
         match self.take_token()? {
             Token::Str(value) => Ok(value),
-            other => Err(NextjsonError::invalid_type("a string", token_name(&other))),
+            other => Err(self.invalid_type("a string", &other)),
         }
     }
 
@@ -525,10 +534,7 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
                     _ => Err(self.fail(Error::InvalidChar)),
                 }
             }
-            other => Err(NextjsonError::invalid_type(
-                "a character",
-                token_name(&other),
-            )),
+            other => Err(self.invalid_type("a character", &other)),
         }
     }
 
@@ -564,6 +570,10 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
         // error recorded during that attempt is stale for the retry and must
         // not shadow the error reported by a later variant.
         self.wire_error = None;
+    }
+
+    fn set_expecting(&mut self, expecting: &'static str) -> Option<&'static str> {
+        self.expecting.replace(expecting)
     }
 
     fn is_human_readable(&self) -> bool {
