@@ -1,0 +1,80 @@
+name: Benchmark
+
+# Runs the criterion benchmark lab on a fresh runner and writes
+# `github_action_benchmark.md` with the real measured results.
+#
+# Trigger it manually (Actions -> Benchmark -> Run workflow) or on every push
+# to main. The report is uploaded as an artifact named
+# `github_action_benchmark`.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "rustbinary-bench/**"
+      - "src/**"
+      - "Cargo.toml"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Capture machine and toolchain info
+        id: machine
+        run: |
+          echo "cpu=$(lscpu | awk -F': +' '/^Model name/ {print $2; exit}')" >> "$GITHUB_OUTPUT"
+          echo "os=$(uname -sr)" >> "$GITHUB_OUTPUT"
+          echo "rustc=$(rustc --version)" >> "$GITHUB_OUTPUT"
+
+      - name: Run benchmark lab
+        run: |
+          cargo bench --manifest-path rustbinary-bench/Cargo.toml \
+            --bench lab -- --warm-up-time 1 --measurement-time 3 2>&1 | tee bench_raw.txt
+
+      - name: Generate github_action_benchmark.md
+        env:
+          BENCH_OS: ${{ steps.machine.outputs.os }}
+          BENCH_CPU: ${{ steps.machine.outputs.cpu }}
+          BENCH_RUSTC: ${{ steps.machine.outputs.rustc }}
+          BENCH_RUN_ID: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BENCH_DATE: ${{ github.event.head_commit.timestamp }}
+        run: |
+          if [ -z "$BENCH_DATE" ]; then
+            BENCH_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "BENCH_DATE (fallback): $BENCH_DATE"
+          fi
+          export BENCH_DATE
+          python3 scripts/bench_to_md.py bench_raw.txt github_action_benchmark.md
+          echo "--- report ---"
+          cat github_action_benchmark.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: github_action_benchmark
+          path: github_action_benchmark.md
+          if-no-files-found: error
+
+      - name: Commit report back to the repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add github_action_benchmark.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit (report identical)."
+          else
+            git commit -m "chore(bench): refresh github_action_benchmark.md"
+            git push
+          fi

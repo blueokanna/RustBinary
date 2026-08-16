@@ -60,6 +60,22 @@ pub fn derive_static_size(input: TokenStream) -> TokenStream {
         .into()
 }
 
+#[proc_macro_derive(DecodeBounded)]
+/// Derives `rustbinary::DecodeBounded`, the schema-derived resource cost
+/// algebra `(B, A, D, W)` = (max input bytes, max allocation, max nesting
+/// depth, max work) that mirrors the parser structure.
+///
+/// Fields must implement `rustbinary::DecodeBounded`. Named fields contribute
+/// their object-key bytes, containers contribute a nesting level, and dynamic
+/// collections/strings report `usize::MAX` for content-dependent resources.
+/// Unions are rejected.
+pub fn derive_decode_bounded(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    decode_bounded_impl(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 #[proc_macro_derive(Reflect, attributes(bits, entropy))]
 /// Derives allocation-free structural reflection metadata.
 ///
@@ -324,6 +340,237 @@ fn static_size_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream
 
 fn type_name(ty: &Type) -> String {
     ty.to_token_stream().to_string().replace(' ', "")
+}
+
+// ---------------------------------------------------------------------------
+// DecodeBounded: schema-derived resource cost algebra (B/A/D/W).
+// ---------------------------------------------------------------------------
+
+fn bounded_field_input(field: &syn::Field) -> proc_macro2::TokenStream {
+    let ty = &field.ty;
+    quote!(<#ty as ::rustbinary::DecodeBounded>::MAX_INPUT)
+}
+
+fn bounded_field_alloc(field: &syn::Field) -> proc_macro2::TokenStream {
+    let ty = &field.ty;
+    quote!(<#ty as ::rustbinary::DecodeBounded>::MAX_ALLOC)
+}
+
+fn bounded_field_depth(field: &syn::Field) -> proc_macro2::TokenStream {
+    let ty = &field.ty;
+    quote!(<#ty as ::rustbinary::DecodeBounded>::MAX_DEPTH)
+}
+
+fn bounded_field_work(field: &syn::Field) -> proc_macro2::TokenStream {
+    let ty = &field.ty;
+    quote!(<#ty as ::rustbinary::DecodeBounded>::MAX_WORK)
+}
+
+fn bounded_field_structural(field: &syn::Field) -> proc_macro2::TokenStream {
+    let ty = &field.ty;
+    quote!(<#ty as ::rustbinary::DecodeBounded>::MAX_STRUCTURAL_ELEMENT)
+}
+
+/// Maximum per-element structural allocation across a field list.
+fn max_bounded_structural(fields: &Fields) -> proc_macro2::TokenStream {
+    fields.iter().fold(quote!(0usize), |maximum, field| {
+        let structural = bounded_field_structural(field);
+        quote!(::rustbinary::bounded::max(#maximum, #structural))
+    })
+}
+
+/// Sum of field input bounds; named fields additionally contribute their key
+/// bytes (mirroring the encoder's object-key cost).
+fn sum_bounded_input(fields: &Fields) -> proc_macro2::TokenStream {
+    fields
+        .iter()
+        .enumerate()
+        .fold(quote!(0usize), |sum, (index, field)| {
+            let input = bounded_field_input(field);
+            if field.ident.is_some() {
+                let key = key_size(&field_name(index, field));
+                quote!(::rustbinary::bounded::saturating_add(
+                    #sum,
+                    ::rustbinary::bounded::saturating_add(#input, #key),
+                ))
+            } else {
+                quote!(::rustbinary::bounded::saturating_add(#sum, #input))
+            }
+        })
+}
+
+/// Sum of field allocation bounds.
+fn sum_bounded_alloc(fields: &Fields) -> proc_macro2::TokenStream {
+    fields.iter().fold(quote!(0usize), |sum, field| {
+        let alloc = bounded_field_alloc(field);
+        quote!(::rustbinary::bounded::saturating_add(#sum, #alloc))
+    })
+}
+
+/// One container level over the maximum field depth.
+fn max_bounded_depth(fields: &Fields) -> proc_macro2::TokenStream {
+    let maximum = fields.iter().fold(quote!(0usize), |maximum, field| {
+        let depth = bounded_field_depth(field);
+        quote!(::rustbinary::bounded::max(#maximum, #depth))
+    });
+    quote!(::rustbinary::bounded::depth_plus_one(#maximum))
+}
+
+/// Sum of field work bounds; named fields additionally contribute their key
+/// bytes.
+fn sum_bounded_work(fields: &Fields) -> proc_macro2::TokenStream {
+    fields
+        .iter()
+        .enumerate()
+        .fold(quote!(0usize), |sum, (index, field)| {
+            let work = bounded_field_work(field);
+            if field.ident.is_some() {
+                let key = key_size(&field_name(index, field));
+                quote!(::rustbinary::bounded::saturating_add(
+                    #sum,
+                    ::rustbinary::bounded::saturating_add(#work, #key),
+                ))
+            } else {
+                quote!(::rustbinary::bounded::saturating_add(#sum, #work))
+            }
+        })
+}
+
+/// Variant content bounds, excluding the variant key added by the enum
+/// wrapper.
+fn variant_bounded_input(variant: &syn::Variant) -> proc_macro2::TokenStream {
+    match &variant.fields {
+        Fields::Unit => quote!(1usize),
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => bounded_field_input(&f.unnamed[0]),
+        other => {
+            let payload = sum_bounded_input(other);
+            quote!(::rustbinary::bounded::saturating_add(#payload, 2usize))
+        }
+    }
+}
+
+fn variant_bounded_alloc(variant: &syn::Variant) -> proc_macro2::TokenStream {
+    match &variant.fields {
+        Fields::Unit => quote!(0usize),
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => bounded_field_alloc(&f.unnamed[0]),
+        other => sum_bounded_alloc(other),
+    }
+}
+
+fn variant_bounded_depth(variant: &syn::Variant) -> proc_macro2::TokenStream {
+    match &variant.fields {
+        Fields::Unit => quote!(0usize),
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => bounded_field_depth(&f.unnamed[0]),
+        other => max_bounded_depth(other),
+    }
+}
+
+fn variant_bounded_work(variant: &syn::Variant) -> proc_macro2::TokenStream {
+    match &variant.fields {
+        Fields::Unit => quote!(1usize),
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => bounded_field_work(&f.unnamed[0]),
+        other => {
+            let payload = sum_bounded_work(other);
+            quote!(::rustbinary::bounded::saturating_add(#payload, 2usize))
+        }
+    }
+}
+
+fn variant_bounded_structural(variant: &syn::Variant) -> proc_macro2::TokenStream {
+    match &variant.fields {
+        Fields::Unit => quote!(0usize),
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => bounded_field_structural(&f.unnamed[0]),
+        other => max_bounded_structural(other),
+    }
+}
+
+fn decode_bounded_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let generics = add_bound(
+        input.generics.clone(),
+        parse_quote!(::rustbinary::DecodeBounded),
+    );
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+    let (max_input, max_alloc, max_depth, max_work, max_structural) = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Unit => (
+                quote!(1usize),
+                quote!(0usize),
+                quote!(0usize),
+                quote!(1usize),
+                quote!(0usize),
+            ),
+            Fields::Unnamed(_) | Fields::Named(_) => {
+                let input = sum_bounded_input(&data.fields);
+                let alloc = sum_bounded_alloc(&data.fields);
+                let depth = max_bounded_depth(&data.fields);
+                let work = sum_bounded_work(&data.fields);
+                let structural = max_bounded_structural(&data.fields);
+                (
+                    quote!(::rustbinary::bounded::saturating_add(#input, 2usize)),
+                    alloc,
+                    depth,
+                    quote!(::rustbinary::bounded::saturating_add(#work, 2usize)),
+                    structural,
+                )
+            }
+        },
+        Data::Enum(data) => {
+            // External nextjson enums encode as an object with one variant key.
+            let mut input = quote!(0usize);
+            let mut alloc = quote!(0usize);
+            let mut depth = quote!(0usize);
+            let mut work = quote!(0usize);
+            let mut structural = quote!(0usize);
+            for variant in &data.variants {
+                let key = key_size(&variant.ident.to_string());
+                let vinput = variant_bounded_input(variant);
+                let valloc = variant_bounded_alloc(variant);
+                let vdepth = variant_bounded_depth(variant);
+                let vwork = variant_bounded_work(variant);
+                let vstructural = variant_bounded_structural(variant);
+                input = quote!(::rustbinary::bounded::max(
+                    #input,
+                    ::rustbinary::bounded::saturating_add(#key, #vinput),
+                ));
+                alloc = quote!(::rustbinary::bounded::max(#alloc, #valloc));
+                depth = quote!(::rustbinary::bounded::max(#depth, #vdepth));
+                work = quote!(::rustbinary::bounded::max(
+                    #work,
+                    ::rustbinary::bounded::saturating_add(#key, #vwork),
+                ));
+                structural = quote!(::rustbinary::bounded::max(#structural, #vstructural));
+            }
+            (
+                quote!(::rustbinary::bounded::saturating_add(
+                    ::rustbinary::bounded::saturating_add(1usize, #input),
+                    1usize,
+                )),
+                alloc,
+                quote!(::rustbinary::bounded::depth_plus_one(#depth)),
+                quote!(::rustbinary::bounded::saturating_add(
+                    ::rustbinary::bounded::saturating_add(1usize, #work),
+                    1usize,
+                )),
+                structural,
+            )
+        }
+        Data::Union(_) => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "DecodeBounded cannot be derived for unions",
+            ))
+        }
+    };
+    Ok(quote! {
+        impl #impl_generics ::rustbinary::DecodeBounded for #name #type_generics #where_clause {
+            const MAX_INPUT: usize = #max_input;
+            const MAX_ALLOC: usize = #max_alloc;
+            const MAX_DEPTH: usize = #max_depth;
+            const MAX_WORK: usize = #max_work;
+            const MAX_STRUCTURAL_ELEMENT: usize = #max_structural;
+        }
+    })
 }
 
 /// Explicit `#[entropy(symbols = N)]` alphabet declaration, if present.

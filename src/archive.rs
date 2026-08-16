@@ -39,8 +39,19 @@ use rkyv::{
     Portable,
 };
 
-use crate::hash::blake3;
 use crate::ErrorCategory;
+
+/// BLAKE3 digest over `input` using the audited [`blake3`] crate.
+///
+/// This is the single hashing entry point for the archive Merkle tree. The
+/// crate is the official, formally reviewed BLAKE3 implementation (as opposed
+/// to an in-tree reimplementation); domain separation and tree geometry are
+/// owned by this module, not by the hash primitive.
+fn blake3(input: &[u8]) -> [u8; 32] {
+    *blake3_crate::hash(input).as_bytes()
+}
+
+use blake3 as blake3_crate;
 
 /// Re-exported derives and traits used to define archive-native types.
 pub use rkyv::{Archive, Deserialize, Serialize};
@@ -291,7 +302,7 @@ impl From<io::Error> for ArchiveError {
 /// Merkle leaf hash over one payload block.
 ///
 /// The input is the domain tag, the 64-bit big-endian leaf index, and the
-/// block bytes, hashed with the dependency-free BLAKE3 from `hash`.
+/// block bytes, hashed with the audited [`blake3`] crate.
 fn leaf_hash(index: u64, block: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(9 + block.len());
     input.push(LEAF_DOMAIN);

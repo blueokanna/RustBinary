@@ -90,6 +90,9 @@ pub mod archive;
 #[cfg(feature = "bit-packing")]
 /// Bit-level caller-buffer codecs and the [`BitPack`] contract.
 pub mod bitpack;
+#[cfg(feature = "bounded")]
+/// Resource-bounded decoding with a schema-derived cost algebra.
+pub mod bounded;
 /// Canonical little-endian varint/ZigZag primitives (single source of truth).
 mod canonical;
 #[cfg(feature = "cbor")]
@@ -119,9 +122,6 @@ pub mod error;
 pub mod evolution;
 #[cfg(feature = "fingerprint")]
 mod frame;
-/// Dependency-free SHA-256 for the archive Merkle tree.
-#[cfg(feature = "archive")]
-mod hash;
 #[cfg(feature = "reconcile")]
 /// Invertible Bloom Lookup Tables for unordered set reconciliation.
 pub mod ibl;
@@ -133,6 +133,9 @@ mod kani_proofs;
 pub mod parallel;
 /// Optional transform product surface.
 pub mod pipeline;
+#[cfg(feature = "projection")]
+/// Projectable self-authenticating records with projection soundness.
+pub mod projection;
 /// Schema and wire-governance product surface.
 pub mod protocol;
 #[cfg(feature = "entropy")]
@@ -167,6 +170,11 @@ use std::io::{Read, Write};
 pub use adaptive::{AdaptiveConfig, CollectionStrategy, StringStrategy};
 #[cfg(feature = "bit-packing")]
 pub use bitpack::{BitPack, BitPackedConfig, BitReader, BitValue, BitWriter};
+#[cfg(feature = "bounded")]
+pub use bounded::{
+    decode_bounded, Budget, BudgetExceeded, DecodeBounded, DecodeError, Decoded, ResourceUse,
+    ELEMENT_STRUCTURE_BYTES,
+};
 #[cfg(feature = "cbor")]
 pub use cbor::CborConfig;
 #[cfg(all(feature = "cbor", feature = "fingerprint"))]
@@ -190,6 +198,12 @@ pub use evolution::{
 pub use ibl::{encode_set, reconcile, splitmix64, Cell, Iblt, IbltEntry};
 #[cfg(feature = "parallel")]
 pub use parallel::ParallelConfig;
+#[cfg(feature = "projection")]
+pub use projection::{
+    prove, schema_root, verify, verify_untrusted, Projection, ProjectionError, ProjectionLimits,
+    ProjectionProof, ProofLeaf, ProofSibling, Record as ProjectedRecord, RecordBuilder,
+    VerifiedField, DEFAULT_MAX_FIELDS, DEFAULT_MAX_PAYLOAD_LEN, DEFAULT_MAX_RECORD_LEN,
+};
 #[cfg(feature = "entropy")]
 pub use rans::{EntropyConfig, FieldModel, Model, RansDecoder, RansEncoder, SchemaModel, RANS_M};
 #[cfg(feature = "reflection")]
@@ -219,6 +233,8 @@ pub const fn __bitpack_max(left: usize, right: usize) -> usize {
         right
     }
 }
+#[cfg(all(feature = "derive", feature = "bounded"))]
+pub use rustbinary_derive::DecodeBounded;
 #[cfg(all(feature = "derive", feature = "fingerprint"))]
 pub use rustbinary_derive::Fingerprint;
 #[cfg(all(feature = "derive", feature = "reflection"))]
@@ -830,6 +846,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn configurable_depth_limit_rejects_deep_nesting() {
+        // 64 nested arrays over a single unit value.
+        let mut deep = vec![0x0a; 64];
+        deep.push(0x00);
+        deep.extend(std::iter::repeat_n(0xff, 64));
+        // The default cap (128) accepts 64 levels.
+        assert!(options().deserialize::<nextjson::Value>(&deep).is_ok());
+        // A tighter cap rejects the same input.
+        assert!(matches!(
+            options()
+                .with_depth_limit(8)
+                .deserialize::<nextjson::Value>(&deep),
+            Err(Error::Custom(_))
+        ));
+        // Serialization honors the same cap.
+        let mut nested = nextjson::Value::Null;
+        for _ in 0..64 {
+            nested = nextjson::Value::Array(vec![nested]);
+        }
+        assert!(matches!(
+            options().with_depth_limit(8).serialize(&nested),
+            Err(Error::Custom(_))
+        ));
+        assert!(options().serialize(&nested).is_ok());
+        // A huge limit is clamped to the crate maximum without OOB indexing.
+        assert!(options()
+            .with_depth_limit(usize::MAX)
+            .deserialize::<nextjson::Value>(&deep)
+            .is_ok());
+    }
+
+    #[test]
+    fn depth_limit_boundaries_are_exact() {
+        // A single container level (array with one unit value).
+        let one = vec![0x0a, 0x00, 0xff];
+        // Two nested container levels.
+        let two = vec![0x0a, 0x0a, 0x00, 0xff, 0xff];
+        // Three nested container levels.
+        let three = vec![0x0a, 0x0a, 0x0a, 0x00, 0xff, 0xff, 0xff];
+
+        // depth_limit 0 rejects even a single container on decode and encode.
+        assert!(matches!(
+            options()
+                .with_depth_limit(0)
+                .deserialize::<nextjson::Value>(&one),
+            Err(Error::Custom(_))
+        ));
+        let value: nextjson::Value = nextjson::Value::Array(vec![nextjson::Value::Null]);
+        assert!(matches!(
+            options().with_depth_limit(0).serialize(&value),
+            Err(Error::Custom(_))
+        ));
+
+        // depth_limit 1 accepts one level, rejects two.
+        assert!(options()
+            .with_depth_limit(1)
+            .deserialize::<nextjson::Value>(&one)
+            .is_ok());
+        assert!(matches!(
+            options()
+                .with_depth_limit(1)
+                .deserialize::<nextjson::Value>(&two),
+            Err(Error::Custom(_))
+        ));
+
+        // depth_limit 2 accepts two levels, rejects three.
+        assert!(options()
+            .with_depth_limit(2)
+            .deserialize::<nextjson::Value>(&two)
+            .is_ok());
+        assert!(matches!(
+            options()
+                .with_depth_limit(2)
+                .deserialize::<nextjson::Value>(&three),
+            Err(Error::Custom(_))
+        ));
+        // Serialization honors the same boundaries.
+        let two_value: nextjson::Value =
+            nextjson::Value::Array(vec![nextjson::Value::Array(vec![nextjson::Value::Null])]);
+        assert!(options().with_depth_limit(2).serialize(&two_value).is_ok());
+        assert!(matches!(
+            options().with_depth_limit(1).serialize(&two_value),
+            Err(Error::Custom(_))
+        ));
+
+        // The limit clamps to the crate-wide maximum (128).
+        assert_eq!(options().with_depth_limit(10_000).depth_limit(), 128);
+        assert_eq!(options().with_depth_limit(0).depth_limit(), 0);
+        assert_eq!(options().with_depth_limit(128).depth_limit(), 128);
     }
 
     struct Stateful<'a>(&'a Cell<u8>);

@@ -8,16 +8,27 @@ description = "Standalone benchmark crate comparing rustbinary against bincode 1
 [workspace]
 
 [dependencies]
-rustbinary = { path = "..", features = ["entropy"] }
+rustbinary = { path = "..", features = ["entropy", "schema-evolution"] }
 nextjson = { version = "0.1", features = ["derive"] }
 
 # serde-family opponents (bench-only; never part of rustbinary itself).
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+# bincode 2.x is the serde-based rewrite of bincode ("bincode-next" line).
 bincode2 = { package = "bincode", version = "2.0.1", features = ["serde"] }
+# bincode-next 3.x is the standalone continuation crate of the same line.
+bincode-next = { version = "3.1.1", features = ["serde"] }
 postcard = { version = "1", features = ["use-std"] }
 cbor4ii = { version = "1.2.2", features = ["serde1"] }
 minicbor = { version = "2.3.0", features = ["derive", "alloc"] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+rkyv = { version = "0.8.18", features = ["bytecheck", "alloc", "std"] }
+
+[[bench]]
+name = "lab"
+harness = false
 
 [profile.release]
 lto = "thin"

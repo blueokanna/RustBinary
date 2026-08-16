@@ -1,10 +1,13 @@
 # RustBinary
 
 RustBinary 是一个基于 [nextjson](https://crates.io/crates/nextjson) 的有界二进制编解码库。
-它实现 nextjson 的 `NsonSerialize` / `NsonDeserialize` 与 `FormatEncoder` /
-`FormatDecoder` 契约，类型直接用 nextjson 的 derive 描述。这个库是一套"把字节放到线上、
-再从线上读回来"的工具箱，每个特性都对应一个具体问题。本文档说明这些问题的答案，以及
-每个答案的代价。
+类型直接用 nextjson 的 derive 描述，这个库负责把它们变成字节、再变回来。它只做一件窄事：
+把结构化数据搬上线或落进文件——对面可能是恶意的，内存可能很紧，而且你希望在解码器跑起来
+之前就知道它最多会吃掉多少资源。
+
+这里每个特性都回答一个具体问题——"这个帧我拒得起吗？"、"轻客户端能不能不扫全记录就读
+一个字段？"、"这种类型最坏能把我的堆怎么样？"——下文先给答案，再说明代价。本库没有装饰
+性功能；凡是取舍而非纯赢的特性，README 都会直说。
 
 ## 格式身份
 
@@ -12,17 +15,18 @@ RustBinary 是一个基于 [nextjson](https://crates.io/crates/nextjson) 的有�
 终结。这就是格式身份。它不是 bincode 式的紧凑布局，也不是 CBOR 式的长度前缀布局，
 也不会悄悄变成这两种中的任何一种。
 
-这个身份换来三条整个设计都依赖的性质：
+自描述换来三条整个设计都依赖的性质：
 
 - `Option`、无标签枚举、`nextjson::Value` 无需旁路元数据即可无歧义往返。
 - 借用 `&str` 字段直接指向输入 frame，零复制。
 - 解码器永远知道一个值在哪里结束、一个 frame 是否完整。
 
 代价是每个值付一字节标签，数值数组每个元素各付一字节标签。这笔税是真实的，而且被
-测量过而不是被藏起来——本仓库的 benchmark crate 在同样的数据上把它与 bincode 1、
-bincode 2、postcard、cbor4ii、minicbor 对比。如果你的负载是一大堆 `f64` 别的什么都没有，
-无 schema 的紧凑编解码器在体积和速度上会胜过本库，那就去用那个。如果你的负载是异构
-记录、必须无歧义往返、且在没有带外 schema 的情况下可读，标签税买来的就是这些。
+测量过而不是被藏起来——本仓库的基准实验室在同样的数据上把它与 bincode 1、bincode 2、
+bincode-next、postcard、rkyv、minicbor 对比，输在哪一行都写得清清楚楚。如果你的负载是
+一大堆 `f64` 别的什么都没有，无 schema 的紧凑编解码器在体积和速度上会胜过本库，那就去用
+那个。如果你的负载是异构记录、必须无歧义往返、且在没有带外 schema 的情况下可读，标签税
+买来的就是这些。
 
 `archive` 特性**不是第二种流格式**。它是独立的存储格式——rkyv 扁平相对指针 + RustBinary
 信封——用于只读内存映射对象存储，并独立版本化（`RBARC002`）。流编解码器从不做内存强转、
@@ -31,14 +35,18 @@ bincode 2、postcard、cbor4ii、minicbor 对比。如果你的负载是一大�
 ## 依赖策略
 
 流路径依赖 nextjson，以及可选的派生 crate。可选 pipeline 增加 zstd、
-chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
-**刻意没有任何第三方哈希依赖**：
+chacha20poly1305、getrandom、zeroize。archive 增加 memmap2、rkyv 与 **blake3**。
+供应链策略与密码实现策略是刻意分离的两个决策：
 
-- 熵层完全不使用哈希来校验帧——见熵编码一节。
-- 归档的 Merkle 树是唯一结构性无法避免哈希的地方（Merkle 树由哈希函数定义）。
-  为守住“零第三方哈希”约束，`src/hash.rs` 用约 150 行实现 BLAKE3，并以官方
-  BLAKE3 测试向量校验。请把它当作内部实现细节而非卖点：模块文档说明了审计局限
-  （测试向量不是实现级审查），换成审计过的 crate 也不改动任何调用点。
+- **供应链**：第三方依赖被限制在真正需要的层（pipeline 编解码、归档存储、Merkle
+  哈希），且都是可选 Cargo feature；流核心保持轻依赖。
+- **密码实现**：凡是承载安全或完整性语义的原语都用经过审计的 crate，而不是库内
+  自研。归档 Merkle 树使用官方 **`blake3`** crate（正式审查过的实现）；本库不再
+  自带任何哈希原语。熵层完全不需要哈希——它靠重放校验帧，残余检测缺口见熵编码一节。
+
+若威胁模型要求更小的依赖面，`blake3` crate 可替换为任何 `fn(&[u8]) -> [u8; 32]`
+实现而不改变归档布局（调用点只有 `src/archive.rs` 里的一处包装）；域分离与树几何
+归归档模块所有，不归哈希原语所有。
 
 ## 分层
 
@@ -49,6 +57,7 @@ chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
 | **Pipeline**| `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理                                    |
 | **Sync**    | `sync`                 | 否       | rANS 熵编码、差分帧、IBLT 集合协调、信任演算                        |
 | **Archive** | `rustbinary::archive`  | 否       | Merkle 校验的只读内存映射对象存储                                   |
+| **Projection**| `rustbinary::projection`| 否     | 可投影自认证记录，具备投影健全性                                     |
 
 [English](README.md)
 
@@ -75,8 +84,11 @@ chacha20poly1305、getrandom、zeroize。archive 增加 memmap2 与 rkyv。
 | 差分帧                  | 已实现     | 基准相对整数差分 + 确定性 HPACK 式动态表                                    |
 | IBLT 集合协调           | 已实现     | 自研可逆布隆查找表（Goodrich 与 Mitzenmacher）                              |
 | 信任演算                | 已实现     | 类型级认证状态机；未认证接收在类型层面不可表达                              |
-| Merkle 归档             | 已实现     | 零依赖 BLAKE3 树，O(log n) 证明，仅信封打开                                |
-| 形式化验证              | Kani 证明  | varint/ZigZag 核心的往返、有界、规范唯一性                                   |
+| Merkle 归档             | 已实现     | 审计 BLAKE3 树，O(log n) 证明，仅信封打开                                |
+| 可投影自认证记录        | 已实现     | 投影健全性、O(log n) 证明、schema 版本绑定、跳过未知字段                   |
+| 资源有界解码            | 已实现     | schema 派生 B/A/D/W 成本代数，预算强制的 `decode_bounded` 并带用量证据      |
+| 可配置深度上限          | 已实现     | `Config::with_depth_limit` 在编码与解码两侧限制嵌套深度                     |
+| 形式化验证              | Kani 证明  | varint/ZigZag 核心 + 投影树几何 + 预算极限代数                              |
 | `no_std`                | 已实现     | Compact slice 编解码与调用方缓冲区无需默认 feature                          |
 | `no_std + alloc`        | 已实现     | owned 值、指纹、演进、自适应、熵、集合协调                                  |
 
@@ -96,8 +108,8 @@ rustbinary = { version = "0.1", features = ["sync"] }       # 熵 + 集合协调
 rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap 归档
 ```
 
-Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵编码器与归档的 BLAKE3
-零依赖。
+Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵编码器零依赖，归档用审计过的
+`blake3` crate 做哈希（见依赖策略）。
 
 ### 特性矩阵
 
@@ -124,6 +136,8 @@ Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵�
 | `encryption`       | 否   | XChaCha20-Poly1305、OS 随机、zeroize 密钥                                   |
 | `parallel`         | 否   | scoped 线程有序 batch frame                                                 |
 | `schema-evolution` | 否   | 稳定字段 ID 版本化 frame                                                    |
+| `bounded`          | 否   | `DecodeBounded` 成本代数（B/A/D/W）、`Budget`、`decode_bounded`；需要 `std` 与 `derive` |
+| `projection`       | 否   | 可投影自认证记录与投影证明；需要 `std` 与审计过的 `blake3`                  |
 
 ## 快速开始
 
@@ -406,6 +420,70 @@ frame 以 magic `RBE1`、格式版本、flags、schema ID、schema 版本、字�
 类型；重命名 Rust 字段时保留 ID；为向后兼容添加可选或默认字段；用编码版本表达刻意的
 语义迁移；需要转发或保留时检查未知字段。
 
+## 可投影自认证记录（投影健全性）
+
+`projection` 特性是一种**协议格式，不是紧凑 codec**：规范、自认证的记录，其字段可
+针对可信根**逐个**验证与解码，而无需扫描或反序列化记录的其余部分。保证是**投影健全性**：
+
+```text
+Verify(P, π, q) = v   ⟹   v = Project_q(Decode(P))
+```
+
+`P` 是记录，`q` 是投影查询（字段 ID 集合），`π` 是证明，`Decode(P)` 是唯一规范解码
+（唯一性来自格式的规范性：严格递增字段 ID、定宽头部、无重复）。`q` 之外的字段永不
+被读取，但其真实性仍被保证：每个字段都绑定进 Merkle 根，篡改或替换未读字段会改变根
+并使验证失败。
+
+- **构造**：字段为 `(field_id, payload_len, payload)` 三元组；根是
+  `BLAKE3(schema_version ‖ merkle_root)`，因此证明无法针对不同 schema 版本重放。
+  `RecordBuilder` 强制规范顺序；`prove` 提取批量证明（最小兄弟集）；`verify` 永不
+  触碰记录，并要求**可信锚点**（记录根，由认证来源承诺——区块头、带密钥的承诺、
+  签名的索引）。本模块绑定完整性；带密钥的认证是调用方的信任锚。`verify_untrusted`
+  只检查内部一致性，检测损坏而非替换。
+- **诚实的复杂度**：`prove` 为 O(n)；证明大小最坏 O(|q| · log(n/|q|))，单字段或连续
+  区间为 O(log n)；`verify` 做 O(|q| + log n) 次哈希运算。Merkle 开销意味着该格式面向
+  字段数适中的记录；对负载为主的记录，逐字段哈希成本可忽略。
+- **已验证**：Kani 证明 `small_tree_proof_agrees_with_root` 证明聚合/重算协议对任意
+  哈希与任意查询在代数上一致；`leaf_count_is_complete_and_bounded` 证明树完整且至多
+  翻倍。
+
+## 资源有界解码（成本代数）
+
+`bounded` 特性把 `StaticSize` 从“最坏输出字节数”推进到**可证明的资源语义**。
+`#[derive(DecodeBounded)]` 为每个类型生成镜像解析器的成本代数：
+
+```text
+B(T)  一次解码 T 最多消费的输入字节数
+A(T)  一次解码 T 最多分配的堆字节数
+D(T)  最大解析器嵌套深度
+W(T)  最坏工作量（读字节 + 逐字段开销）
+```
+
+`decode_bounded` 在 [`Budget`] 下运行解码并返回携带**证据**的 `Decoded<T>`
+（`ResourceUse`：精确读字节数，加上分配、深度、工作的可证明上界）。代数与解析器同构
+——derive 镜像编码器/解码器遍历的确切容器/键结构——因此对静态有界类型，常量是精确的：
+这样的解码按构造至多读 `B(T)` 字节、分配 `A(T)` 字节（通常为 0）、嵌套 `D(T)` 层、
+做 `W(T)` 工作。
+
+动态类型（`Vec`、`String`、`&str`）对内容相关的资源报告 `usize::MAX`，由运行时预算
+强制执行调用方的上限。分配上限是保守且对 derive 覆盖的类型精确的：
+
+- **数据**：输入中物化到堆的每一字节（字符串与字节缓冲本体）都被字节上限约束，因此
+  `数据 ≤ 读取`。
+- **结构**：集合后备缓冲与 Box 超出其线数据之外的部分。derive 计算
+  `MAX_STRUCTURAL_ELEMENT`——类型中所有集合里最坏的单元素结构分配（`Vec<T>`/`Box<T>`
+  为 `size_of::<T>()`，`String` 为 0）。一次解码至多有 `D(T)` 层嵌套集合，每层受集合
+  上限约束，因此
+  `分配 ≤ 读取 + MAX_STRUCTURAL_ELEMENT · D(T) · collection_limit ≤ max_input + max_alloc`。
+  报告的 `alloc_bound` 即该上界。未声明 `MAX_STRUCTURAL_ELEMENT` 的手写 `DecodeBounded`
+  实现回退到预算的 `element_structure_bytes` 旋钮（默认 `ELEMENT_STRUCTURE_BYTES` = 64，
+  覆盖标准集合形态；宽元组或大内联元素布局应调高）。
+
+每次失败都会报告超出的是哪个维度（`BudgetExceeded`）。这是 DoS 敏感消费者的入口：
+区块链节点、enclave、网关从策略或 `Budget::from_type::<T>()`（由代数派生紧致默认值）
+选择 `Budget`，并拿到本次解码消耗的证据。`Config::with_depth_limit` 把容器嵌套上限
+压到库级 128 之下，并做了钳制，恶意上限不会导致越界索引。
+
 ## CBOR、压缩与加密
 
 pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR 递归排序规范 map 键。压缩
@@ -432,8 +510,9 @@ pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR �
 ## 带 Merkle 证明的内存映射归档
 
 `archive` 特性是存储格式：rkyv 扁平相对指针布局包在 128 字节 RustBinary 信封里。`build`
-产出信封、小端负载，以及覆盖固定大小负载块的 BLAKE3 Merkle 树——哈希来自
-`src/hash.rs`（内部零依赖实现，见依赖策略）。信封记录格式版本、flags、非零应用 schema
+产出信封、小端负载，以及覆盖固定大小负载块的 BLAKE3 Merkle 树。哈希使用审计过的
+`blake3` crate（见依赖策略）；域分离（`LEAF`/`NODE`/`PAD` 标签加大端索引）与树几何
+是本模块自己的。信封记录格式版本、flags、非零应用 schema
 ID、负载/文件
 长度、块大小与块数、Merkle 根与哈希区位置。
 
@@ -561,26 +640,58 @@ cargo +nightly fuzz run decode_structured_roundtrip
 
 ### 基准测试
 
-`rustbinary-bench/` 是独立 crate（非 workspace 成员），在共享数据集（小型头部、遥测帧、
-大批数值、大批字符串）上对比 rustbinary 与 bincode 1、bincode 2、postcard、cbor4ii、
-minicbor，外加独立 rANS 字节 codec 与精确符号表枚举编码。使用预热 + `black_box` 的
-9 次中位数。代表性输出（Windows，release 构建；在 crate 内以 `cargo run --release`
-重新生成）：
+`rustbinary-bench/` 是独立 crate（非 workspace 成员），提供两套基准：
 
-| codec | dataset | encode ns | decode ns | bytes |
+- `cargo run --release`——9 次中位数表，在共享数据集（小型头部、遥测帧、大批数值、
+  大批字符串）上对比 rustbinary 与 bincode 1、bincode 2、postcard、cbor4ii、
+  minicbor，外加独立 rANS 字节 codec 与精确符号表枚举编码。
+- `cargo bench --bench lab`——**公平基准实验室**（criterion），覆盖五类负载：
+  `homogeneous`（1024 条相同记录）、`heterogeneous`（混合枚举变体）、`borrowed`
+  （零拷贝 `&str`）、`adversarial`（10 万元素向量）、`schema-evolution`（用 V2
+  类型解码 V1 字节）。对手为 bincode 1、bincode 2、**bincode-next**、postcard、
+  rkyv、minicbor——所有 codec 由同一次调用、同一份 `[profile.release]` 编译，
+  criterion 报告校准后的中位数统计、`black_box`，并逐对打印编码字节数。
+
+实验室是这个库愿意接受评判的对比。每次 push 到 `main` 都会在全新的 GitHub
+Actions 运行器上重跑一次，完整报告存于
+[`github_action_benchmark.md`](github_action_benchmark.md)——由
+`.github/workflows/benchmark.yml` 重新生成，绝不是过期的截图。以下是最近一次本机
+实测（Windows 11、Intel i7-11850H、Rust 1.97、release 配置）的要点，完整逐行
+数据见报告文件。
+
+**homogeneous**（1024 条相同记录；单操作中位数）：
+
+| codec | encode | decode | bytes |
 |---|---|---:|---:|---:|
-| rustbinary | small | 1375 | 612 | 49 |
-| bincode 1 | small | 88 | 6 | 14 |
-| postcard | small | 119 | 12 | 8 |
-| rustbinary | bulk-strings | 14481 | 62922 | 7955 |
-| bincode 1 | bulk-strings | 2084 | 34356 | 9488 |
-| rustbinary entropy | bulk-strings | 60566 | 151406 | 3570（2.08x）|
-| rustbinary entropy | enum x1000 | 9022 | 20100 | 2.51 bits/symbol |
+| rustbinary | 120.5 µs | 272.6 µs | 51716 |
+| bincode 1 | 3.2 µs | 2.0 µs | 14344 |
+| bincode 2 | 10.1 µs | 4.2 µs | 13829 |
+| bincode-next | 7.9 µs | 8.6 µs | 13829 |
+| postcard | 22.5 µs | 9.1 µs | 13686 |
+| rkyv | 5.7 µs | 445.1 ns | 24584 |
 
-读这张表要带着格式身份来读：rustbinary 是带类型标签的自描述格式，因此以字节与编码
-开销换取自描述、借用与有界解码。熵行的解码数高于带标签流，因为重放校验在解码时多做
-一次编码；传输层已认证字节时可 `without_replay_verification()` 关掉。数字随机器与
-构建变化；基准 crate 存在就是为了让对比可以被重新生成，而不是被断言。
+**schema-evolution**（用带追加 `#[serde(default)]` 字段的 V2 类型解码 V1 字节）：
+
+| codec | encode-v1 | decode-v1-as-v2 | bytes |
+|---|---|---:|---:|---:|
+| rustbinary | 306.8 ns | 217.3 ns | 68 |
+| bincode 1 | 50.7 ns | error | 26 |
+| bincode 2 | 182.3 ns | error | 18 |
+| bincode-next | 173.7 ns | 71.3 ns | 18 |
+| postcard | 185.7 ns | error | 17 |
+
+读这张表要带着格式身份来读。rustbinary 是带类型标签的自描述格式：在巨型同构数组
+上每个值都付一个标签，因此字节与速度都会输——表格毫不掩饰这一点。这笔税换来的
+东西在 `schema-evolution` 里看得最清楚：bincode 1、bincode 2、postcard 无法用
+V2 类型解码追加字段后的 V1 字节（顺序格式不带字段元数据，缺失值直接报错）；
+bincode-next 会记录字段数，因此成功；rustbinary 靠稳定字段 ID 成功。同样的诚实
+口径也适用于其他组——`borrowed` 不含 bincode 2 与 bincode-next，因为它们的
+`decode_from_slice` 需要 `T: for<'de> Deserialize<'de>`，借用型 serde 类型无法满足；
+在 `adversarial` 的 10 万 `Vec<u64>` 上 rustbinary 解码约 3.3 ms，而 bincode 1
+只要 88.6 µs。这些是自描述的真实代价，如实报告而非遮掩；五类负载的完整逐 codec
+表格都在 `github_action_benchmark.md` 里。
+
+数字随机器与构建变化；基准 crate 存在就是为了让对比可以被重新运行，而不是被断言。
 
 ### 完整验证命令
 

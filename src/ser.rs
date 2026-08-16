@@ -240,7 +240,7 @@ impl<W: EncodeWriter> Encoder<W> {
     }
 
     fn enter_container(&mut self, tag: u8) -> NextjsonResult<()> {
-        if self.depth >= MAX_DEPTH {
+        if self.depth >= self.config.depth_limit {
             return Err(self.fail(Error::Custom("encoder nesting depth limit exceeded".into())));
         }
         self.emit_tag(tag)?;

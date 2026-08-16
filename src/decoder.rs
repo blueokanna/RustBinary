@@ -358,7 +358,7 @@ impl<'de> Decoder<'de> {
     }
 
     fn push_frame(&mut self) -> NextjsonResult<()> {
-        if self.depth >= MAX_DEPTH {
+        if self.depth >= self.config.depth_limit {
             return Err(self.fail(Error::Custom("decoder nesting depth limit exceeded".into())));
         }
         self.depth += 1;
@@ -371,11 +371,13 @@ impl<'de> Decoder<'de> {
         }
         // The entry separators only probe for the terminator; consuming it is
         // this method's job (mirroring nextjson's `}` / `]` consumption).
-        let byte = self.peek_byte().map_err(|error| self.fail(error))?;
+        // `byte()` is `take(1)`, so the terminator counts against the byte
+        // limit exactly as the encoder's `emit` does — keeping the consumed
+        // byte count at or below the configured limit on both directions.
+        let byte = self.byte().map_err(|error| self.fail(error))?;
         if byte != TAG_END {
             return Err(self.fail(Error::Custom("container end without terminator".into())));
         }
-        self.cursor += 1;
         self.depth -= 1;
         // Reset this container's element counter so sibling containers at the
         // same depth each get their own collection-limit budget.

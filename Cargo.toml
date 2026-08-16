@@ -1,5 +1,10 @@
 [workspace]
 members = ["rustbinary-derive"]
+# `fuzz` is a standalone cargo-fuzz crate; excluding it keeps `cargo metadata`
+# (and therefore `cargo fmt --all`) from treating it as a stray member of this
+# workspace. `rustbinary-bench` breaks out via its own empty `[workspace]`
+# table.
+exclude = ["fuzz"]
 resolver = "2"
 
 [package]
@@ -43,7 +48,7 @@ protocol = [
 ]
 pipeline = ["cbor", "compression", "encryption", "parallel"]
 sync = ["entropy", "reconcile", "trust"]
-archive = ["std", "dep:memmap2", "dep:rkyv"]
+archive = ["std", "dep:memmap2", "dep:rkyv", "dep:blake3"]
 entropy = ["alloc", "reflection"]
 reconcile = ["alloc"]
 trust = ["alloc", "std"]
@@ -58,6 +63,8 @@ bit-packing = []
 adaptive = ["bit-packing"]
 parallel = ["std"]
 schema-evolution = ["alloc"]
+bounded = ["alloc", "std", "derive"]
+projection = ["std", "dep:blake3"]
 simd = ["std"]
 
 [[example]]
@@ -133,6 +140,9 @@ chacha20poly1305 = { version = "0.11", optional = true, default-features = false
 getrandom = { version = "0.4.3", optional = true }
 zeroize = { version = "1.9.0", optional = true }
 memmap2 = { version = "0.9.11", optional = true }
+blake3 = { version = "1.8", optional = true, default-features = false, features = [
+    "std",
+] }
 rkyv = { version = "0.8.18", optional = true, default-features = false, features = [
     "bytecheck",
     "little_endian",

@@ -10,7 +10,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustbinary::{Config, ErrorCategory};
+use rustbinary::ErrorCategory;
 
 fuzz_target!(|data: &[u8]| {
     // Exercise both the strict compact profile and the legacy profile.

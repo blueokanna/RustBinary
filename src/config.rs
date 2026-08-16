@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
 
-use crate::{decoder, error::Result, ser};
+use crate::{decoder, error::Result, ser, tags::MAX_DEPTH};
 
 /// Conservative default byte limit for one encoded or decoded Core value.
 pub const DEFAULT_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
@@ -61,6 +61,7 @@ pub struct Config {
     pub(crate) trailing: TrailingBytes,
     pub(crate) limit: Option<u64>,
     pub(crate) collection_limit: Option<u64>,
+    pub(crate) depth_limit: usize,
 }
 
 impl Default for Config {
@@ -78,6 +79,7 @@ impl Config {
             trailing: TrailingBytes::Reject,
             limit: Some(DEFAULT_SIZE_LIMIT),
             collection_limit: Some(DEFAULT_COLLECTION_LIMIT),
+            depth_limit: MAX_DEPTH,
         }
     }
     /// Creates the historical unbounded fixed-width RustBinary profile.
@@ -96,6 +98,7 @@ impl Config {
             trailing: TrailingBytes::Allow,
             limit: None,
             collection_limit: None,
+            depth_limit: MAX_DEPTH,
         }
     }
     /// Selects little endian.
@@ -155,6 +158,31 @@ impl Config {
     pub const fn with_no_collection_limit(mut self) -> Self {
         self.collection_limit = None;
         self
+    }
+    /// Caps the maximum container nesting depth for one encoded or decoded value.
+    ///
+    /// Both the encoder and the decoder fail fast when a container is entered
+    /// at the limit, so hostile deep-nesting input is rejected instead of
+    /// walked. The value is clamped to the crate-wide `MAX_DEPTH` ceiling
+    /// (currently 128), which also sizes the internal per-depth accounting
+    /// tables, so a caller-supplied larger limit cannot cause out-of-bounds
+    /// indexing.
+    pub const fn with_depth_limit(mut self, limit: usize) -> Self {
+        let clamped = if limit > MAX_DEPTH { MAX_DEPTH } else { limit };
+        self.depth_limit = clamped;
+        self
+    }
+    /// Returns the configured container nesting depth cap.
+    pub const fn depth_limit(self) -> usize {
+        self.depth_limit
+    }
+    /// Returns the configured consumed-byte limit, if any.
+    pub const fn limit(self) -> Option<u64> {
+        self.limit
+    }
+    /// Returns the configured per-collection element limit, if any.
+    pub const fn collection_limit(self) -> Option<u64> {
+        self.collection_limit
     }
     /// Adds a versioned schema fingerprint header to every value.
     #[cfg(feature = "fingerprint")]
@@ -293,6 +321,9 @@ pub trait Options: Sized {
     }
     fn with_no_collection_limit(self) -> Config {
         self.config().with_no_collection_limit()
+    }
+    fn with_depth_limit(self, limit: usize) -> Config {
+        self.config().with_depth_limit(limit)
     }
     fn reject_trailing_bytes(self) -> Config {
         self.config().reject_trailing_bytes()

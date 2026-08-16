@@ -1,22 +1,28 @@
 # RustBinary
 
 RustBinary is a bounded binary codec built on [nextjson](https://crates.io/crates/nextjson).
-It implements nextjson's `NsonSerialize` / `NsonDeserialize` and `FormatEncoder` /
-`FormatDecoder` contracts, so your types are described with the normal nextjson
-derives. The crate is a toolkit for moving bytes on a wire and reading them
-back off a disk, and every feature in it exists to answer a specific question
-about that problem. This document says what the answers are and what they
-cost.
+Your types are described with the normal nextjson derives; this crate turns
+those into bytes and back. It exists for a narrow job: moving structured data
+across a wire or into a file, where the other side might be hostile, where
+memory is scarce, and where you want to know exactly what a decoder will
+consume before it runs.
+
+Every feature in here answers a concrete question — "can I afford to reject
+this frame?", "can a light client read one field without scanning the whole
+record?", "what is the worst case this type can do to my heap?" — and the
+sections below state the answers together with what each one costs. Nothing in
+this crate is decoration, and the README says plainly when a feature is a
+trade-off rather than a win.
 
 ## Format identity
 
 The stream wire format is a **type-tagged, self-describing byte stream**:
 every value starts with a one-byte type tag, and arrays and objects end with
-`0xff`. This is the format identity. It is not a bincode-style compact layout
+`0xff`. That is the whole identity. It is not a bincode-style compact layout
 and it is not a CBOR-style length-prefixed layout, and it will not quietly
 become either of those.
 
-The identity buys three properties that the rest of the design leans on:
+Being self-describing buys three things the rest of the design leans on:
 
 - `Option`, untagged enums, and `nextjson::Value` round-trip without any side
   metadata.
@@ -24,9 +30,10 @@ The identity buys three properties that the rest of the design leans on:
 - A decoder can always tell where a value ends and whether a frame is whole.
 
 The price is a one-byte tag per value and one tag per element in a numeric
-array. That tax is real and it is measured, not waved away — the benchmark
-crate in this repository reports it against bincode 1, bincode 2, postcard,
-cbor4ii, and minicbor on the same data. If your workload is a giant array of
+array. That tax is real, and it is measured rather than waved away — the
+benchmark lab in this repository reports it against bincode 1, bincode 2,
+bincode-next, postcard, rkyv, and minicbor on the same data, and the numbers
+are honest about where this format loses. If your workload is a giant array of
 `f64` and nothing else, a schemaless codec will beat this one on size and
 speed; take the schemaless codec. If your workload is heterogeneous records
 that must round-trip unambiguously and be readable without an out-of-band
@@ -42,18 +49,25 @@ pointers, and never changes its behavior based on which Cargo features are on.
 
 The stream path depends on nextjson and, optionally, the derive crate. The
 optional pipeline adds zstd, chacha20poly1305, getrandom, and zeroize. The
-archive adds memmap2 and rkyv. There is deliberately **no third-party hashing
-dependency**:
+archive adds memmap2, rkyv, and **blake3**. Supply-chain strategy and crypto
+implementation strategy are deliberately separate decisions:
 
-- The entropy layer verifies frames without any hash — see the entropy
+- **Supply chain**: third-party dependencies are confined to the layers that
+  need them (pipeline codecs, archive storage, Merkle hashing) and are
+  optional Cargo features. The stream core stays dependency-light.
+- **Crypto implementation**: every primitive that is load-bearing for
+  security or integrity is a vetted crate, not an in-tree reimplementation.
+  The archive Merkle tree hashes with the official **`blake3`** crate (a
+  formally reviewed implementation); this crate does not ship its own hash
+  primitive. The entropy layer needs no hash at all — it verifies frames by
+  replay, and the residual detection gap is documented in the entropy
   section.
-- The archive's Merkle tree is the one place a hash is structurally
-  unavoidable (a Merkle tree is defined by a hash function). To keep the
-  zero-third-party-hash constraint, `src/hash.rs` implements BLAKE3 in about
-  150 lines and checks it against the official BLAKE3 test vectors. Treat that
-  as an internal implementation detail, not a feature: the module documents its
-  audit limits (test vectors are not an implementation-level review), and
-  swapping in a vetted crate changes no call site.
+
+If a threat model demands an even smaller dependency surface, the blake3
+crate can be swapped for any implementation of `fn(&[u8]) -> [u8; 32]` without
+changing the archive layout (the call site is a single wrapper in
+`src/archive.rs`); domain separation and tree geometry are owned by the
+archive module, not by the hash primitive.
 
 ## Layers
 
@@ -64,6 +78,7 @@ dependency**:
 | **Pipeline**| `rustbinary::pipeline` | no      | CBOR, compression, encryption, ordered parallel batches                      |
 | **Sync**    | `sync`                 | no      | rANS entropy coding, differential frames, IBLT reconciliation, trust calculus|
 | **Archive** | `rustbinary::archive`  | no      | Merkle-verified read-only memory-mapped object stores                        |
+| **Projection**| `rustbinary::projection`| no    | self-authenticating projectable records with projection soundness            |
 
 [中文文档](README.zh-CN.md)
 
@@ -90,8 +105,11 @@ dependency**:
 | Differential frames         | Implemented    | baseline-relative integer deltas + deterministic HPACK-style dynamic tables                 |
 | IBLT set reconciliation     | Implemented    | from-scratch invertible Bloom lookup tables (Goodrich and Mitzenmacher)                     |
 | Trust calculus              | Implemented    | type-level authentication state machine; unauthenticated receive is unrepresentable         |
-| Merkle archives             | Implemented    | dependency-free BLAKE3 tree, O(log n) proofs, header-only open                            |
-| Formal verification         | Kani harnesses | roundtrip / boundedness / canonical uniqueness for the varint and ZigZag core               |
+| Merkle archives             | Implemented    | audited BLAKE3 tree, O(log n) proofs, header-only open                                      |
+| Projectable self-auth. records | Implemented | projection soundness, O(log n) proofs, schema-version binding, unknown-field skipping      |
+| Resource-bounded decoding   | Implemented    | schema-derived B/A/D/W cost algebra, budget-enforced `decode_bounded` with evidence          |
+| Configurable depth limit    | Implemented    | `Config::with_depth_limit` caps nesting on encode and decode                              |
+| Formal verification         | Kani harnesses | varint/ZigZag core + projection tree geometry + budget-limit algebra                        |
 | `no_std`                    | Implemented    | compact slice codec and caller buffers need no default features                             |
 | `no_std + alloc`            | Implemented    | owned values, fingerprints, evolution, adaptive, entropy, reconcile                        |
 
@@ -112,7 +130,8 @@ rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap archiv
 ```
 
 Zstandard needs a C toolchain on the build host. Everything else is pure Rust;
-the entropy coder and the archive's BLAKE3 are dependency-free.
+the entropy coder is dependency-free and the archive hashes with the audited
+`blake3` crate (see the dependency policy).
 
 ### Feature matrix
 
@@ -139,6 +158,8 @@ the entropy coder and the archive's BLAKE3 are dependency-free.
 | `encryption`       | no      | XChaCha20-Poly1305, OS randomness, zeroized keys                                                         |
 | `parallel`         | no      | scoped-thread ordered batch frames                                                                       |
 | `schema-evolution` | no      | stable-field-ID versioned frames                                                                         |
+| `bounded`          | no      | `DecodeBounded` cost algebra (B/A/D/W), `Budget`, `decode_bounded`; requires `std` and `derive` |
+| `projection`       | no      | self-authenticating projectable records and projection proofs; requires `std`, audited `blake3` |
 
 ## Quick start
 
@@ -465,6 +486,131 @@ when renaming a Rust field; add optional or defaulted fields for backward
 compatibility; use the encoded version for deliberate semantic migrations;
 inspect unknown fields when forwarding or preservation is required.
 
+## Projectable self-authenticating records (projection soundness)
+
+The `projection` feature is a **protocol format, not a compact codec**: a
+canonical, self-authenticating record whose fields can be verified and
+decoded *individually* against a trusted root, without scanning or decoding
+the rest of the record. The guarantee is **projection soundness**:
+
+```text
+Verify(P, π, q) = v   ⟹   v = Project_q(Decode(P))
+```
+
+`P` is the record, `q` a projection query (a set of field ids), `π` the
+proof, and `Decode(P)` the unique canonical decoding (uniqueness follows from
+the format's canonicality: strictly increasing field ids, fixed-width
+headers, no duplicates). Fields outside `q` are never read, yet their
+authenticity is still guaranteed: every field is bound into the Merkle root,
+so a tampered or substituted unread field changes the root and fails
+verification.
+
+- **Construction**: fields are `(field_id, payload_len, payload)` triples;
+  the root is `BLAKE3(schema_version ‖ merkle_root)`, so a proof cannot be
+  replayed against a different schema version. `RecordBuilder` enforces
+  canonical order; `prove` extracts a batch proof (minimal sibling set);
+  `verify` never touches the record and requires a **trusted anchor** (the
+  record root as committed by an authenticated source — a block header, a
+  keyed commitment, a signed index). The module binds integrity; keyed
+  authentication is the caller's trust anchor. `verify_untrusted` checks
+  internal consistency only and detects corruption, not substitution.
+- **Honest complexity**: `prove` is O(n); proof size is O(|q| · log(n/|q|))
+  worst case and O(log n) for a single field or a contiguous range; `verify`
+  does O(|q| + log n) hash operations. The Merkle overhead means the format
+  targets records with moderate field counts; for payload-heavy records the
+  per-field hash cost is negligible.
+- **Verified**: the Kani harness `small_tree_proof_agrees_with_root` proves
+  the aggregation/recomputation protocol is algebraically consistent for any
+  hash and any query; `leaf_count_is_complete_and_bounded` proves the tree is
+  complete and never more than doubles.
+
+```rust
+let mut builder = rustbinary::RecordBuilder::new(7); // schema version 7
+builder.insert_str(1, "alpha").unwrap();
+builder.insert_varint(2, 42).unwrap();
+builder.insert_bytes(3, b"\x00\x01").unwrap();
+let record = builder.finish().unwrap();
+
+// The trusted anchor comes from an authenticated source (e.g. a block header).
+let parsed = rustbinary::ProjectedRecord::parse(&record, &rustbinary::ProjectionLimits::new())?;
+let anchor = *parsed.root();
+
+let query = rustbinary::Projection::new([2]);
+let proof = rustbinary::prove(&record, &query, &rustbinary::ProjectionLimits::new())?;
+let verified = rustbinary::verify(&proof, &anchor, 7)?; // schema version bound
+assert_eq!(verified[0].field_id, 2);
+assert_eq!(verified[0].as_varint()?, 42);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## Resource-bounded decoding (cost algebra)
+
+The `bounded` feature advances `StaticSize` from "worst-case output bytes" to
+**provable resource semantics**. For each type the `#[derive(DecodeBounded)]`
+macro generates a cost algebra that mirrors the parser exactly:
+
+```text
+B(T)  maximum input bytes one decode of T can consume
+A(T)  maximum heap bytes one decode of T can allocate
+D(T)  maximum parser nesting depth
+W(T)  worst-case work (bytes read + per-field overhead)
+```
+
+`decode_bounded` runs the decode under a [`Budget`] and returns a `Decoded<T>`
+carrying **evidence** (`ResourceUse`: exact bytes read plus provable bounds
+for allocation, depth, and work). The algebra is isomorphic to the parser —
+the derive mirrors the exact container/key structure the encoder and decoder
+walk — so for statically bounded types the constants are exact: such a decode
+reads at most `B(T)` bytes, allocates at most `A(T)` (usually 0), nests at
+most `D(T)` levels, and does at most `W(T)` work, by construction.
+
+Dynamic types (`Vec`, `String`, `&str`) report `usize::MAX` for
+content-dependent resources, and the *runtime* budget enforces the caller's
+limits. The allocation ceiling is conservative and exact for the types the
+derive covers:
+
+- **Data**: every byte materialized on the heap from the input (string and
+  byte-buffer bodies) is bounded by the byte limit, so `data ≤ read`.
+- **Structure**: collection backing buffers and boxes beyond their wire data.
+  The derive computes `MAX_STRUCTURAL_ELEMENT` — the worst per-element
+  structural allocation across the type's collections (`size_of::<T>()` for
+  `Vec<T>`/`Box<T>`, `0` for `String`). A decode has at most `D(T)` nested
+  collection levels, each capped at the collection limit, so
+  `allocation ≤ read + MAX_STRUCTURAL_ELEMENT · D(T) · collection_limit ≤
+  max_input + max_alloc`. The reported `alloc_bound` is that ceiling.
+  Manual `DecodeBounded` implementations that do not declare
+  `MAX_STRUCTURAL_ELEMENT` fall back to the budget's
+  `element_structure_bytes` knob (default [`ELEMENT_STRUCTURE_BYTES`] = 64,
+  which covers the standard collection shapes; raise it for wide-tuple or
+  large-inline-element layouts).
+
+Every failure reports which dimension was exceeded (`BudgetExceeded`). This
+is the entry point for DoS-sensitive consumers: blockchain nodes, enclaves,
+and gateways pick a `Budget` — from policy or from `Budget::from_type::<T>()`,
+which derives tight defaults from the algebra — and receive evidence of what
+the decode consumed.
+
+```rust
+#[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::DecodeBounded)]
+struct Packet {
+    sequence: u64,
+    payload: Vec<u8>,
+}
+
+let bytes = rustbinary::options().serialize(&Packet { sequence: 1, payload: vec![0; 64] })?;
+let budget = rustbinary::Budget::from_type::<Packet>()
+    .with_max_alloc(1 << 16);
+let decoded = rustbinary::decode_bounded::<Packet>(&bytes, budget)?;
+assert_eq!(decoded.value.sequence, 1);
+assert!(decoded.use_.read as usize <= bytes.len());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The `bounded` module's budget derivation and the projection tree geometry are
+Kani-proven (see Verification). `Config::with_depth_limit` (always available)
+caps container nesting on encode and decode below the crate-wide 128 ceiling
+and is clamped so a hostile limit cannot cause out-of-bounds indexing.
+
 ## CBOR, compression, and encryption
 
 The pipeline is explicit and ordered: serialize, optionally compress, then
@@ -503,11 +649,11 @@ overhead.
 The `archive` feature is a storage format: rkyv's flat relative-pointer
 layout inside a 128-byte RustBinary envelope. `build` produces the envelope,
 the little-endian payload, and a stored BLAKE3 Merkle tree over fixed-size
-payload blocks (the hash comes from `src/hash.rs` — an internal,
-dependency-free implementation; see the dependency policy). The
-envelope records the format version, flags, a non-zero application schema ID,
-payload/file lengths, block size and count, the Merkle root, and the
-hash-section location.
+payload blocks. Hashing uses the audited `blake3` crate (see the dependency
+policy); domain separation (`LEAF`/`NODE`/`PAD` tags plus big-endian index)
+and tree geometry are this module's own. The envelope records the format
+version, flags, a non-zero application schema ID, payload/file lengths, block
+size and count, the Merkle root, and the hash-section location.
 
 Two access modes:
 
@@ -644,12 +790,23 @@ cargo kani -p rustbinary --harness canonical::varint_roundtrip
 cargo kani -p rustbinary --harness canonical::zigzag_roundtrip
 cargo kani -p rustbinary --harness canonical::zigzag_injective
 cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
+cargo kani -p rustbinary --features projection --harness projection::leaf_count_is_complete_and_bounded
+cargo kani -p rustbinary --features projection --harness projection::small_tree_proof_agrees_with_root
+cargo kani -p rustbinary --features bounded --harness bounded::enforced_limits_respect_budget
+cargo kani -p rustbinary --features bounded --harness bounded::depth_algebra_preserves_max
 ```
 
-The archive's BLAKE3 is checked against the official BLAKE3 test vectors
-across single-block, chunk-boundary, and multi-chunk lengths. Test vectors
-check correctness; they are not an implementation-level audit — see the
-dependency policy.
+The projection harnesses prove the Merkle aggregation/recomputation protocol
+is algebraically consistent for *any* hash values and any query subset, and
+that `leaf_count` yields a complete tree that never more than doubles. The
+bounded harnesses prove the derived enforced limits never exceed the budget
+and that the documented allocation ceiling holds.
+
+The archive hashes with the audited `blake3` crate, which maintains its own
+formal review and test vectors. Correctness of the Merkle *geometry* (domain
+separation, sibling extraction, root recomputation) is this crate's
+responsibility and is covered by the archive tests and the projection Kani
+harness for tree aggregation.
 
 ### Property tests (proptest)
 
@@ -657,6 +814,16 @@ dependency policy.
 public API: byte and uniform-alphabet roundtrips, per-byte corruption
 properties (error, or a *different* payload — never the original), truncation
 rejection, non-canonical-form rejection, and integer roundtrips.
+
+`tests/projection_proptest.rs` randomizes the projection format's *shape*
+(arbitrary field counts, payloads, and queries): every proof returns exactly
+the queried projection with authentic bytes, any single header/field byte
+tamper is detected against the trusted anchor, arbitrary bytes never panic,
+and the stored root always matches the recomputed root.
+`tests/bounded_proptest.rs` randomizes values through `decode_bounded`: the
+result agrees with the plain codec, the bytes read are exact, the reported
+allocation bound is sound, static types never exceed their compile-time
+algebra, and the input-budget boundary is exact.
 
 ### Fuzzing (cargo-fuzz)
 
@@ -671,32 +838,70 @@ cargo +nightly fuzz run decode_structured_roundtrip
 
 ### Benchmarks
 
-`rustbinary-bench/` is a standalone crate (not a workspace member) comparing
-rustbinary against bincode 1, bincode 2, postcard, cbor4ii, and minicbor on
-shared datasets (small header, telemetry frame, bulk numerics, bulk strings),
-plus the standalone rANS byte codec and exact-alphabet enum coding. It uses
-median-of-9 latency with warmup and `black_box`. Representative output
-(Windows, release build; regenerate with `cargo run --release` in that
-crate):
+Two benchmark surfaces live in `rustbinary-bench/` (a standalone crate, not a
+workspace member):
 
-| codec | dataset | encode ns | decode ns | bytes |
+- `cargo run --release` — the median-of-9 table comparing rustbinary against
+  bincode 1, bincode 2, postcard, cbor4ii, and minicbor on shared datasets
+  (small header, telemetry frame, bulk numerics, bulk strings), plus the
+  standalone rANS byte codec and exact-alphabet enum coding.
+- `cargo bench --bench lab` — the **fair benchmark lab** (criterion) across
+  five workload classes: `homogeneous` (1024 identical records),
+  `heterogeneous` (mixed enum variants), `borrowed` (zero-copy `&str`),
+  `adversarial` (100k-element vector), and `schema-evolution` (V1 bytes
+  decoded by a V2 type). Opponents are bincode 1, bincode 2, **bincode-next**,
+  postcard, rkyv, and minicbor — every codec built by the same invocation
+  with identical `[profile.release]` flags, criterion median statistics with
+  calibration and `black_box`, encoded byte counts printed beside every
+  pair.
+
+The lab is the comparison this crate is willing to be judged by. It is
+re-run on a fresh GitHub Actions runner on every push to `main`, and the
+full report lives in
+[`github_action_benchmark.md`](github_action_benchmark.md) — regenerated by
+`.github/workflows/benchmark.yml`, never a stale screenshot. The most recent
+local run (Windows 11, Intel i7-11850H, Rust 1.97, release profile) is below,
+cut to the rows that matter; the file has every row.
+
+**homogeneous** (1024 identical records; per-op medians):
+
+| codec | encode | decode | bytes |
 |---|---|---:|---:|---:|
-| rustbinary | small | 1375 | 612 | 49 |
-| bincode 1 | small | 88 | 6 | 14 |
-| postcard | small | 119 | 12 | 8 |
-| rustbinary | bulk-strings | 14481 | 62922 | 7955 |
-| bincode 1 | bulk-strings | 2084 | 34356 | 9488 |
-| rustbinary entropy | bulk-strings | 60566 | 151406 | 3570 (2.08x) |
-| rustbinary entropy | enum x1000 | 9022 | 20100 | 2.51 bits/symbol |
+| rustbinary | 120.5 µs | 272.6 µs | 51716 |
+| bincode 1 | 3.2 µs | 2.0 µs | 14344 |
+| bincode 2 | 10.1 µs | 4.2 µs | 13829 |
+| bincode-next | 7.9 µs | 8.6 µs | 13829 |
+| postcard | 22.5 µs | 9.1 µs | 13686 |
+| rkyv | 5.7 µs | 445.1 ns | 24584 |
 
-Read the table with the format identity in mind: rustbinary is a type-tagged
-self-describing format, so it trades bytes and encode cost for
-self-description, borrowing, and bounded decoding. The entropy row includes
-replay verification on decode (one extra encode pass), which is why its
-decode number is higher than the tagged stream's; disable it with
-`without_replay_verification()` when the transport authenticates bytes.
+**schema-evolution** (V1 bytes decoded by a V2 type with an appended
+`#[serde(default)]` field):
+
+| codec | encode-v1 | decode-v1-as-v2 | bytes |
+|---|---|---:|---:|---:|
+| rustbinary | 306.8 ns | 217.3 ns | 68 |
+| bincode 1 | 50.7 ns | error | 26 |
+| bincode 2 | 182.3 ns | error | 18 |
+| bincode-next | 173.7 ns | 71.3 ns | 18 |
+| postcard | 185.7 ns | error | 17 |
+
+Read these with the format identity in mind. rustbinary is a type-tagged,
+self-describing format: on a giant homogeneous array it pays one tag per
+value, so it loses on bytes and speed — and the table says so plainly. What
+the tax buys shows up in `schema-evolution`: bincode 1, bincode 2 and
+postcard cannot decode V1 bytes as a V2 type with an appended field (their
+sequential format carries no field metadata, so the missing value errors
+out); bincode-next tracks the field count and succeeds; rustbinary succeeds
+through stable field IDs. The same honest framing holds elsewhere —
+`borrowed` omits bincode 2 and bincode-next because their
+`decode_from_slice` needs `T: for<'de> Deserialize<'de>`, which a borrowed
+serde type cannot satisfy, and on the `adversarial` 100k-`Vec<u64>` workload
+rustbinary decodes in ~3.3 ms where bincode 1 takes 88.6 µs. Those are real
+costs of self-description, reported rather than hidden; the full per-codec
+tables for all five workloads are in `github_action_benchmark.md`.
+
 Numbers vary by machine and build; the benchmark crate exists so the
-comparison can be regenerated, not asserted.
+comparison can be re-run, not asserted.
 
 ### Full verification commands
 

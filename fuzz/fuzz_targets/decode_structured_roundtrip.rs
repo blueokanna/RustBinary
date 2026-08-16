@@ -24,10 +24,12 @@ struct Record<'a> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let config = Config::standard().with_collection_limit(4096).with_limit(1 << 20);
+    let config = Config::standard()
+        .with_collection_limit(4096)
+        .with_limit(1 << 20);
     // Split the input into a structured value and use the tail for strings.
-    let mut name = String::from_utf8_lossy(data.get(..64.min(data.len())).unwrap_or(data))
-        .into_owned();
+    let mut name =
+        String::from_utf8_lossy(data.get(..64.min(data.len())).unwrap_or(data)).into_owned();
     if name.is_empty() {
         name.push('x');
     }
@@ -43,7 +45,11 @@ fuzz_target!(|data: &[u8]| {
             })
             .collect(),
         flags: data.iter().map(|byte| byte & 1 == 0).collect(),
-        maybe: if data.is_empty() { None } else { Some(data[0] as u32) },
+        maybe: if data.is_empty() {
+            None
+        } else {
+            Some(data[0] as u32)
+        },
     };
     let frame = config.serialize(&record).unwrap();
     let decoded: Record<'_> = config.deserialize(&frame).unwrap();
