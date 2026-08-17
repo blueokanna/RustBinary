@@ -78,12 +78,7 @@ struct Small {
     delta: i32,
 }
 
-#[derive(
-    Debug,
-    nextjson::NsonSerialize,
-    nextjson::NsonDeserialize,
-    rustbinary::CompactBinary,
-)]
+#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary)]
 struct RbSmall {
     enabled: bool,
     mode: u8,
@@ -181,11 +176,7 @@ fn messages() -> Vec<Msg> {
         .collect()
 }
 
-#[derive(
-    nextjson::NsonSerialize,
-    nextjson::NsonDeserialize,
-    rustbinary::CompactBinary,
-)]
+#[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary)]
 enum RbMsg {
     Version(u32),
     Heartbeat { seq: u64, ts: f64 },
@@ -264,12 +255,7 @@ fn borrowed_value() -> BorrowedOwned {
     }
 }
 
-#[derive(
-    Debug,
-    nextjson::NsonSerialize,
-    nextjson::NsonDeserialize,
-    rustbinary::CompactBinary,
-)]
+#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary)]
 struct RbBorrowed<'a> {
     id: u64,
     #[njson(borrow)]
@@ -330,6 +316,7 @@ impl rustbinary::protocol::SchemaEncode for TelemetryV1 {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct TelemetryV2 {
     device_name: String,
     sample_count: u32,
@@ -360,6 +347,7 @@ struct SerV1 {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct SerV2 {
     device_name: String,
     sample_count: u32,
@@ -756,7 +744,8 @@ fn adversarial(c: &mut Criterion) {
             .0
     );
 
-    let b2n = bincode_next::serde::encode_to_vec(&values, bincode_next::config::standard()).unwrap();
+    let b2n =
+        bincode_next::serde::encode_to_vec(&values, bincode_next::config::standard()).unwrap();
     codec_pair!(
         group,
         "bincode-next",
@@ -802,7 +791,8 @@ fn schema_evolution(c: &mut Criterion) {
         .serialize(&value)
         .unwrap();
     println!(
-        "BENCH_BYTES\tschema-evolution\trustbinary\t{}",
+        "BENCH_BYTES\tschema-evolution\t{}\t{}",
+        "rustbinary",
         rb_bytes.len()
     );
     let rb_bytes_ref = &rb_bytes;
@@ -855,7 +845,11 @@ fn schema_evolution(c: &mut Criterion) {
     let b2 = bincode2::serde::encode_to_vec(&ser_v1, bincode2::config::standard()).unwrap();
     println!("BENCH_BYTES\tschema-evolution\tbincode2\t{}", b2.len());
     group.bench_function("bincode2/encode-v1", |b| {
-        b.iter(|| black_box(bincode2::serde::encode_to_vec(&ser_v1, bincode2::config::standard()).unwrap()))
+        b.iter(|| {
+            black_box(
+                bincode2::serde::encode_to_vec(&ser_v1, bincode2::config::standard()).unwrap(),
+            )
+        })
     });
     if bincode2::serde::decode_from_slice::<SerV2, _>(&b2, bincode2::config::standard()).is_ok() {
         let b2_ref = &b2;
@@ -874,18 +868,15 @@ fn schema_evolution(c: &mut Criterion) {
     } else {
         println!("BENCH_EVO_FAIL\tschema-evolution\tbincode2");
     }
-    let b2n = bincode_next::serde::encode_to_vec(&ser_v1, bincode_next::config::standard()).unwrap();
-    println!(
-        "BENCH_BYTES\tschema-evolution\tbincode-next\t{}",
-        b2n.len()
-    );
+    let b2n =
+        bincode_next::serde::encode_to_vec(&ser_v1, bincode_next::config::standard()).unwrap();
+    println!("BENCH_BYTES\tschema-evolution\tbincode-next\t{}", b2n.len());
     group.bench_function("bincode-next/encode-v1", |b| {
         b.iter(|| {
-            black_box(bincode_next::serde::encode_to_vec(
-                &ser_v1,
-                bincode_next::config::standard(),
+            black_box(
+                bincode_next::serde::encode_to_vec(&ser_v1, bincode_next::config::standard())
+                    .unwrap(),
             )
-            .unwrap())
         })
     });
     if bincode_next::serde::decode_from_slice::<SerV2, _>(&b2n, bincode_next::config::standard())

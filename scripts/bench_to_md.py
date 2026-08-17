@@ -18,22 +18,16 @@ import argparse
 import os
 import re
 import sys
-
-# workload/codec/op, where op is "encode" or "decode".
-TIME_RE = re.compile(r"^\s*time:\s+\[\s*([0-9.]+)\s*(\S+?)\s*[0-9.]+\s*\S+?\s*[0-9.]+\s*\S+?\s*\]")
-# Matches a benchmark-name line. Criterion prints the name alone on its
-# own line in one mode and "name time: [...]" on a single line in
-# another (observed with the rkyv benches); both are handled. The op is
-# "encode", "decode", or a suffixed variant such as "encode-v1" /
-# "decode-v1-as-v2" (schema-evolution).
 LINE_RE = re.compile(
-    r"^(?P<wl>[a-z0-9-]+)/(?P<codec>[a-z0-9-]+)/(?P<op>(?:encode|decode)[a-z0-9-]*)"
-    r"(?:\s+time:\s+\[(?P<t>[0-9.]+)\s+(?P<u>\S+?)\s*[0-9.]+\s*\S+?\s*[0-9.]+\s*\S+?\s*\])?"
+    r"^(?P<wl>[a-z0-9-]+)/(?P<codec>[^/]+)/(?P<op>(?:encode|decode)[a-z0-9-]*)"
+    r"(?:\s+time:\s+\[\s*[0-9.]+\s+\S+\s+(?P<t>[0-9.]+)\s+(?P<u>\S+)\s+[0-9.]+\s+\S+\s*\])?"
     r"\s*$"
 )
 # Standalone criterion timing line (name was on the previous line).
+# Criterion prints "time:   [lower median upper]"; both parsers capture the
+# middle value (the median), which is what the report documents.
 TIME_RE = re.compile(
-    r"^\s*time:\s+\[\s*([0-9.]+)\s*(\S+?)\s*[0-9.]+\s*\S+?\s*[0-9.]+\s*\S+?\s*\]"
+    r"^\s*time:\s+\[\s*[0-9.]+\s+\S+\s+([0-9.]+)\s+(\S+)\s+[0-9.]+\s+\S+\s*\]"
 )
 BYTES_RE = re.compile(r"^BENCH_BYTES\t([^\t]+)\t([^\t]+)\t(\d+)$")
 # Emitted by the lab when a schema-evolution decode probe failed: the codec
