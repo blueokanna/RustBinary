@@ -77,7 +77,9 @@ pub fn datasets() -> Datasets {
 // rustbinary (nextjson) mappings
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary
+)]
 pub struct RbSmall {
     pub enabled: bool,
     pub mode: u8,
@@ -85,7 +87,9 @@ pub struct RbSmall {
     pub delta: i32,
 }
 
-#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary
+)]
 pub struct RbTelemetry {
     pub device: String,
     pub metric: String,
@@ -94,13 +98,17 @@ pub struct RbTelemetry {
     pub status: Option<u8>,
 }
 
-#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary
+)]
 pub struct RbBulkNumerics {
     pub id: u64,
     pub values: Vec<i64>,
 }
 
-#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::CompactBinary
+)]
 pub struct RbBulkStrings {
     pub id: u64,
     pub entries: Vec<String>,

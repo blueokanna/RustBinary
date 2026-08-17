@@ -46,6 +46,11 @@ impl EvolutionConfig {
         self.base
     }
 
+    /// Always [`crate::BinaryProfile::Evolution`].
+    pub const fn profile(self) -> crate::BinaryProfile {
+        crate::BinaryProfile::Evolution
+    }
+
     /// Serializes a value with schema identity, revision, and stable field IDs.
     pub fn serialize<T: SchemaEncode + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         let mut encoder = FieldEncoder::new(self.base);

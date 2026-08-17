@@ -267,3 +267,11 @@ impl Error {
         Self::Custom(CustomMessage::from_display(error))
     }
 }
+
+/// Builds an `Error::Custom` from a static message.
+///
+/// Used by `rustbinary-derive`-generated code; not part of the public API.
+#[doc(hidden)]
+pub fn __custom_message(message: &'static str) -> CustomMessage {
+    CustomMessage::from_display(message)
+}

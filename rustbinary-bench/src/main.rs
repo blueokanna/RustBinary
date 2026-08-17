@@ -114,6 +114,8 @@ fn main() {
         minicbor::decode::<dataset::CborSmall>(&mc).unwrap()
     }, mc);
 
+    bench_compact("rustbinary compact", "small", &rb_small);
+
     // --- Telemetry ---------------------------------------------------------
     let telemetry = &d.telemetry;
     let rb_telemetry = dataset::RbTelemetry {
@@ -176,6 +178,8 @@ fn main() {
         minicbor::decode::<dataset::CborTelemetry>(&mc).unwrap()
     }, mc);
 
+    bench_compact("rustbinary compact", "telemetry", &rb_telemetry);
+
     // --- Bulk numerics -----------------------------------------------------
     bench_numerics(&d.bulk_numerics, &rb_cfg);
     // --- Bulk strings ------------------------------------------------------
@@ -185,7 +189,7 @@ fn main() {
     entropy_benchmark(&d);
 
     println!();
-    println!("Note: latencies are ns/op on this machine; compare rows within a dataset, not across runs. rustbinary is a type-tagged self-describing format; bincode/postcard are compact schemaless formats. The entropy row measures the standalone rANS byte codec, not the tagged stream.");
+    println!("Note: latencies are ns/op on this machine; compare rows within a dataset, not across runs. \"rustbinary\" is a type-tagged self-describing format; \"rustbinary compact\" is the schema-guided compact profile (no tags, no field names, length-prefixed containers) and is the apples-to-apples comparison against bincode/postcard. The entropy row measures the standalone rANS byte codec, not the tagged stream.");
 }
 
 fn bench_numerics(d: &BulkNumerics, rb_cfg: &rustbinary::Config) {
@@ -242,6 +246,8 @@ fn bench_numerics(d: &BulkNumerics, rb_cfg: &rustbinary::Config) {
     }, {
         minicbor::decode::<dataset::CborBulkNumerics>(&mc).unwrap()
     }, mc);
+
+    bench_compact("rustbinary compact", "bulk-numerics", &rb);
 }
 
 fn bench_strings(d: &BulkStrings, rb_cfg: &rustbinary::Config) {
@@ -298,6 +304,24 @@ fn bench_strings(d: &BulkStrings, rb_cfg: &rustbinary::Config) {
     }, {
         minicbor::decode::<dataset::CborBulkStrings>(&mc).unwrap()
     }, mc);
+
+    bench_compact("rustbinary compact", "bulk-strings", &rb);
+}
+
+/// Compact-profile row: schema-known direct codec (no tags, no field names).
+fn bench_compact<T>(name: &str, dataset: &str, value: &T)
+where
+    T: rustbinary::compact::CompactEncode + for<'de> rustbinary::compact::CompactDecode<'de>,
+{
+    let config = rustbinary::options()
+        .with_limit(1 << 20)
+        .with_compact_format();
+    let frame = config.serialize(value).unwrap();
+    codec_row!(name, dataset, {
+        config.serialize(value).unwrap()
+    }, {
+        config.deserialize::<T>(&frame).unwrap()
+    }, frame);
 }
 
 /// The standalone rANS byte codec on repetitive bulk data: the schema-driven

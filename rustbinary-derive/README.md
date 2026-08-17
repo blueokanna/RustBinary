@@ -25,6 +25,7 @@ and the `derive` feature are additive and independent.
 | `StaticSize` | `rustbinary::StaticSize` | Compile-time worst-case bounds |
 | `Reflect` | `rustbinary::Reflect` | Inspect static field and variant metadata |
 | `BitPacked` | `rustbinary::BitPack` | Pack bounded fields at bit granularity |
+| `CompactBinary` | `rustbinary::compact::{CompactEncode, CompactDecode}` | Schema-guided compact wire profile (no tags, no field names) |
 
 The macros do not implement `nextjson::NsonSerialize` or
 `nextjson::NsonDeserialize`. Combine them with nextjson derives when the
@@ -49,10 +50,10 @@ rustbinary = { version = "0.1.4", features = [
 ```
 
 The feature names are independent. `derive` enables macro re-exports, while
-`fingerprint`, `reflection`, `static-size`, and `bit-packing` enable their
-runtime contracts. Application code normally writes
+`fingerprint`, `reflection`, `static-size`, `bit-packing`, and `compact`
+enable their runtime contracts. Application code normally writes
 `rustbinary::Fingerprint`, `rustbinary::StaticSize`, `rustbinary::Reflect`,
-and `rustbinary::BitPacked`.
+`rustbinary::BitPacked`, and `rustbinary::CompactBinary`.
 
 Direct use of this package is also supported for macro ownership or build
 tooling, but the runtime crate must still be present because generated paths

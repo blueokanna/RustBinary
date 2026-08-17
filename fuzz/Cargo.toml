@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rustbinary = { path = "..", features = ["alloc"] }
+rustbinary = { path = "..", features = ["alloc", "derive", "compact"] }
 nextjson = { version = "0.1", features = ["derive"] }
 
 [[bin]]
@@ -22,6 +22,13 @@ bench = false
 [[bin]]
 name = "decode_structured_roundtrip"
 path = "fuzz_targets/decode_structured_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_compact_arbitrary"
+path = "fuzz_targets/decode_compact_arbitrary.rs"
 test = false
 doc = false
 bench = false

@@ -1,13 +1,47 @@
 #[cfg(feature = "alloc")]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use crate::{BitReader, BitWriter, Config, Error, Result, TrailingBytes};
+use crate::{
+    canonical::encode_varint_le, BitReader, BitWriter, Config, Error, Result, TrailingBytes,
+};
 
 const RAW_UTF8: u8 = 0;
 const ASCII7: u8 = 1;
 const RAW_INTEGERS: u8 = 0;
 const DELTA_INTEGERS: u8 = 1;
 const RLE_INTEGERS: u8 = 2;
+
+/// Number of leading elements sampled by [`AdaptiveMode::Heuristic`] before
+/// deciding whether delta / run-length coding is worth a full pass.
+pub const HEURISTIC_SAMPLE: usize = 64;
+
+/// How much analysis the adaptive codec performs before encoding.
+///
+/// The choice is **size-only**: every strategy is lossless, so a cheaper mode
+/// never changes what decodes, only how many bytes the frame occupies and how
+/// many scan passes the encoder performs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AdaptiveMode {
+    /// Encode directly with the raw representation.
+    ///
+    /// Zero analysis passes — the low-latency default for online paths. Bytes
+    /// are larger than `Heuristic`/`Exact` on compressible data, but the
+    /// encoder never rescans the input to save a few bytes.
+    #[default]
+    Off,
+    /// Sample the first [`HEURISTIC_SAMPLE`] elements to decide whether
+    /// delta / run-length pays off, then take a single sizing pass over the
+    /// chosen strategy.
+    ///
+    /// Integer collections are always safe to sample (the choice is size-only
+    /// and lossless). Strings cannot be sampled safely — `ASCII7` requires
+    /// every scalar to be ASCII, so they use the exact scan in this mode.
+    Heuristic,
+    /// Compare the complete raw / delta / run-length sizes and pick the
+    /// smallest. Optimal size at the cost of extra full scans; best for
+    /// offline compression.
+    Exact,
+}
 
 /// Selected representation for one adaptively encoded string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,16 +67,35 @@ pub enum CollectionStrategy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdaptiveConfig {
     base: Config,
+    mode: AdaptiveMode,
 }
 
 impl AdaptiveConfig {
     pub(crate) const fn new(base: Config) -> Self {
-        Self { base }
+        Self {
+            base,
+            mode: AdaptiveMode::Off,
+        }
     }
 
     /// Returns the variable-integer payload configuration.
     pub const fn base_config(self) -> Config {
         self.base
+    }
+
+    /// Selects how much analysis the adaptive encoder performs.
+    ///
+    /// [`AdaptiveMode::Off`] (the default) encodes directly with no extra
+    /// scans; [`AdaptiveMode::Heuristic`] samples a bounded prefix;
+    /// [`AdaptiveMode::Exact`] compares complete encodings.
+    pub const fn with_adaptive_mode(mut self, mode: AdaptiveMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Returns the configured analysis mode.
+    pub const fn mode(self) -> AdaptiveMode {
+        self.mode
     }
 
     /// Uses value-width adaptive varints for a regular nextjson payload.
@@ -62,6 +115,19 @@ impl AdaptiveConfig {
     /// Encodes a string using raw UTF-8 or 7-bit ASCII packing, whichever is smaller.
     #[cfg(feature = "alloc")]
     pub fn encode_string(self, value: &str) -> Result<Vec<u8>> {
+        if self.mode == AdaptiveMode::Off {
+            // Direct raw UTF-8 with no ASCII scan: the low-latency default.
+            let required = 1usize
+                .checked_add(varint_size(value.len() as u128))
+                .and_then(|size| size.checked_add(value.len()))
+                .ok_or(Error::Adaptive("encoded size overflow"))?;
+            self.enforce_byte_limit(required)?;
+            let mut output = Vec::with_capacity(required);
+            output.push(RAW_UTF8);
+            push_varint(&mut output, value.len() as u128);
+            output.extend_from_slice(value.as_bytes());
+            return Ok(output);
+        }
         let required = self.encoded_string_size(value)?;
         let mut output = Vec::new();
         output
@@ -74,7 +140,7 @@ impl AdaptiveConfig {
 
     /// Returns the exact adaptive string frame size without allocating.
     pub fn encoded_string_size(self, value: &str) -> Result<usize> {
-        let (_, _, required) = string_layout(value)?;
+        let (_, _, required) = string_layout(value, self.mode)?;
         self.enforce_byte_limit(required)?;
         Ok(required)
     }
@@ -83,7 +149,7 @@ impl AdaptiveConfig {
     ///
     /// The output is left untouched when it is too small.
     pub fn encode_string_into_slice(self, output: &mut [u8], value: &str) -> Result<usize> {
-        let (strategy, payload_size, required) = string_layout(value)?;
+        let (strategy, payload_size, required) = string_layout(value, self.mode)?;
         self.enforce_byte_limit(required)?;
         if output.len() < required {
             return Err(Error::BufferTooSmall {
@@ -223,6 +289,19 @@ impl AdaptiveConfig {
     /// Encodes an `i64` slice using raw, delta, or run-length varints.
     #[cfg(feature = "alloc")]
     pub fn encode_i64_slice(self, values: &[i64]) -> Result<Vec<u8>> {
+        if self.mode == AdaptiveMode::Off {
+            // Direct raw encoding with a single growing pass: the low-latency
+            // default never rescans the input to save a few bytes.
+            self.enforce_collection_limit(values.len())?;
+            let mut output = Vec::with_capacity(values.len().saturating_add(1));
+            output.push(RAW_INTEGERS);
+            push_varint(&mut output, values.len() as u128);
+            for value in values {
+                push_varint(&mut output, zigzag_i64(*value));
+            }
+            self.enforce_byte_limit(output.len())?;
+            return Ok(output);
+        }
         let required = self.encoded_i64_slice_size(values)?;
         let mut output = Vec::new();
         output
@@ -236,7 +315,7 @@ impl AdaptiveConfig {
     /// Returns the exact adaptive integer-collection frame size without allocating.
     pub fn encoded_i64_slice_size(self, values: &[i64]) -> Result<usize> {
         self.enforce_collection_limit(values.len())?;
-        let (_, _, required) = collection_layout(values)?;
+        let (_, _, required) = collection_layout(values, self.mode)?;
         self.enforce_byte_limit(required)?;
         Ok(required)
     }
@@ -246,7 +325,7 @@ impl AdaptiveConfig {
     /// The output is left untouched when it is too small.
     pub fn encode_i64_slice_into_slice(self, output: &mut [u8], values: &[i64]) -> Result<usize> {
         self.enforce_collection_limit(values.len())?;
-        let (strategy, _, required) = collection_layout(values)?;
+        let (strategy, _, required) = collection_layout(values, self.mode)?;
         self.enforce_byte_limit(required)?;
         if output.len() < required {
             return Err(Error::BufferTooSmall {
@@ -424,9 +503,13 @@ fn validate_ascii_padding(bytes: &[u8], meaningful_bits: usize) -> Result<()> {
     Ok(())
 }
 
-fn string_layout(value: &str) -> Result<(StringStrategy, usize, usize)> {
+fn string_layout(value: &str, mode: AdaptiveMode) -> Result<(StringStrategy, usize, usize)> {
     let raw_size = value.len();
-    let packed_size = if is_ascii(value.as_bytes()) {
+    // ASCII7 requires every scalar to be ASCII, so the scan cannot be sampled
+    // safely; `Off` skips the scan entirely and writes raw UTF-8.
+    let packed_size = if mode == AdaptiveMode::Off {
+        None
+    } else if is_ascii(value.as_bytes()) {
         Some(
             value
                 .len()
@@ -463,32 +546,15 @@ fn plain_varint_prefix(input: &[u8]) -> usize {
     input.iter().take_while(|&&byte| byte <= 250).count()
 }
 
-fn collection_layout(values: &[i64]) -> Result<(CollectionStrategy, usize, usize)> {
-    let raw_size = values.iter().try_fold(0usize, |size, value| {
+/// Exact byte size of the independent-ZigZag encoding of `values`.
+fn raw_size(values: &[i64]) -> Result<usize> {
+    values.iter().try_fold(0usize, |size, value| {
         size.checked_add(varint_size(zigzag_i64(*value)))
             .ok_or(Error::Adaptive("encoded size overflow"))
-    })?;
-    let delta_size = delta_size(values)?;
-    let rle_size = rle_size(values)?;
-    let strategy = if delta_size < raw_size && delta_size <= rle_size {
-        CollectionStrategy::Delta
-    } else if rle_size < raw_size {
-        CollectionStrategy::RunLength
-    } else {
-        CollectionStrategy::Raw
-    };
-    let payload_size = match strategy {
-        CollectionStrategy::Raw => raw_size,
-        CollectionStrategy::Delta => delta_size,
-        CollectionStrategy::RunLength => rle_size,
-    };
-    let required = 1usize
-        .checked_add(varint_size(values.len() as u128))
-        .and_then(|size| size.checked_add(payload_size))
-        .ok_or(Error::Adaptive("encoded size overflow"))?;
-    Ok((strategy, payload_size, required))
+    })
 }
 
+/// Exact byte size of the delta encoding of `values`.
 fn delta_size(values: &[i64]) -> Result<usize> {
     let Some(first) = values.first() else {
         return Ok(0);
@@ -501,6 +567,7 @@ fn delta_size(values: &[i64]) -> Result<usize> {
         })
 }
 
+/// Exact byte size of the run-length encoding of `values`.
 fn rle_size(values: &[i64]) -> Result<usize> {
     let mut size = 0usize;
     let mut start = 0;
@@ -516,6 +583,61 @@ fn rle_size(values: &[i64]) -> Result<usize> {
         start = end;
     }
     Ok(size)
+}
+
+/// Picks the smallest complete encoding from precomputed sizes.
+fn best_strategy(raw: usize, delta: usize, rle: usize) -> (CollectionStrategy, usize) {
+    if delta < raw && delta <= rle {
+        (CollectionStrategy::Delta, delta)
+    } else if rle < raw {
+        (CollectionStrategy::RunLength, rle)
+    } else {
+        (CollectionStrategy::Raw, raw)
+    }
+}
+
+fn collection_layout(
+    values: &[i64],
+    mode: AdaptiveMode,
+) -> Result<(CollectionStrategy, usize, usize)> {
+    let (strategy, payload_size) = match mode {
+        // Direct raw encoding: no analysis at all.
+        AdaptiveMode::Off => (CollectionStrategy::Raw, raw_size(values)?),
+        // Compare the whole collection exactly.
+        AdaptiveMode::Exact => {
+            let raw = raw_size(values)?;
+            let delta = delta_size(values)?;
+            let rle = rle_size(values)?;
+            best_strategy(raw, delta, rle)
+        }
+        // The sample covers everything: the comparison is exact and cheap.
+        AdaptiveMode::Heuristic if values.len() <= HEURISTIC_SAMPLE => {
+            let raw = raw_size(values)?;
+            let delta = delta_size(values)?;
+            let rle = rle_size(values)?;
+            best_strategy(raw, delta, rle)
+        }
+        // Sample a bounded prefix to pick a strategy, then take one full
+        // sizing pass under the chosen strategy.
+        AdaptiveMode::Heuristic => {
+            let sample = &values[..HEURISTIC_SAMPLE];
+            let raw = raw_size(sample)?;
+            let delta = delta_size(sample)?;
+            let rle = rle_size(sample)?;
+            let (chosen, _) = best_strategy(raw, delta, rle);
+            let payload = match chosen {
+                CollectionStrategy::Raw => raw_size(values)?,
+                CollectionStrategy::Delta => delta_size(values)?,
+                CollectionStrategy::RunLength => rle_size(values)?,
+            };
+            (chosen, payload)
+        }
+    };
+    let required = 1usize
+        .checked_add(varint_size(values.len() as u128))
+        .and_then(|size| size.checked_add(payload_size))
+        .ok_or(Error::Adaptive("encoded size overflow"))?;
+    Ok((strategy, payload_size, required))
 }
 
 const fn zigzag_i64(value: i64) -> u128 {
@@ -573,26 +695,20 @@ impl<'a> OutputCursor<'a> {
     }
 
     fn varint(&mut self, value: u128) {
-        match value {
-            0..=250 => self.byte(value as u8),
-            251..=0xffff => {
-                self.byte(251);
-                self.bytes(&(value as u16).to_le_bytes());
-            }
-            0x1_0000..=0xffff_ffff => {
-                self.byte(252);
-                self.bytes(&(value as u32).to_le_bytes());
-            }
-            0x1_0000_0000..=0xffff_ffff_ffff_ffff => {
-                self.byte(253);
-                self.bytes(&(value as u64).to_le_bytes());
-            }
-            _ => {
-                self.byte(254);
-                self.bytes(&value.to_le_bytes());
-            }
-        }
+        // Single source of truth: the canonical little-endian marker-varint
+        // (also used by the compact profile and the Kani proofs).
+        let (bytes, len) = encode_varint_le(value);
+        self.bytes(&bytes[..len]);
     }
+}
+
+/// Appends a canonical little-endian marker-varint to a growing vector.
+///
+/// Used by the `Off` owned-encode fast paths, which avoid a sizing pass by
+/// letting the output buffer grow.
+fn push_varint(output: &mut Vec<u8>, value: u128) {
+    let (bytes, len) = encode_varint_le(value);
+    output.extend_from_slice(&bytes[..len]);
 }
 
 struct Cursor<'a> {

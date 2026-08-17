@@ -18,9 +18,18 @@ trade-off rather than a win.
 
 The stream wire format is a **type-tagged, self-describing byte stream**:
 every value starts with a one-byte type tag, and arrays and objects end with
-`0xff`. That is the whole identity. It is not a bincode-style compact layout
-and it is not a CBOR-style length-prefixed layout, and it will not quietly
-become either of those.
+`0xff`. That is the whole identity of the *dynamic* stream. It is not a
+bincode-style compact layout and it is not a CBOR-style length-prefixed
+layout, and it will not quietly become either of those.
+
+For statically typed values the crate additionally ships a **schema-guided
+compact profile** (`Config::with_compact_format()` + the `CompactBinary`
+derive). It is a *second, additive* wire format, not a mode of the tagged
+stream: no per-value tags, no field names, length-prefixed containers, and
+memcpy / bulk-endian fast paths for byte strings and float arrays. `Value`,
+untagged enums, and `FormatEncoder`-driven types stay on the self-describing
+stream; static hot paths can take the compact profile. The two never change
+each other's bytes.
 
 Being self-describing buys three things the rest of the design leans on:
 
@@ -34,10 +43,11 @@ array. That tax is real, and it is measured rather than waved away — the
 benchmark lab in this repository reports it against bincode 1, bincode 2,
 bincode-next, postcard, rkyv, and minicbor on the same data, and the numbers
 are honest about where this format loses. If your workload is a giant array of
-`f64` and nothing else, a schemaless codec will beat this one on size and
-speed; take the schemaless codec. If your workload is heterogeneous records
-that must round-trip unambiguously and be readable without an out-of-band
-schema, the tag tax buys you that.
+`f64` and nothing else, a schemaless codec will beat the *tagged stream* on
+size and speed; the compact profile closes most of that gap while keeping the
+same bounded, resource-policed decoder. If your workload is heterogeneous
+records that must round-trip unambiguously and be readable without an
+out-of-band schema, the tag tax buys you that.
 
 The `archive` feature is **not a second stream format**. It is a separate
 storage format — rkyv's flat relative pointers inside a RustBinary envelope —
@@ -87,6 +97,7 @@ archive module, not by the hash primitive.
 | Capability                  | Status         | Notes                                                                                       |
 | --------------------------- | -------------- | ------------------------------------------------------------------------------------------- |
 | nextjson binary codec       | Implemented    | strict marker-varint profile and a fixed-width legacy profile                               |
+| Compact profile             | Implemented    | schema-guided `CompactBinary` derive: no tags/field names, length-prefixed containers, byte/float fast paths |
 | Adaptive integers/strings   | Implemented    | per-value width selection, ZigZag signed values, ASCII7 packing                             |
 | Adaptive `i64` collections  | Implemented    | raw / delta / run-length frames                                                             |
 | rANS entropy coding         | Implemented    | from-scratch static-model coder; hash-free replay verification                              |
@@ -291,6 +302,19 @@ be returned as `Cow::Borrowed`.
 data-aware APIs. Frames carry a stable strategy tag, and the decoder validates
 canonical varints, padding, lengths, delta overflow, and RLE runs.
 
+The encoder's analysis policy is controlled by
+`with_adaptive_mode(rustbinary::AdaptiveMode::…)`:
+
+- `Off` (default) — encode directly with the raw representation; **zero** scan
+  passes, the low-latency choice for online paths.
+- `Heuristic` — sample the first `HEURISTIC_SAMPLE` (64) elements to decide
+  whether delta / run-length pays off, then take a single sizing pass.
+- `Exact` — compare the complete raw / delta / run-length encodings and pick
+  the smallest; best for offline compression.
+
+The mode is **size-only**: every strategy is lossless, so all three modes
+decode to the same values; they differ in scan passes and frame size.
+
 ```rust
 let adaptive = rustbinary::options()
     .with_limit(1 << 20)
@@ -304,6 +328,16 @@ assert_eq!(adaptive.decode_i64_vec(&output)?, values);
 
 let encoded = adaptive.encode_string("telemetry/primary")?;
 assert_eq!(adaptive.decode_string(&encoded)?, "telemetry/primary");
+
+// Off (default) writes raw frames with no analysis scans; Exact picks delta
+// for ramp-like data.
+let off = rustbinary::options()
+    .with_adaptive_encoding()
+    .with_adaptive_mode(rustbinary::AdaptiveMode::Off);
+assert_eq!(
+    off.collection_strategy(&off.encode_i64_slice(&values)?)?,
+    rustbinary::CollectionStrategy::Raw
+);
 # Ok::<(), rustbinary::Error>(())
 ```
 

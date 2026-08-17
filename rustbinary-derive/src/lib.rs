@@ -20,6 +20,8 @@
 //! - [`Reflect`](derive@Reflect) generates allocation-free structural metadata.
 //! - [`BitPacked`](derive@BitPacked) generates a checked bit-level codec for
 //!   bounded fields and nested `BitPack` values.
+//! - [`CompactBinary`](derive@CompactBinary) generates the schema-guided
+//!   compact profile codec (`CompactEncode` + `CompactDecode`).
 //!
 //! The generated implementations are not a replacement for the nextjson
 //! derives. Add `NsonSerialize` and `NsonDeserialize` when the value also
@@ -29,6 +31,7 @@
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
+use syn::spanned::Spanned;
 use syn::{
     parse_macro_input, parse_quote, Data, DataEnum, DataStruct, DeriveInput, Expr, Fields,
     Generics, Lit, Meta, Type,
@@ -106,6 +109,266 @@ pub fn derive_bit_packed(input: TokenStream) -> TokenStream {
     bit_packed_impl(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
+}
+
+#[proc_macro_derive(CompactBinary, attributes(njson))]
+/// Derives `rustbinary::compact::CompactEncode` and
+/// `rustbinary::compact::CompactDecode` — the schema-guided compact binary
+/// profile.
+///
+/// Struct fields encode in declaration order with **no field names**; enums
+/// write only a compact variant discriminant; containers are length-prefixed.
+/// The generated codec bypasses the generic nextjson event path entirely, so
+/// the hot loop carries no type tags, no field-name handling and no dynamic
+/// dispatch. `#[njson(borrow)]` is accepted for nextjson compatibility and is
+/// otherwise ignored: borrowing follows the field type, so `&'a str` and
+/// `&'a [u8]` fields decode as zero-copy references into the input when
+/// `'de: 'a` holds. Unions are rejected.
+pub fn derive_compact_binary(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    compact_binary_impl(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn compact_binary_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let encode = compact_encode_impl(input)?;
+    let decode = compact_decode_impl(input)?;
+    Ok(quote!(#encode #decode))
+}
+
+fn compact_encode_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let generics = add_bound(
+        input.generics.clone(),
+        parse_quote!(::rustbinary::compact::CompactEncode),
+    );
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+    let body = match &input.data {
+        Data::Struct(data) => compact_encode_struct(data),
+        Data::Enum(data) => compact_encode_enum(data),
+        Data::Union(_) => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "CompactBinary cannot be derived for unions",
+            ))
+        }
+    }?;
+    Ok(quote! {
+        impl #impl_generics ::rustbinary::compact::CompactEncode for #name #type_generics #where_clause {
+            fn encode_compact<W: ::rustbinary::writer::EncodeWriter + ?Sized>(
+                &self,
+                writer: &mut W,
+            ) -> ::rustbinary::Result<()> {
+                #body
+                Ok(())
+            }
+        }
+    })
+}
+
+fn compact_encode_struct(data: &DataStruct) -> syn::Result<proc_macro2::TokenStream> {
+    let statements = data.fields.iter().enumerate().map(|(index, field)| {
+        let member = field
+            .ident
+            .clone()
+            .map(syn::Member::Named)
+            .unwrap_or_else(|| syn::Member::Unnamed(syn::Index::from(index)));
+        let ty = &field.ty;
+        quote! {
+            <#ty as ::rustbinary::compact::CompactEncode>::encode_compact(&self.#member, writer)?;
+        }
+    });
+    Ok(quote!(#(#statements)*))
+}
+
+fn compact_encode_enum(data: &DataEnum) -> syn::Result<proc_macro2::TokenStream> {
+    let mut arms = Vec::new();
+    for (index, variant) in data.variants.iter().enumerate() {
+        let variant_name = &variant.ident;
+        let discriminant = proc_macro2::Literal::u32_suffixed(index as u32);
+        let pattern = match &variant.fields {
+            Fields::Named(fields) => {
+                let names = fields
+                    .named
+                    .iter()
+                    .map(|field| field.ident.as_ref().expect("named"));
+                quote!(Self::#variant_name { #(#names),* })
+            }
+            Fields::Unnamed(_) => {
+                let bindings = (0..variant.fields.len())
+                    .map(|i| syn::Ident::new(&format!("field_{i}"), variant.ident.span()))
+                    .collect::<Vec<_>>();
+                quote!(Self::#variant_name(#(#bindings),*))
+            }
+            Fields::Unit => quote!(Self::#variant_name),
+        };
+        let payload = compact_variant_encode(&variant.fields)?;
+        arms.push(quote! {
+            #pattern => {
+                ::rustbinary::compact::encode_variant_index(writer, #discriminant)?;
+                #payload
+            }
+        });
+    }
+    Ok(quote!(match self { #(#arms),* }))
+}
+
+fn compact_variant_encode(fields: &Fields) -> syn::Result<proc_macro2::TokenStream> {
+    let statements = fields.iter().enumerate().map(|(index, field)| {
+        let binding: syn::Ident = match fields {
+            Fields::Named(_) => field.ident.clone().expect("named"),
+            _ => syn::Ident::new(&format!("field_{index}"), field.ty.span()),
+        };
+        let ty = &field.ty;
+        quote! {
+            <#ty as ::rustbinary::compact::CompactEncode>::encode_compact(#binding, writer)?;
+        }
+    });
+    Ok(quote!(#(#statements)*))
+}
+
+fn compact_decode_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+
+    // `impl` generics: `'de` first, `CompactDecode<'de>` bounds on every type
+    // parameter, and `'de: 'a` predicates so borrowed fields can borrow input.
+    let mut impl_generics = input.generics.clone();
+    impl_generics.params.insert(0, parse_quote!('de));
+    for parameter in impl_generics.type_params_mut() {
+        parameter
+            .bounds
+            .push(parse_quote!(::rustbinary::compact::CompactDecode<'de>));
+    }
+    let original_lifetimes: Vec<syn::Lifetime> = input
+        .generics
+        .lifetimes()
+        .map(|param| param.lifetime.clone())
+        .collect();
+    if !original_lifetimes.is_empty() {
+        let where_clause = impl_generics.make_where_clause();
+        for lifetime in &original_lifetimes {
+            where_clause.predicates.push(parse_quote!('de: #lifetime));
+        }
+    }
+
+    // Type generics come from the *original* generics: the type itself has no
+    // `'de` parameter.
+    let (_, type_generics, _) = input.generics.split_for_impl();
+    let (impl_generics, _, where_clause) = impl_generics.split_for_impl();
+
+    let body = match &input.data {
+        Data::Struct(data) => compact_decode_struct(name, data)?,
+        Data::Enum(data) => compact_decode_enum(data)?,
+        Data::Union(_) => unreachable!(),
+    };
+    Ok(quote! {
+        impl #impl_generics ::rustbinary::compact::CompactDecode<'de> for #name #type_generics #where_clause {
+            fn decode_compact(
+                cursor: &mut ::rustbinary::compact::CompactCursor<'de>,
+            ) -> ::rustbinary::Result<Self> {
+                #body
+            }
+        }
+    })
+}
+
+fn compact_decode_struct(
+    name: &syn::Ident,
+    data: &DataStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    match &data.fields {
+        Fields::Unit => Ok(quote!(Ok(#name))),
+        Fields::Named(fields) => {
+            let decodes = fields.named.iter().map(|field| {
+                let ident = field.ident.as_ref().expect("named");
+                let ty = &field.ty;
+                quote! {
+                    let #ident = <#ty as ::rustbinary::compact::CompactDecode<'de>>::decode_compact(cursor)?;
+                }
+            });
+            let names = fields
+                .named
+                .iter()
+                .map(|field| field.ident.as_ref().expect("named"));
+            Ok(quote! {
+                #(#decodes)*
+                Ok(#name { #(#names),* })
+            })
+        }
+        Fields::Unnamed(fields) => {
+            let names = (0..fields.unnamed.len())
+                .map(|i| syn::Ident::new(&format!("field_{i}"), name.span()))
+                .collect::<Vec<_>>();
+            let decodes = fields.unnamed.iter().zip(&names).map(|(field, ident)| {
+                let ty = &field.ty;
+                quote! {
+                    let #ident = <#ty as ::rustbinary::compact::CompactDecode<'de>>::decode_compact(cursor)?;
+                }
+            });
+            Ok(quote! {
+                #(#decodes)*
+                Ok(#name(#(#names),*))
+            })
+        }
+    }
+}
+
+fn compact_decode_enum(data: &DataEnum) -> syn::Result<proc_macro2::TokenStream> {
+    let arms = data
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let variant_name = &variant.ident;
+            let discriminant = proc_macro2::Literal::u32_suffixed(index as u32);
+            match &variant.fields {
+                Fields::Unit => quote!(#discriminant => Ok(Self::#variant_name)),
+                Fields::Unnamed(fields) => {
+                    let names = (0..fields.unnamed.len())
+                        .map(|i| syn::Ident::new(&format!("field_{i}"), variant.ident.span()))
+                        .collect::<Vec<_>>();
+                    let decodes = fields.unnamed.iter().zip(&names).map(|(field, ident)| {
+                        let ty = &field.ty;
+                        quote! {
+                            let #ident = <#ty as ::rustbinary::compact::CompactDecode<'de>>::decode_compact(cursor)?;
+                        }
+                    });
+                    quote! {
+                        #discriminant => {
+                            #(#decodes)*
+                            Ok(Self::#variant_name(#(#names),*))
+                        }
+                    }
+                }
+                Fields::Named(fields) => {
+                    let names = fields
+                        .named
+                        .iter()
+                        .map(|field| field.ident.as_ref().expect("named"))
+                        .collect::<Vec<_>>();
+                    let decodes = fields.named.iter().map(|field| {
+                        let ident = field.ident.as_ref().expect("named");
+                        let ty = &field.ty;
+                        quote! {
+                            let #ident = <#ty as ::rustbinary::compact::CompactDecode<'de>>::decode_compact(cursor)?;
+                        }
+                    });
+                    quote! {
+                        #discriminant => {
+                            #(#decodes)*
+                            Ok(Self::#variant_name { #(#names),* })
+                        }
+                    }
+                }
+            }
+        });
+    Ok(quote! {
+        match ::rustbinary::compact::decode_variant_index(cursor)? {
+            #(#arms,)*
+            _ => Err(::rustbinary::compact::__err_static("unknown compact enum variant")),
+        }
+    })
 }
 
 fn add_bound(mut generics: Generics, bound: syn::Path) -> Generics {

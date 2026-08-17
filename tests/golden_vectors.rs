@@ -69,7 +69,11 @@ fn protocol_bit_packed_vector_is_stable() {
 fn protocol_adaptive_delta_vector_is_stable() {
     let values = [1_000_i64, 1_001, 1_002, 1_003];
     let golden = [1, 4, 251, 208, 7, 2, 2, 2];
-    let config = rustbinary::options().with_adaptive_encoding();
+    // The delta vector locks the full-comparison wire form; the default
+    // `Off` mode encodes raw and is covered separately.
+    let config = rustbinary::options()
+        .with_adaptive_encoding()
+        .with_adaptive_mode(rustbinary::AdaptiveMode::Exact);
     let mut encoded = [0_u8; 16];
     let written = config
         .encode_i64_slice_into_slice(&mut encoded, &values)

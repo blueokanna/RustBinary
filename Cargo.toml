@@ -34,18 +34,24 @@ codegen-units = 1
 opt-level = 3
 
 [features]
-default = ["std"]
+default = ["std", "compact"]
 alloc = []
 std = ["alloc", "nextjson/std"]
 protocol = [
     "adaptive",
     "bit-packing",
+    "compact",
     "derive",
     "fingerprint",
     "reflection",
     "schema-evolution",
     "static-size",
 ]
+# Schema-guided compact profile: no per-value tags, no field names, and
+# length-prefixed containers with byte/float/string fast paths. See
+# `src/compact.rs` for the wire layout. Additive: it never changes the
+# self-describing profile's payloads.
+compact = ["alloc"]
 pipeline = ["cbor", "compression", "encryption", "parallel"]
 sync = ["entropy", "reconcile", "trust"]
 archive = ["std", "dep:memmap2", "dep:rkyv", "dep:blake3"]
@@ -83,6 +89,10 @@ required-features = [
     "simd",
     "static-size",
 ]
+
+[[example]]
+name = "compact_profile"
+required-features = ["compact", "derive"]
 
 [[example]]
 name = "adaptive_zero_alloc"

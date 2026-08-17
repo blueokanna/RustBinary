@@ -55,7 +55,12 @@
 //!
 //! # Format selection
 //!
-//! - [`Config`] is the core binary profile.
+//! - [`Config`] is the core binary profile (type-tagged, self-describing).
+//! - `compact` is a schema-guided compact profile for statically typed values:
+//!   no per-value tags, no field names, length-prefixed containers, and
+//!   byte/float/string fast paths. Select it with
+//!   [`Config::with_compact_format`] and derive `CompactEncode`/`CompactDecode`
+//!   with `#[derive(rustbinary::CompactBinary)]`.
 //! - `adaptive` contains canonical cost-selected string and integer frames.
 //! - `bitpack` provides generated bit-level layouts.
 //! - `cbor` provides RFC 8949 payloads and deterministic map ordering.
@@ -101,6 +106,9 @@ pub mod cbor;
 #[cfg(feature = "cbor")]
 /// Streaming RFC 8949 CBOR encoder/decoder (crate-private).
 mod cbor_codec;
+#[cfg(feature = "compact")]
+/// Schema-guided compact binary profile (no tags, no field names, length-prefixed containers).
+pub mod compact;
 #[cfg(feature = "compression")]
 /// Adaptive Zstandard framing.
 pub mod compression;
@@ -167,7 +175,9 @@ use alloc::vec::Vec;
 use std::io::{Read, Write};
 
 #[cfg(feature = "adaptive")]
-pub use adaptive::{AdaptiveConfig, CollectionStrategy, StringStrategy};
+pub use adaptive::{
+    AdaptiveConfig, AdaptiveMode, CollectionStrategy, StringStrategy, HEURISTIC_SAMPLE,
+};
 #[cfg(feature = "bit-packing")]
 pub use bitpack::{BitPack, BitPackedConfig, BitReader, BitValue, BitWriter};
 #[cfg(feature = "bounded")]
@@ -179,10 +189,12 @@ pub use bounded::{
 pub use cbor::CborConfig;
 #[cfg(all(feature = "cbor", feature = "fingerprint"))]
 pub use cbor::FingerprintedCborConfig;
+#[cfg(feature = "compact")]
+pub use compact::{CompactConfig, CompactCursor, CompactDecode, CompactEncode};
 #[cfg(feature = "compression")]
 pub use compression::CompressedConfig;
 pub use config::{
-    Config, Endian, IntEncoding, Options, TrailingBytes, DEFAULT_COLLECTION_LIMIT,
+    BinaryProfile, Config, Endian, IntEncoding, Options, TrailingBytes, DEFAULT_COLLECTION_LIMIT,
     DEFAULT_SIZE_LIMIT,
 };
 #[cfg(feature = "reconcile")]
@@ -223,6 +235,9 @@ pub use writer::{CountWriter, EncodeWriter, SliceWriter};
 
 #[cfg(all(feature = "derive", feature = "bit-packing"))]
 pub use rustbinary_derive::BitPacked;
+
+#[cfg(all(feature = "derive", feature = "compact"))]
+pub use rustbinary_derive::CompactBinary;
 
 #[cfg(feature = "bit-packing")]
 #[doc(hidden)]

@@ -742,6 +742,7 @@ name = "rustbinary"
 version = "0.1.7"
 dependencies = [
  "nextjson",
+ "rustbinary-derive",
 ]
 
 [[package]]
@@ -759,6 +760,15 @@ dependencies = [
  "rkyv",
  "rustbinary",
  "serde",
+]
+
+[[package]]
+name = "rustbinary-derive"
+version = "0.1.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

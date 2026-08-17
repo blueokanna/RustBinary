@@ -53,6 +53,29 @@ pub enum TrailingBytes {
     Reject,
 }
 
+/// The three wire profiles the codec offers for the same Rust value.
+///
+/// They coexist and compose; the profile is a property of the chosen
+/// configuration, never of the type itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryProfile {
+    /// Field-name-bearing, type-tagged, terminator-delimited stream.
+    ///
+    /// Backs dynamic [`nextjson::Value`]s, untagged enums, and
+    /// `FormatEncoder`-driven types. Compactness is secondary to flexibility.
+    SelfDescribing,
+    /// Schema-guided compact stream.
+    ///
+    /// No per-value tags, no field names, length-prefixed containers. See
+    /// [`crate::compact`] for the wire layout. Enabled with
+    /// [`Config::with_compact_format`].
+    CompactSchema,
+    /// Stable numeric field IDs with per-field lengths for forward compatibility.
+    ///
+    /// Enabled with [`Config::with_schema_evolution`].
+    Evolution,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Copyable configuration describing a complete wire profile.
 pub struct Config {
@@ -189,6 +212,20 @@ impl Config {
     pub const fn with_fingerprint(self) -> crate::FingerprintedConfig {
         crate::FingerprintedConfig::new(self)
     }
+    /// Selects the schema-guided compact profile.
+    ///
+    /// Carries over this config's resource policies (`limit`,
+    /// `collection_limit`, `depth_limit`, `trailing`). The compact wire is
+    /// always little-endian marker-varint; `Endian` and `IntEncoding` do not
+    /// alter it. Returns [`BinaryProfile::CompactSchema`].
+    #[cfg(feature = "compact")]
+    pub const fn with_compact_format(self) -> crate::CompactConfig {
+        crate::CompactConfig::new(self)
+    }
+    /// Returns the wire profile this configuration produces.
+    pub const fn profile(self) -> BinaryProfile {
+        BinaryProfile::SelfDescribing
+    }
     /// Switches to the RFC 8949 CBOR format while retaining resource policies.
     #[cfg(feature = "cbor")]
     pub const fn with_cbor_format(self) -> crate::CborConfig {
@@ -324,6 +361,15 @@ pub trait Options: Sized {
     }
     fn with_depth_limit(self, limit: usize) -> Config {
         self.config().with_depth_limit(limit)
+    }
+    /// Selects the schema-guided compact profile.
+    #[cfg(feature = "compact")]
+    fn with_compact_format(self) -> crate::CompactConfig {
+        crate::CompactConfig::new(self.config())
+    }
+    /// Returns the wire profile this configuration produces.
+    fn profile(self) -> BinaryProfile {
+        BinaryProfile::SelfDescribing
     }
     fn reject_trailing_bytes(self) -> Config {
         self.config().reject_trailing_bytes()

@@ -4,14 +4,41 @@ use crate::{Error, Result};
 ///
 /// Unlike [`std::io::Write`], this trait is available without `std` and models
 /// the codec's actual requirement: accepting a complete byte slice.
+///
+/// The optional container hooks let bounded writers track nesting depth
+/// exactly like the self-describing encoder does. Defaults are no-ops, so
+/// plain sinks (vectors, slices, counters) keep their zero-overhead behavior
+/// and external implementations remain source-compatible.
 pub trait EncodeWriter {
     /// Accepts all bytes or returns a codec error.
     fn write_all(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// Records that a length-prefixed container is being entered.
+    ///
+    /// The compact profile calls this once per collection so a bounded writer
+    /// can reject pathological nesting on encode (mirroring the decoder's
+    /// depth guard). The default does nothing.
+    fn enter_container(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Records that a length-prefixed container has been left.
+    ///
+    /// Always balances a preceding [`enter_container`](EncodeWriter::enter_container).
+    fn exit_container(&mut self) {}
 }
 
 impl<W: EncodeWriter + ?Sized> EncodeWriter for &mut W {
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         (**self).write_all(bytes)
+    }
+
+    fn enter_container(&mut self) -> Result<()> {
+        (**self).enter_container()
+    }
+
+    fn exit_container(&mut self) {
+        (**self).exit_container()
     }
 }
 

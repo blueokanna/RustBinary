@@ -12,6 +12,7 @@ exit status means its success and failure-path contracts both held.
 | `adaptive_zero_alloc` | Protocol | `cargo run --example adaptive_zero_alloc --features adaptive` |
 | `metadata` | Protocol | `cargo run --example metadata --features bit-packing,derive,fingerprint,reflection,static-size` |
 | `schema_evolution` | Protocol | `cargo run --example schema_evolution --features schema-evolution` |
+| `compact_profile` | Core | `cargo run --example compact_profile --features compact,derive` |
 | `secure_pipeline` | Pipeline | `cargo run --example secure_pipeline --features cbor,compression,encryption` |
 | `parallel_batch` | Pipeline | `cargo run --example parallel_batch --features parallel` |
 | `complete` | All layers | `cargo run --example complete --all-features` |
