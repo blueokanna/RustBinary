@@ -1,6 +1,6 @@
 //! # Compact schema-guided binary profile
 //!
-//! The **self-describing** profile (see [`crate::ser`] / [`crate::decoder`])
+//! The **self-describing** profile (see `crate::ser` / `crate::decoder`)
 //! trades compactness for dynamic flexibility: every value carries a one-byte
 //! type tag, struct fields are written as named object keys, and containers
 //! are `0xff`-terminated. For statically known types that overhead dominates:
@@ -21,7 +21,7 @@
 //!   `#[derive(rustbinary::CompactBinary)]` macro (or hand-written) that
 //!   encodes/decodes straight into the wire with no nextjson event dispatch,
 //!   no field-name handling and no per-value tag match.
-//! - [`crate::FormatEncoder`] / [`crate::FormatDecoder`] — the existing
+//! - [`nextjson::FormatEncoder`] / [`nextjson::FormatDecoder`] — the existing
 //!   generic path, kept for dynamic and framework-neutral values.
 //!
 //! # Wire layout
@@ -574,24 +574,11 @@ pub struct CompactCursor<'de> {
 
 impl<'de> CompactCursor<'de> {
     pub(crate) fn new(input: &'de [u8], config: Config) -> Self {
-        // A read only ever reaches `position ≤ input.len()`, so once the whole
-        // input fits within the byte limit, plain slice bounds already enforce
-        // it and the per-read branch is elided.
-        let limit_end = match config.limit {
-            Some(limit) => match usize::try_from(limit).ok() {
-                // A limit beyond addressable memory cannot be hit: slice
-                // bounds suffice.
-                None => None,
-                Some(limit) => {
-                    if input.len() > limit {
-                        Some(limit)
-                    } else {
-                        None
-                    }
-                }
-            },
-            None => None,
-        };
+        let limit_end = config.limit.and_then(|limit| {
+            usize::try_from(limit)
+                .ok()
+                .filter(|&limit| input.len() > limit)
+        });
         Self {
             input,
             position: 0,
@@ -1466,7 +1453,10 @@ impl_tuple!(A, B, C, D, E, F, G, H);
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The `vec!` macro is not in the prelude under `no_std`; the module's own
+    // `use alloc::vec::Vec` only imports the type.
     use alloc::string::ToString;
+    use alloc::vec;
 
     fn roundtrip<T>(value: &T) -> Vec<u8>
     where

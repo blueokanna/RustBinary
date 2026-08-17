@@ -78,7 +78,12 @@ struct Small {
     delta: i32,
 }
 
-#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    Debug,
+    nextjson::NsonSerialize,
+    nextjson::NsonDeserialize,
+    rustbinary::CompactBinary,
+)]
 struct RbSmall {
     enabled: bool,
     mode: u8,
@@ -176,7 +181,11 @@ fn messages() -> Vec<Msg> {
         .collect()
 }
 
-#[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    nextjson::NsonSerialize,
+    nextjson::NsonDeserialize,
+    rustbinary::CompactBinary,
+)]
 enum RbMsg {
     Version(u32),
     Heartbeat { seq: u64, ts: f64 },
@@ -255,7 +264,12 @@ fn borrowed_value() -> BorrowedOwned {
     }
 }
 
-#[derive(Debug, nextjson::NsonSerialize, nextjson::NsonDeserialize)]
+#[derive(
+    Debug,
+    nextjson::NsonSerialize,
+    nextjson::NsonDeserialize,
+    rustbinary::CompactBinary,
+)]
 struct RbBorrowed<'a> {
     id: u64,
     #[njson(borrow)]
@@ -423,6 +437,18 @@ fn homogeneous(c: &mut Criterion) {
             .unwrap()
     );
 
+    let compact = rustbinary::options()
+        .with_limit(1 << 20)
+        .with_compact_format();
+    let rb_compact = compact.serialize(&rb).unwrap();
+    codec_pair!(
+        group,
+        "rustbinary compact",
+        rb_compact,
+        compact.serialize(&rb).unwrap(),
+        compact.deserialize::<Vec<RbSmall>>(&rb_compact).unwrap()
+    );
+
     let ser: Vec<SerSmall> = values.iter().map(to_ser).collect();
     let b1 = bincode::serialize(&ser).unwrap();
     codec_pair!(
@@ -515,6 +541,18 @@ fn heterogeneous(c: &mut Criterion) {
             .unwrap()
     );
 
+    let compact = rustbinary::options()
+        .with_limit(1 << 20)
+        .with_compact_format();
+    let rb_compact = compact.serialize(&rb).unwrap();
+    codec_pair!(
+        group,
+        "rustbinary compact",
+        rb_compact,
+        compact.serialize(&rb).unwrap(),
+        compact.deserialize::<Vec<RbMsg>>(&rb_compact).unwrap()
+    );
+
     let ser: Vec<SerMsg> = values.iter().map(to_ser_msg).collect();
     let b1 = bincode::serialize(&ser).unwrap();
     codec_pair!(
@@ -600,6 +638,18 @@ fn borrowed(c: &mut Criterion) {
             .unwrap()
     );
 
+    let compact = rustbinary::options()
+        .with_limit(1 << 16)
+        .with_compact_format();
+    let rb_compact = compact.serialize(&rb).unwrap();
+    codec_pair!(
+        group,
+        "rustbinary compact",
+        rb_compact,
+        compact.serialize(&rb).unwrap(),
+        compact.deserialize::<RbBorrowed<'_>>(&rb_compact).unwrap()
+    );
+
     let ser = SerBorrowed {
         id: value.id,
         name: &value.name,
@@ -671,6 +721,19 @@ fn adversarial(c: &mut Criterion) {
             .with_collection_limit(200_000)
             .deserialize::<Vec<u64>>(&rb_bytes)
             .unwrap()
+    );
+
+    let compact = rustbinary::options()
+        .with_limit(1 << 22)
+        .with_collection_limit(200_000)
+        .with_compact_format();
+    let rb_compact = compact.serialize(&values).unwrap();
+    codec_pair!(
+        group,
+        "rustbinary compact",
+        rb_compact,
+        compact.serialize(&values).unwrap(),
+        compact.deserialize::<Vec<u64>>(&rb_compact).unwrap()
     );
 
     let b1 = bincode::serialize(&values).unwrap();
