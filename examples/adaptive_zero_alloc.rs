@@ -1,10 +1,13 @@
 use rustbinary::{protocol::CollectionStrategy, protocol::StringStrategy, Error};
 
 fn main() -> rustbinary::Result<()> {
+    // `Exact` explicitly: this example demonstrates the data-aware *selection*
+    // (delta / ASCII7), which `Off` (the low-latency default) skips.
     let codec = rustbinary::options()
         .with_limit(64 * 1024)
         .with_collection_limit(4096)
-        .with_adaptive_encoding();
+        .with_adaptive_encoding()
+        .with_adaptive_mode(rustbinary::AdaptiveMode::Exact);
 
     // A monotonic series normally selects delta encoding. Selection compares
     // complete payload sizes and has a deterministic tie-break order.
