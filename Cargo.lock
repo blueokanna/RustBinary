@@ -220,12 +220,23 @@ version = "0.1.8"
 dependencies = [
  "nextjson",
  "proptest",
- "rustbinary-derive",
+ "rustbinary-derive 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "rustbinary-derive"
 version = "0.1.5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "rustbinary-derive"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8ff15f5a7a6c6048ff7b7984847585e7cc70f36d80ed431bfbda42417f961c9"
 dependencies = [
  "proc-macro2",
  "quote",

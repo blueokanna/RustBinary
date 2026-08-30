@@ -132,7 +132,7 @@ required-features = ["trust", "std"]
 
 [dependencies]
 nextjson = { version = "0.1.4", default-features = false }
-rustbinary-derive = { version = "0.1.5", path = "rustbinary-derive", optional = true }
+rustbinary-derive = { version = "0.1.5", optional = true }
 
 [dev-dependencies]
 nextjson = { version = "0.1.4" }

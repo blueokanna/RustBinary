@@ -9,7 +9,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rustbinary = { path = "..", features = ["derive", "compact"] }
-nextjson = { version = "=0.1.4", features = ["derive"] }
+nextjson = { version = "0.1.4", features = ["derive"] }
 
 [[bin]]
 name = "decode_arbitrary_bytes"
