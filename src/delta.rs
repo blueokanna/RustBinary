@@ -288,9 +288,6 @@ impl<'a> DeltaCursor<'a> {
         let mut shift = 0u32;
         loop {
             let byte = self.byte()?;
-            // The final group may carry fewer than 7 meaningful bits (only
-            // bits 126..=127 of a u128 remain at shift 126); reject any group
-            // whose bits would overflow the type.
             if shift >= 128 {
                 return Err(Error::Delta("delta varint overflows u128"));
             }
@@ -331,6 +328,7 @@ impl<'a> DeltaCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn integer_delta_roundtrips_against_a_base() {
@@ -340,14 +338,10 @@ mod tests {
             let encoded = config.encode_delta(base, value).unwrap();
             assert_eq!(config.decode_delta(base, &encoded).unwrap(), value);
         }
-        // The full i128 range roundtrips against a zero base (MIN..MAX fits
-        // in a ZigZag u128, so no delta overflow is possible).
         for &value in &[i128::MIN, i128::MAX, 0] {
             let encoded = config.encode_delta(0, value).unwrap();
             assert_eq!(config.decode_delta(0, &encoded).unwrap(), value);
         }
-        // Identical values produce the smallest delta (zero); a larger delta
-        // needs more varint bytes.
         let zero = config.encode_delta(base, base).unwrap();
         let one = config.encode_delta(base, base + 1000).unwrap();
         assert!(zero.len() < one.len());

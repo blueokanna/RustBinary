@@ -128,7 +128,6 @@ impl EncodeWriter for CountWriter {
     }
 }
 
-#[cfg(feature = "alloc")]
 impl EncodeWriter for alloc::vec::Vec<u8> {
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         self.extend_from_slice(bytes);

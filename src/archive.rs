@@ -1,14 +1,15 @@
 //! Validated relative-pointer archives for read-only memory mapping.
 //!
-//! This module is deliberately separate from the nextjson stream codec. Archive
-//! values use rkyv's flat, relative-pointer layout and can be accessed in place
-//! after one structural validation pass. RustBinary adds a stable envelope,
-//! explicit application schema identifiers, resource limits, a read-only mmap
-//! owner, and a **Merkle tree over the payload**.
+//! This module is deliberately separate from the nextjson stream codec.
+//! Archive values use the in-tree [`crate::archive_codec`] flat,
+//! relative-pointer layout and can be accessed in place after one structural
+//! validation pass. RustBinary adds a stable envelope, explicit application
+//! schema identifiers, resource limits, a read-only mmap owner, and a
+//! **Merkle tree over the payload**.
 //!
-//! Every archive (format version 2) carries a SHA-256 Merkle root in the
-//! envelope. The hash is the dependency-free implementation in `hash` (no
-//! third-party hashing crate). A full [`crate::archive::MappedArchive::open`] validates the envelope, the
+//! Every archive (format version 4) carries a BLAKE3 Merkle root in the
+//! envelope, computed with the in-tree [`crate::hash`] implementation. A full
+//! [`crate::archive::MappedArchive::open`] validates the envelope, the
 //! relative-pointer graph, and the Merkle root once. For TB-scale archives,
 //! [`crate::archive::MappedArchive::open_header_only`] verifies only the envelope, and every
 //! byte range is then covered by a self-contained [`crate::archive::MerkleProof`] built from
@@ -22,6 +23,7 @@
 //! against every other process, so opening a file mapping is an unsafe
 //! operation with a precise safety contract.
 
+use alloc::{string::String, vec::Vec};
 use core::{fmt, marker::PhantomData, mem::align_of, ops::Range};
 use std::{
     fs::{self, File, OpenOptions},
@@ -29,41 +31,178 @@ use std::{
     path::Path,
 };
 
-use memmap2::{Mmap, MmapOptions};
-use rkyv::{
-    api::high::{HighSerializer, HighValidator},
-    bytecheck::CheckBytes,
-    rancor::Error as RkyvError,
-    ser::allocator::ArenaHandle,
-    util::AlignedVec,
-    Portable,
-};
+use crate::mmap::{Mmap, MmapOptions};
 
-use crate::ErrorCategory;
+use crate::{archive_codec, hash, ErrorCategory};
 
-/// BLAKE3 digest over `input` using the audited [`blake3`] crate.
+/// BLAKE3 digest over `input` using the in-tree [`crate::hash`] implementation.
 ///
 /// This is the single hashing entry point for the archive Merkle tree. The
-/// crate is the official, formally reviewed BLAKE3 implementation (as opposed
-/// to an in-tree reimplementation); domain separation and tree geometry are
-/// owned by this module, not by the hash primitive.
+/// algorithm follows draft-irtf-cfrg-blake3 (byte-for-byte compatible with
+/// the official crate); domain separation and tree geometry are owned by this
+/// module, not by the hash primitive.
 fn blake3(input: &[u8]) -> [u8; 32] {
-    *blake3_crate::hash(input).as_bytes()
+    hash::blake3(input)
 }
 
-use blake3 as blake3_crate;
-
 /// Re-exported derives and traits used to define archive-native types.
-pub use rkyv::{Archive, Deserialize, Serialize};
+///
+/// `Archive` is both a trait (the archived-mirror contract, type namespace)
+/// and a derive macro (macro namespace), so
+/// `#[derive(rustbinary::archive::Archive, rustbinary::archive::Serialize)]`
+/// resolves both. `Serialize` is a derive macro that generates the
+/// [`ArchiveWrite`] two-phase serializer.
+pub use crate::archive_codec::{Archive, ArchiveWrite, CheckBytes};
+#[cfg(feature = "derive")]
+pub use crate::{Archive, Serialize};
 
-const MAGIC: [u8; 8] = *b"RBARC002";
-const FORMAT_VERSION: u16 = 2;
+/// Owned byte buffer with a guaranteed minimum alignment.
+///
+/// The archive envelope keeps a 64-byte alignment contract so the payload root
+/// and every element array start on an alignment boundary.
+struct AlignedBytes<const ALIGN: usize> {
+    ptr: core::ptr::NonNull<u8>,
+    capacity: usize,
+    len: usize,
+}
+
+impl<const ALIGN: usize> AlignedBytes<ALIGN> {
+    /// Creates an empty buffer that allocates on first write.
+    fn new() -> Self {
+        Self {
+            ptr: core::ptr::NonNull::dangling(),
+            capacity: 0,
+            len: 0,
+        }
+    }
+
+    /// Creates an empty buffer with `capacity` bytes pre-allocated.
+    fn with_capacity(capacity: usize) -> Self {
+        let mut buffer = Self::new();
+        buffer.reserve(capacity);
+        buffer
+    }
+
+    /// Grows the allocation so at least `additional` more bytes fit.
+    fn reserve(&mut self, additional: usize) {
+        let needed = self.len.saturating_add(additional);
+        if needed <= self.capacity {
+            return;
+        }
+        let capacity = needed.max(self.capacity.saturating_mul(2));
+        // SAFETY: `ALIGN` is a power of two and `capacity > 0`, so the layout
+        // is valid.
+        let layout = core::alloc::Layout::from_size_align(capacity, ALIGN)
+            .expect("aligned byte buffer layout is valid");
+        // SAFETY: the layout is valid for `capacity` bytes of `ALIGN` alignment.
+        let new_ptr = unsafe { std::alloc::alloc(layout) };
+        let new_ptr = core::ptr::NonNull::new(new_ptr).expect("allocation failed");
+        if self.len != 0 {
+            // SAFETY: `self.ptr` and `new_ptr` are both `ALIGN`-aligned,
+            // `self.len <= capacity`, and the ranges do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
+            }
+        }
+        if self.capacity != 0 {
+            // SAFETY: `self.ptr` was allocated with the previous layout.
+            let old_layout = core::alloc::Layout::from_size_align(self.capacity, ALIGN)
+                .expect("previous aligned layout is valid");
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), old_layout) };
+        }
+        self.ptr = new_ptr;
+        self.capacity = capacity;
+    }
+
+    /// Appends `bytes`, reallocating if needed.
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.reserve(bytes.len());
+        if !bytes.is_empty() {
+            // SAFETY: after `reserve`, `self.len + bytes.len() <= self.capacity`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.ptr.as_ptr().add(self.len),
+                    bytes.len(),
+                );
+            }
+            self.len += bytes.len();
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `self.len` initialized bytes live at `self.ptr`.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `self.len` initialized bytes live at `self.ptr` and the
+        // buffer is exclusively borrowed.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<const ALIGN: usize> core::ops::Deref for AlignedBytes<ALIGN> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl<const ALIGN: usize> core::ops::DerefMut for AlignedBytes<ALIGN> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+impl<const ALIGN: usize> Drop for AlignedBytes<ALIGN> {
+    fn drop(&mut self) {
+        if self.capacity != 0 {
+            // SAFETY: `self.ptr` was allocated with the same aligned layout.
+            let layout = core::alloc::Layout::from_size_align(self.capacity, ALIGN)
+                .expect("aligned layout is valid");
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+/// Zero-copy access to an archived root after the caller has validated the
+/// payload.
+///
+/// The archived mirror is a `#[repr(C)]` struct with alignment at most 8 (the
+/// archive only contains scalars up to 8 bytes and 4-aligned `RelPtr` fields);
+/// the 128-byte envelope keeps the payload base 8-aligned, and the callers in
+/// this module verify that before casting. This function owns the single
+/// aligned cast.
+///
+/// # Safety
+///
+/// `bytes` must hold a valid archived `A` at its base and the pointer must
+/// satisfy `align_of::<A>()`.
+unsafe fn access_unchecked<A>(bytes: &[u8]) -> &A {
+    // The in-tree archive layout stores the archived root at the START of the
+    // payload. The root is `size_of::<A>()` bytes at offset 0.
+    debug_assert!(bytes.len() >= core::mem::size_of::<A>());
+    let root = &bytes[..core::mem::size_of::<A>()];
+    debug_assert_eq!(
+        root.as_ptr() as usize % core::mem::align_of::<A>(),
+        0,
+        "archived access requires alignment"
+    );
+    // SAFETY: caller guarantees `bytes` holds a valid archived `A` at its
+    // start.
+    unsafe { &*root.as_ptr().cast::<A>() }
+}
+
+const MAGIC: [u8; 8] = *b"RBARC004";
+const FORMAT_VERSION: u16 = 4;
 /// Format flag: the payload carries a Merkle tree with the recorded root.
-/// Merkle verification is mandatory in format version 2.
+/// Merkle verification is mandatory in format version 4.
 const FLAG_MERKLE: u16 = 0x0001;
 const FORMAT_FLAGS: u16 = FLAG_MERKLE;
 const HEADER_LEN: usize = 128;
-/// Byte offset of the rkyv payload within an archive file.
+/// Byte offset of the archive payload within an archive file.
 pub const PAYLOAD_OFFSET: usize = HEADER_LEN;
 const MAX_ARCHIVE_ALIGNMENT: usize = 64;
 
@@ -162,7 +301,7 @@ impl ArchiveHeader {
         self.schema_id
     }
 
-    /// Returns the rkyv payload length in bytes.
+    /// Returns the archive payload length in bytes.
     pub const fn payload_len(self) -> u64 {
         self.payload_len
     }
@@ -594,7 +733,7 @@ impl MerkleProof {
     }
 
     /// Number of blocks carried by the proof.
-    pub const fn block_count(&self) -> usize {
+    pub fn block_count(&self) -> usize {
         self.blocks.len()
     }
 
@@ -664,7 +803,7 @@ impl MerkleProof {
 
 /// Immutable, aligned archive bytes owned by the current process.
 pub struct OwnedArchive<T: ArchiveSchema> {
-    bytes: AlignedVec<MAX_ARCHIVE_ALIGNMENT>,
+    bytes: AlignedBytes<MAX_ARCHIVE_ALIGNMENT>,
     payload: Range<usize>,
     hash_section: Range<usize>,
     header: ArchiveHeader,
@@ -682,7 +821,7 @@ impl<T: ArchiveSchema> OwnedArchive<T> {
         &self.bytes
     }
 
-    /// Returns the validated rkyv payload bytes without the envelope.
+    /// Returns the validated archive payload bytes without the envelope.
     pub fn payload(&self) -> &[u8] {
         &self.bytes[self.payload.clone()]
     }
@@ -730,13 +869,15 @@ impl<T: ArchiveSchema> OwnedArchive<T> {
 impl<T> OwnedArchive<T>
 where
     T: ArchiveSchema,
-    T::Archived: Portable,
 {
     /// Returns the archived root without allocating or deserializing.
     pub fn root(&self) -> &T::Archived {
-        // SAFETY: `build` validates the immutable private payload before
-        // constructing `OwnedArchive`; callers can only borrow these bytes.
-        unsafe { rkyv::access_unchecked::<T::Archived>(self.payload()) }
+        // SAFETY: `build` validates the immutable private payload (Merkle
+        // root, relative-pointer graph, alignment) before constructing
+        // `OwnedArchive`; the buffer is `ALIGN`-aligned and the 128-byte
+        // envelope keeps the payload base `ALIGN`-aligned, so the cast is
+        // aligned and valid.
+        unsafe { access_unchecked::<T::Archived>(self.payload()) }
     }
 }
 
@@ -752,7 +893,7 @@ pub struct MappedArchive<T: ArchiveSchema> {
 impl<T> MappedArchive<T>
 where
     T: ArchiveSchema,
-    T::Archived: Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
+    T::Archived: CheckBytes,
 {
     /// Opens, maps, and fully validates an immutable archive file.
     ///
@@ -799,8 +940,8 @@ where
     /// This is the O(1) entry point for TB-scale archives. The returned owner
     /// exposes [`Self::proof_for`] for per-range proofs and **does not** expose
     /// `root()`: typed zero-copy access requires either a full [`Self::open`]
-    /// or a verified [`MerkleProof::extract`] followed by an explicit rkyv
-    /// `access` on the extracted bytes.
+    /// or a verified [`MerkleProof::extract`] followed by an explicit
+    /// [`access`] on the extracted bytes.
     ///
     /// # Safety
     ///
@@ -848,7 +989,7 @@ where
         &self.map
     }
 
-    /// Returns the mapped rkyv payload bytes without the envelope.
+    /// Returns the mapped archive payload bytes without the envelope.
     pub fn payload(&self) -> &[u8] {
         &self.map[self.payload.clone()]
     }
@@ -876,8 +1017,10 @@ where
     /// Returns the archived root without allocation or deserialization.
     pub fn root(&self) -> &T::Archived {
         // SAFETY: `open` structurally validates the read-only payload, and its
-        // safety contract requires the mapped file to remain immutable.
-        unsafe { rkyv::access_unchecked::<T::Archived>(self.payload()) }
+        // safety contract requires the mapped file to remain immutable. The
+        // mmap base is page-aligned and the 128-byte envelope keeps the
+        // payload base `ALIGN`-aligned, so the cast is aligned and valid.
+        unsafe { access_unchecked::<T::Archived>(self.payload()) }
     }
 }
 
@@ -906,7 +1049,7 @@ impl<T: ArchiveSchema> MappedArchiveHeader<T> {
         &self.map
     }
 
-    /// Returns the mapped rkyv payload bytes without the envelope.
+    /// Returns the mapped archive payload bytes without the envelope.
     pub fn payload(&self) -> &[u8] {
         &self.map[self.payload.clone()]
     }
@@ -932,9 +1075,8 @@ impl<T: ArchiveSchema> MappedArchiveHeader<T> {
 /// Builds and validates an aligned, versioned archive in owned memory.
 pub fn build<T>(value: &T, limits: ArchiveLimits) -> Result<OwnedArchive<T>, ArchiveError>
 where
-    T: ArchiveSchema
-        + for<'a> rkyv::Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    T::Archived: Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
+    T: ArchiveSchema + ArchiveWrite,
+    T::Archived: CheckBytes,
 {
     validate_schema_id::<T>()?;
     validate_alignment::<T>()?;
@@ -945,8 +1087,7 @@ where
         ));
     }
 
-    let payload = rkyv::to_bytes::<RkyvError>(value)
-        .map_err(|error| ArchiveError::Serialization(error.to_string()))?;
+    let payload = archive_codec::to_archive(value).map_err(ArchiveError::Serialization)?;
     let payload_len = u64::try_from(payload.len()).map_err(|_| ArchiveError::SizeLimit {
         limit: limits.max_file_size(),
         actual: u64::MAX,
@@ -988,7 +1129,7 @@ where
         limit: limits.max_file_size(),
         actual: file_len,
     })?;
-    let mut bytes = AlignedVec::<MAX_ARCHIVE_ALIGNMENT>::with_capacity(capacity);
+    let mut bytes = AlignedBytes::<MAX_ARCHIVE_ALIGNMENT>::with_capacity(capacity);
     bytes.extend_from_slice(&encode_header(header));
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&hash_section);
@@ -1011,11 +1152,13 @@ where
 pub fn access<T>(bytes: &[u8], limits: ArchiveLimits) -> Result<&T::Archived, ArchiveError>
 where
     T: ArchiveSchema,
-    T::Archived: Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
+    T::Archived: CheckBytes,
 {
     let (_, payload, _) = validate_archive::<T>(bytes, limits)?;
-    rkyv::access::<T::Archived, RkyvError>(&bytes[payload])
-        .map_err(|error| ArchiveError::Validation(error.to_string()))
+    // SAFETY: `validate_archive` proved the relative-pointer graph, the
+    // Merkle root, and the envelope; the archived root is packed (alignment
+    // 1), so the cast is aligned and the bytes hold a valid `T::Archived`.
+    Ok(unsafe { access_unchecked::<T::Archived>(&bytes[payload]) })
 }
 
 /// Derives the payload and hash-section byte ranges from a parsed header.
@@ -1054,7 +1197,7 @@ fn validate_archive<T>(
 ) -> Result<(ArchiveHeader, Range<usize>, Range<usize>), ArchiveError>
 where
     T: ArchiveSchema,
-    T::Archived: Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
+    T::Archived: CheckBytes,
 {
     validate_schema_id::<T>()?;
     validate_alignment::<T>()?;
@@ -1067,8 +1210,13 @@ where
     }
     let (payload, hash_section) = ranges_from_header(bytes.len(), header)?;
     let payload_bytes = &bytes[payload.clone()];
+    // The archived root is `#[repr(C)]` with alignment at most 8 (u64/i64/f64
+    // fields; strings and vecs are 4-aligned RelPtrs). Zero-copy access casts
+    // the payload base to `&T::Archived`, so the base must satisfy that
+    // alignment. In practice the envelope keeps the payload base at offset
+    // 128 on an aligned buffer, but a caller-supplied slice may not.
     let required_alignment = align_of::<T::Archived>();
-    if !(payload_bytes.as_ptr() as usize).is_multiple_of(required_alignment) {
+    if (payload_bytes.as_ptr() as usize) % required_alignment != 0 {
         return Err(ArchiveError::Validation(
             "payload base does not satisfy archived root alignment".into(),
         ));
@@ -1110,8 +1258,9 @@ where
         }
     }
     let _ = levels;
-    rkyv::access::<T::Archived, RkyvError>(payload_bytes)
-        .map_err(|error| ArchiveError::Validation(error.to_string()))?;
+    // Structural validation of the relative-pointer graph, rooted at the
+    // archived root (payload offset 0).
+    T::Archived::check_at(payload_bytes, 0).map_err(ArchiveError::Validation)?;
     Ok((header, payload, hash_section))
 }
 
@@ -1312,10 +1461,7 @@ fn validate_schema_id<T: ArchiveSchema>() -> Result<(), ArchiveError> {
     }
 }
 
-fn validate_alignment<T: ArchiveSchema>() -> Result<(), ArchiveError>
-where
-    T::Archived: Portable,
-{
+fn validate_alignment<T: ArchiveSchema>() -> Result<(), ArchiveError> {
     let required = align_of::<T::Archived>();
     if required > MAX_ARCHIVE_ALIGNMENT {
         Err(ArchiveError::UnsupportedAlignment {
@@ -1348,6 +1494,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
+    use alloc::vec;
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -1374,6 +1522,7 @@ mod tests {
     }
 
     #[derive(Archive, Serialize)]
+    #[archive(check_bytes)]
     struct Root {
         sequence: u64,
         name: String,
@@ -1385,6 +1534,7 @@ mod tests {
     }
 
     #[derive(Archive, Serialize)]
+    #[archive(check_bytes)]
     struct OtherRoot {
         sequence: u64,
         name: String,
@@ -1396,6 +1546,7 @@ mod tests {
     }
 
     #[derive(Archive)]
+    #[archive(check_bytes)]
     struct InvalidSchemaRoot;
 
     impl ArchiveSchema for InvalidSchemaRoot {
@@ -1422,8 +1573,8 @@ mod tests {
         let archive = build(&value(), ArchiveLimits::new()).unwrap();
         let bytes = archive.as_bytes();
         // Envelope format anchors (the format-stability contract).
-        assert_eq!(&bytes[..8], b"RBARC002");
-        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 2);
+        assert_eq!(&bytes[..8], b"RBARC004");
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 4);
         assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), FLAG_MERKLE);
         assert_eq!(
             u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
@@ -1525,7 +1676,7 @@ mod tests {
             ErrorCategory::Protocol
         );
 
-        let mut invalid_graph = AlignedVec::<MAX_ARCHIVE_ALIGNMENT>::new();
+        let mut invalid_graph = AlignedBytes::<MAX_ARCHIVE_ALIGNMENT>::new();
         invalid_graph.extend_from_slice(archive.as_bytes());
         // Rewrite both the payload and the hash section; the Merkle root in
         // the header no longer matches the recomputed tree.
@@ -1557,6 +1708,7 @@ mod tests {
     }
 
     #[derive(Archive, Serialize)]
+    #[archive(check_bytes)]
     struct WideRoot {
         sequence: u64,
         samples: Vec<u8>,

@@ -1,8 +1,10 @@
-use std::io::{Cursor, Read, Write};
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use std::io::{Read, Write};
 
 #[cfg(feature = "cbor")]
 use crate::CborConfig;
-use crate::{Config, Error, Result, TrailingBytes};
+use crate::{lz, Config, Error, Result, TrailingBytes};
 
 const MAGIC: [u8; 4] = *b"RBZ1";
 const VERSION: u16 = 1;
@@ -17,7 +19,13 @@ enum PayloadFormat {
     Cbor(CborConfig),
 }
 
-/// Adaptive Zstandard compression integrated with a RustBinary payload format.
+/// Adaptive LZ77 compression integrated with a RustBinary payload format.
+///
+/// The compressor is the in-tree LZ77 implementation (`src/lz.rs`): a
+/// 32 KiB sliding-window matcher with a packed bitstream. The `level` is a
+/// search-effort hint (1..=22); higher levels find longer matches at higher
+/// CPU cost. The `threshold` is the minimum raw payload size worth
+/// compressing at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompressedConfig {
     payload: PayloadFormat,
@@ -49,7 +57,7 @@ impl CompressedConfig {
         self
     }
 
-    /// Returns the configured Zstandard compression level.
+    /// Returns the configured compression level (a 1..=22 search-effort hint).
     pub const fn compression_level(self) -> i32 {
         self.level
     }
@@ -69,10 +77,12 @@ impl CompressedConfig {
     pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         let raw = self.serialize_payload(value)?;
         let compressed = if raw.len() >= self.threshold {
-            Some(
-                zstd::stream::encode_all(Cursor::new(&raw), self.level)
-                    .map_err(compression_error)?,
-            )
+            let packed = lz::compress(&raw, self.level);
+            if packed.is_empty() {
+                None
+            } else {
+                Some(packed)
+            }
         } else {
             None
         };
@@ -104,24 +114,16 @@ impl CompressedConfig {
         self,
         input: &[u8],
     ) -> Result<T> {
-        // Enforce the declared raw-length limit before validating the frame
-        // body, so an oversized header fails fast with SizeLimit instead of
-        // a structural frame error or an unbounded decompression.
         let header = input.get(..HEADER_LEN).ok_or(Error::UnexpectedEnd)?;
         let (_, declared_raw_len, _) = parse_header(header)?;
         self.enforce_raw_limit(declared_raw_len)?;
         let (flags, raw_len, stored_len, stored) = parse_frame(input, self.trailing_policy())?;
         let payload = if flags & COMPRESSED != 0 {
-            let decoder =
-                zstd::stream::read::Decoder::new(Cursor::new(stored)).map_err(compression_error)?;
             let cap = raw_len
                 .checked_add(1)
                 .ok_or(Error::SizeLimit { limit: u64::MAX })?;
-            let mut payload = Vec::new();
-            decoder
-                .take(cap)
-                .read_to_end(&mut payload)
-                .map_err(compression_error)?;
+            let payload = lz::decompress(stored, cap as usize)
+                .map_err(|error| Error::Compression(error.to_string()))?;
             if payload.len() as u64 != raw_len {
                 return Err(Error::InvalidFrame(
                     "decompressed length does not match compression header",
@@ -199,10 +201,6 @@ impl CompressedConfig {
             #[cfg(feature = "cbor")]
             PayloadFormat::Cbor(config) => config.base_config().limit,
         };
-        // Decompression is always bounded. Without a configured limit
-        // (`legacy()` / `with_no_limit()`), fall back to the crate-wide
-        // default so a hostile frame cannot drive an unbounded expansion
-        // (decompression bomb) from an attacker-controlled header.
         let bound = limit.unwrap_or(crate::DEFAULT_SIZE_LIMIT);
         if raw_len > bound {
             return Err(Error::SizeLimit { limit: bound });
@@ -217,8 +215,6 @@ impl CompressedConfig {
             #[cfg(feature = "cbor")]
             PayloadFormat::Cbor(config) => config.base_config().limit,
         };
-        // Mirrors `enforce_raw_limit`: the envelope bounds the plaintext even
-        // when no explicit limit is configured.
         let bound = match limit {
             Some(limit) => limit,
             None => crate::DEFAULT_SIZE_LIMIT,
@@ -292,8 +288,4 @@ fn parse_frame(input: &[u8], trailing: TrailingBytes) -> Result<(u16, u64, u64, 
         });
     }
     Ok((flags, raw_len, stored_len as u64, stored))
-}
-
-fn compression_error(error: impl std::fmt::Display) -> Error {
-    Error::Compression(error.to_string())
 }

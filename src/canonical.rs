@@ -79,6 +79,32 @@ pub(crate) fn decode_varint_le(marker: u8, payload: &[u8]) -> Option<u128> {
     }
 }
 
+/// Decodes a canonical marker-varint whose value fits in `u64`.
+///
+/// This is the hot-path sibling of [`decode_varint_le`] for readers that
+/// target `u64` (the compact profile's `Vec<u64>` loops and single `u64`
+/// values): it keeps the value in `u64` the whole way instead of widening
+/// through `u128` and re-narrowing, which the compiler cannot always elide.
+/// Canonicality is enforced identically.
+///
+/// Returns `None` for `MARKER_U128` and reserved markers. Callers reading
+/// `u64` must route `MARKER_U128` through [`decode_varint_le`] and report a
+/// value above `u64::MAX` as an overflow (not a canonicality failure).
+pub(crate) fn decode_varint_le_u64(marker: u8, payload: &[u8]) -> Option<u64> {
+    let (value, minimum) = match marker {
+        0..=250 => return Some(marker as u64),
+        MARKER_U16 => (read_le16(payload)? as u64, 251),
+        MARKER_U32 => (read_le32(payload)? as u64, 0x1_0000),
+        MARKER_U64 => (read_le64(payload)?, 0x1_0000_0000),
+        _ => return None,
+    };
+    if value < minimum {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// ZigZag-encodes an `i128` into an unsigned `u128`.
 pub(crate) const fn zigzag_encode(value: i128) -> u128 {
     ((value << 1) ^ (value >> 127)) as u128

@@ -14,7 +14,11 @@
 //! retaining them, so that mode materializes a normalized value tree before
 //! encoding. It is opt-in and its cost is documented on the method itself.
 
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use nextjson::Value;
 
@@ -81,8 +85,14 @@ impl CborConfig {
         FingerprintedCborConfig { config: self }
     }
 
-    /// Wraps CBOR payloads in an adaptive Zstandard compression frame.
+    /// Wraps CBOR payloads in an in-tree LZ77 compression frame.
     #[cfg(feature = "compression")]
+    pub const fn with_compression(self, level: i32) -> crate::CompressedConfig {
+        crate::CompressedConfig::cbor(self, level)
+    }
+    /// Legacy name for [`CborConfig::with_compression`].
+    #[cfg(feature = "compression")]
+    #[deprecated(note = "use `with_compression`; the frame is the in-tree LZ77 codec")]
     pub const fn with_zstd_compression(self, level: i32) -> crate::CompressedConfig {
         crate::CompressedConfig::cbor(self, level)
     }
@@ -95,15 +105,14 @@ impl CborConfig {
 
     /// Encodes a value as CBOR.
     pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        self.serialize_into(&mut output, value)?;
-        Ok(output)
+        self.encode_value(value)
     }
 
     /// Encodes CBOR directly into a writer.
     ///
     /// The payload is produced by the crate's streaming CBOR encoder, so no
     /// intermediate representation is built beyond the emitted bytes.
+    #[cfg(feature = "std")]
     pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
         self,
         mut writer: W,
@@ -159,6 +168,7 @@ impl CborConfig {
     }
 
     /// Decodes one owned CBOR value from a reader.
+    #[cfg(feature = "std")]
     pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
         self,
         mut reader: R,
@@ -194,11 +204,13 @@ impl FingerprintedCborConfig {
         value: &T,
     ) -> Result<Vec<u8>> {
         let mut output = Vec::new();
-        self.serialize_into(&mut output, value)?;
+        output.extend_from_slice(&encode_header(FRAME_MAGIC, self.config.fingerprint::<T>()));
+        output.extend_from_slice(&self.config.encode_value(value)?);
         Ok(output)
     }
 
     /// Writes a fingerprinted CBOR frame directly into a writer.
+    #[cfg(feature = "std")]
     pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + Fingerprint + ?Sized>(
         self,
         mut writer: W,
@@ -218,6 +230,7 @@ impl FingerprintedCborConfig {
     }
 
     /// Reads and validates one fingerprinted CBOR value.
+    #[cfg(feature = "std")]
     pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de> + Fingerprint>(
         self,
         mut reader: R,
@@ -270,7 +283,7 @@ fn canonicalize(value: Value) -> Result<Value> {
     }
 }
 
-fn canonical_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+fn canonical_cmp(left: &[u8], right: &[u8]) -> core::cmp::Ordering {
     left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 

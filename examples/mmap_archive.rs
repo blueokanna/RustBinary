@@ -55,6 +55,7 @@ impl Drop for TemporaryArchive {
 }
 
 #[derive(Archive, Serialize)]
+#[archive(check_bytes)]
 struct Reading {
     sensor_id: u32,
     label: String,
@@ -62,6 +63,7 @@ struct Reading {
 }
 
 #[derive(Archive, Serialize)]
+#[archive(check_bytes)]
 struct Catalog {
     generation: u64,
     site: String,

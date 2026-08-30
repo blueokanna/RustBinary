@@ -25,9 +25,12 @@
 //! deserialization; application-specific verifiers (MACs, signatures, keyed
 //! handshakes) implement [`crate::Verifier`].
 
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use alloc::vec;
 use alloc::vec::Vec;
 
 use core::marker::PhantomData;
@@ -239,12 +242,21 @@ impl<C: Codec> TrustedConfig<C, Authenticated> {
 }
 
 /// Session state marker trait.
+///
+/// The duplex [`Session`] machinery requires byte-level I/O and is therefore
+/// only available with the `std` feature; the [`TrustedConfig`] type-level
+/// calculus above it is `no_std`.
+#[cfg(feature = "std")]
 pub trait SessionState {}
+#[cfg(feature = "std")]
 impl SessionState for Handshake {}
+#[cfg(feature = "std")]
 impl SessionState for Authenticated {}
+#[cfg(feature = "std")]
 impl SessionState for Closed {}
 
 /// Marker for the initial session state: no receiving is possible.
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Handshake;
 
@@ -256,6 +268,7 @@ pub struct Handshake;
 /// [`Session::close`] it is in the terminal [`Closed`] state and exposes
 /// nothing. The session is generic over any [`Codec`], so it composes with
 /// every configuration in the transform chain, not just [`Config`].
+#[cfg(feature = "std")]
 pub struct Session<C: Codec, S: SessionState, R> {
     codec: C,
     max_frame_len: Option<u64>,
@@ -264,6 +277,7 @@ pub struct Session<C: Codec, S: SessionState, R> {
     marker: PhantomData<S>,
 }
 
+#[cfg(feature = "std")]
 impl<C: Codec, R: Read> Session<C, Handshake, R> {
     /// Starts a handshake session over `reader`.
     pub fn new(codec: C, reader: R) -> Self {
@@ -298,6 +312,7 @@ impl<C: Codec, R: Read> Session<C, Handshake, R> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<C: Codec, R: Read> Session<C, Authenticated, R> {
     /// Reads one length-prefixed frame, authenticates it, and deserializes.
     pub fn recv<T: for<'a> nextjson::NsonDeserialize<'a>>(&mut self) -> Result<T> {
@@ -359,11 +374,13 @@ impl<C: Codec, R: Read> Session<C, Authenticated, R> {
 }
 
 /// The terminal session state: no methods are exposed.
+#[cfg(feature = "std")]
 impl<C: Codec, R> Session<C, Closed, R> {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use alloc::string::String;
     use std::io::Cursor;
 
     #[derive(Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize)]

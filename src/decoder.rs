@@ -199,8 +199,6 @@ impl<'de> Decoder<'de> {
 
     fn varint(&mut self) -> NextjsonResult<u128> {
         let marker = self.byte().map_err(|error| self.fail(error))?;
-        // The little-endian canonical path is the single implementation in
-        // `canonical` (shared with the encoder and the Kani proofs).
         if self.config.endian.little() {
             let payload_len = match marker {
                 0..=250 => return Ok(marker as u128),
@@ -216,8 +214,6 @@ impl<'de> Decoder<'de> {
                 None => Err(self.fail(Error::NonCanonicalVarint)),
             };
         }
-        // Big-endian path (kept inline; only the canonical LE profile is
-        // covered by the formal proofs).
         let (value, minimum) = match marker {
             0..=250 => return Ok(marker as u128),
             MARKER_U16 => (self.literal_u16()? as u128, 251),
@@ -577,10 +573,6 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     }
 
     fn restore(&mut self, mark: Mark) {
-        // `Mark` is a public type, so clamp defensively: a depth beyond the
-        // counter table must not panic (unreachable through this decoder's own
-        // `save`, but cheap to harden). A cursor beyond the input fails safely
-        // on the next `take`.
         let depth = (mark.depth() as usize).min(self.counts.len());
         self.cursor = mark.pos();
         self.depth = depth;
@@ -588,9 +580,6 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
             *slot = 0;
         }
         self.lookahead = None;
-        // `restore` follows a failed untagged-variant attempt, so any wire
-        // error recorded during that attempt is stale for the retry and must
-        // not shadow the error reported by a later variant.
         self.wire_error = None;
     }
 
@@ -599,8 +588,6 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     }
 
     fn is_human_readable(&self) -> bool {
-        // RustBinary is a binary wire format; types that branch on this flag
-        // must use their binary decode shape.
         false
     }
 }

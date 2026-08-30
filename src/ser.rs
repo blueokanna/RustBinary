@@ -28,7 +28,6 @@
 use nextjson::Error as NextjsonError;
 use nextjson::Number;
 
-#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::{
@@ -46,7 +45,6 @@ use crate::{
 type NextjsonResult<T> = core::result::Result<T, NextjsonError>;
 
 /// Encodes `value` into a fresh vector.
-#[cfg(feature = "alloc")]
 pub(crate) fn to_vec<T: nextjson::NsonSerialize + ?Sized>(
     value: &T,
     config: Config,
@@ -333,11 +331,17 @@ impl<W: EncodeWriter> nextjson::FormatEncoder for Encoder<W> {
     }
 
     fn write_f64(&mut self, value: f64) -> NextjsonResult<()> {
+        if !value.is_finite() {
+            return Err(self.fail(Error::NonFiniteFloat));
+        }
         self.emit_tag(TAG_F64)?;
         self.fixed(value.to_le_bytes(), value.to_be_bytes())
     }
 
     fn write_f32(&mut self, value: f32) -> NextjsonResult<()> {
+        if !value.is_finite() {
+            return Err(self.fail(Error::NonFiniteFloat));
+        }
         self.emit_tag(TAG_F32)?;
         self.fixed(value.to_le_bytes(), value.to_be_bytes())
     }

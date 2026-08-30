@@ -6,11 +6,9 @@
 //! panic, overflow the stack, or bypass a configured limit.
 //!
 //! Every test drives round-trips through the owned `Config::serialize` API,
-//! so the suite requires the `alloc` feature. The `no_std` slice core is
-//! covered separately by `tests/core_profiles.rs`; this file compiles away
-//! under `cargo test --no-default-features` (the `core-no-std` CI job).
-
-#![cfg(feature = "alloc")]
+//! Every test drives round-trips through the owned `Config::serialize` API.
+//! The crate is always `no_std` + `alloc`, so owned APIs are always available;
+//! the `no_std` slice core is covered separately by `tests/core_profiles.rs`.
 
 // ---------------------------------------------------------------------------
 // Resource limits
@@ -58,10 +56,8 @@ fn decompression_is_bounded_even_without_a_configured_limit() {
     hostile.extend_from_slice(&1u64.to_le_bytes()); // stored_len: tiny
 
     for config in [
-        rustbinary::legacy_options().with_zstd_compression(3),
-        rustbinary::options()
-            .with_no_limit()
-            .with_zstd_compression(3),
+        rustbinary::legacy_options().with_compression(3),
+        rustbinary::options().with_no_limit().with_compression(3),
     ] {
         assert!(
             matches!(
@@ -202,7 +198,7 @@ fn cbor_decode_enforces_collection_limit() {
 
     // A single oversized container is rejected before typed conversion.
     let mut hostile = vec![0x9f]; // indefinite-length array
-    hostile.extend(std::iter::repeat_n(0x01, 5)); // five elements
+    hostile.extend(std::iter::repeat(0x01).take(5)); // five elements
     hostile.push(0xff);
     assert!(matches!(
         config.deserialize::<Vec<u32>>(&hostile),

@@ -45,6 +45,7 @@
 //! style payloads keep working.
 
 use alloc::borrow::Cow;
+use alloc::borrow::ToOwned;
 use alloc::vec::Vec;
 
 use nextjson::de::Mark;
@@ -1194,6 +1195,18 @@ fn token_name(token: &Token<'_>) -> &'static str {
     }
 }
 
+/// 2^n for `-1022 <= n <= 1023`, exact and available without `std`.
+///
+/// Powers of two are exactly representable in `f64`, and their bit pattern is
+/// `exponent = 1023 + n` in the IEEE 754 bias, so `from_bits` yields the value
+/// directly (no `powi`, which is a `std`-only method; `from_bits` is not const
+/// before Rust 1.83, so this stays a plain `fn`).
+fn pow2f(exponent: i32) -> f64 {
+    // `i64` preserves the sign before biasing; casting a negative `i32`
+    // directly to `u64` would wrap and overflow the bias addition.
+    f64::from_bits(((exponent as i64 + 1023) as u64) << 52)
+}
+
 /// Converts an IEEE 754 half-precision value to `f64` (no `std` needed).
 fn half_to_f64(half: u16) -> f64 {
     let sign = if half & 0x8000 != 0 { -1.0 } else { 1.0 };
@@ -1205,7 +1218,7 @@ fn half_to_f64(half: u16) -> f64 {
                 sign * 0.0
             } else {
                 // Subnormal: value = fraction * 2^-24.
-                sign * (fraction as f64) * 2f64.powi(-24)
+                sign * (fraction as f64) * pow2f(-24)
             }
         }
         0x1f => {
@@ -1215,7 +1228,7 @@ fn half_to_f64(half: u16) -> f64 {
                 f64::NAN
             }
         }
-        _ => sign * (fraction as f64 + 1024.0) * 2f64.powi(exponent - 25),
+        _ => sign * (fraction as f64 + 1024.0) * pow2f(exponent - 25),
     }
 }
 

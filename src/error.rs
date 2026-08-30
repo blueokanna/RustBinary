@@ -1,6 +1,5 @@
-use core::{error, fmt, str::Utf8Error};
+use core::{fmt, str::Utf8Error};
 
-#[cfg(feature = "alloc")]
 use alloc::string::{String, ToString};
 #[cfg(feature = "std")]
 use std::io;
@@ -26,28 +25,16 @@ pub enum ErrorCategory {
 }
 
 /// Diagnostic text supplied by custom serializers or external formats.
-///
-/// The text is retained when `alloc` is enabled. Pure core builds retain the
-/// error category without requiring dynamic memory.
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct CustomMessage {
-    #[cfg(feature = "alloc")]
     message: String,
 }
 
 impl CustomMessage {
     fn from_display(message: impl fmt::Display) -> Self {
-        #[cfg(feature = "alloc")]
-        {
-            Self {
-                message: message.to_string(),
-            }
-        }
-        #[cfg(not(feature = "alloc"))]
-        {
-            let _ = message;
-            Self {}
+        Self {
+            message: message.to_string(),
         }
     }
 }
@@ -60,14 +47,7 @@ impl From<&str> for CustomMessage {
 
 impl fmt::Display for CustomMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(feature = "alloc")]
-        {
-            f.write_str(&self.message)
-        }
-        #[cfg(not(feature = "alloc"))]
-        {
-            f.write_str("custom error")
-        }
+        f.write_str(&self.message)
     }
 }
 
@@ -121,6 +101,7 @@ pub enum Error {
     InvalidBool(u8),
     InvalidOption(u8),
     InvalidChar,
+    NonFiniteFloat,
     InvalidUtf8(Utf8Error),
     IntegerOverflow {
         target: &'static str,
@@ -172,6 +153,7 @@ impl Error {
             | Self::InvalidBool(_)
             | Self::InvalidOption(_)
             | Self::InvalidChar
+            | Self::NonFiniteFloat
             | Self::InvalidUtf8(_)
             | Self::IntegerOverflow { .. }
             | Self::InvalidVarintMarker(_)
@@ -229,6 +211,9 @@ impl fmt::Display for Error {
             Self::InvalidBool(value) => write!(f, "invalid boolean tag {value}; expected 0 or 1"),
             Self::InvalidOption(value) => write!(f, "invalid option tag {value}; expected 0 or 1"),
             Self::InvalidChar => f.write_str("invalid UTF-8 character encoding"),
+            Self::NonFiniteFloat => {
+                f.write_str("non-finite float values (NaN or infinity) are rejected")
+            }
             Self::InvalidUtf8(error) => write!(f, "invalid UTF-8 string: {error}"),
             Self::IntegerOverflow { target } => write!(f, "decoded integer does not fit {target}"),
             Self::InvalidVarintMarker(marker) => write!(f, "invalid varint marker {marker:#04x}"),
@@ -242,10 +227,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::Error for Error {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+// `core::error::Error` is not stable before Rust 1.81, so the no_std build on
+// the MSRV 1.78 line has no `core::error::Error` impl; the `std` build gets
+// the standard `Error` trait. no_std consumers that need `dyn Error` on
+// 1.81+ toolchains can map through their own wrapper.
+#[cfg(feature = "std")]
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            #[cfg(feature = "std")]
             Self::Io(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             _ => None,

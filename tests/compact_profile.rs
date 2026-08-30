@@ -511,7 +511,7 @@ fn bulk_varint_path_respects_limits_and_truncation() {
     // the first plain run already crosses the limit and is rejected. The
     // collection cap is raised so the byte limit is what fires.
     let mut frame = vec![200u8];
-    frame.extend(std::iter::repeat_n(1u8, 200));
+    frame.extend(std::iter::repeat(1u8).take(200));
     let config = rustbinary::options()
         .with_limit(16)
         .with_collection_limit(1000)

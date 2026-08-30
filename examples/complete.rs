@@ -101,7 +101,7 @@ fn main() -> rustbinary::Result<()> {
     let secure = protocol
         .with_cbor_format()
         .with_deterministic_encoding()
-        .with_zstd_compression(3)
+        .with_compression(3)
         .with_compression_threshold(64)
         .with_encryption(EncryptionKey::new([0xA5; 32]));
     let encrypted = secure.serialize(&value)?;

@@ -12,7 +12,6 @@ pub use crate::error::{Error, ErrorCategory, Result};
 pub use crate::writer::{CountWriter, EncodeWriter, SliceWriter};
 pub use crate::{deserialize, legacy_options, options, serialize_into_slice, serialized_size};
 
-#[cfg(feature = "alloc")]
 pub use crate::serialize;
 #[cfg(feature = "std")]
 pub use crate::{deserialize_from, serialize_into};

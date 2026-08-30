@@ -1,6 +1,5 @@
 use crate::{Config, Error, Result, TrailingBytes};
 
-#[cfg(feature = "alloc")]
 use alloc::{vec, vec::Vec};
 
 /// Bit-level output over caller-owned memory, least-significant bit first.
@@ -101,7 +100,7 @@ impl<'a> BitReader<'a> {
 
     fn validate_end(&self, trailing: TrailingBytes) -> Result<()> {
         let used = bytes_for_bits(self.position);
-        if !self.position.is_multiple_of(8) && used != 0 {
+        if self.position % 8 != 0 && used != 0 {
             let used_bits = self.position % 8;
             if self.input[used - 1] >> used_bits != 0 {
                 return Err(Error::BitPacking("non-zero bit padding"));
@@ -151,7 +150,6 @@ impl BitPackedConfig {
     }
 
     /// Packs a value into an exactly sized vector.
-    #[cfg(feature = "alloc")]
     pub fn serialize<T: BitPack>(self, value: &T) -> Result<Vec<u8>> {
         let maximum = bytes_for_bits(T::MAX_BITS);
         if let Some(limit) = self.base.limit {

@@ -1,7 +1,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
+// `cfg(kani)` is a toolchain flag (not a Cargo feature), so without a manifest
+// `check-cfg` it trips `unexpected_cfgs` on 1.80+ toolchains. The allow is
+// crate-scoped because the lint fires during cfg evaluation, before item-level
+// lint attributes apply; `unknown_lints` keeps the 1.78 MSRV line quiet, where
+// the lint name does not exist yet.
+#![allow(unexpected_cfgs, unknown_lints)]
 
 //! `RustBinary` is a bounded **nextjson** binary codec with explicit wire
 //! profiles.
@@ -77,10 +83,14 @@
 
 extern crate self as rustbinary;
 
-// nextjson's `FormatDecoder` contract returns `Cow<'de, str>`, so the core
-// always links `alloc` (matching nextjson, which is `no_std` + `alloc`).
-// The `alloc` Cargo feature remains as a compatibility marker.
+// nextjson's `FormatDecoder` contract returns `Cow<'de, str>`, so the crate is
+// always `no_std` + `alloc` (matching nextjson). `std` is opt-in: enabling the
+// `std` feature links the standard library for the I/O adapters and the
+// std-only transform layers (archive, compression, encryption, parallel,
+// SIMD, trust sessions).
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 #[cfg(feature = "std")]
 /// Bridges between the slice-based core and `std::io` readers and writers.
@@ -89,9 +99,15 @@ pub mod adapters;
 #[cfg(feature = "adaptive")]
 /// Canonical data-aware encodings for strings and integer collections.
 pub mod adaptive;
+#[cfg(feature = "encryption")]
+/// In-tree ChaCha20-Poly1305 AEAD primitives (RFC 8439 + XChaCha20).
+mod aead;
 #[cfg(feature = "archive")]
 /// Validated relative-pointer archives for read-only memory mapping.
 pub mod archive;
+#[cfg(feature = "archive")]
+/// In-tree zero-copy archive codec (replaces the `rkyv` dependency).
+pub mod archive_codec;
 #[cfg(feature = "bit-packing")]
 /// Bit-level caller-buffer codecs and the [`BitPack`] contract.
 pub mod bitpack;
@@ -110,7 +126,7 @@ mod cbor_codec;
 /// Schema-guided compact binary profile (no tags, no field names, length-prefixed containers).
 pub mod compact;
 #[cfg(feature = "compression")]
-/// Adaptive Zstandard framing.
+/// Adaptive lossless compression framing.
 pub mod compression;
 /// Core wire-profile configuration.
 pub mod config;
@@ -123,6 +139,9 @@ pub mod delta;
 #[cfg(feature = "encryption")]
 /// Authenticated XChaCha20-Poly1305 framing.
 pub mod encryption;
+#[cfg(feature = "encryption")]
+/// OS-backed randomness and constant-time memory wiping.
+mod entropy;
 /// Codec result and error types.
 pub mod error;
 #[cfg(feature = "schema-evolution")]
@@ -130,17 +149,32 @@ pub mod error;
 pub mod evolution;
 #[cfg(feature = "fingerprint")]
 mod frame;
+/// In-tree BLAKE3 hash used by the archive Merkle tree and projection proofs.
+///
+/// Only compiled when a consumer needs it (the archive Merkle tree or the
+/// projection proofs); feature sets without either must not pull a dead hash
+/// module into the build.
+#[cfg(any(feature = "archive", feature = "projection"))]
+pub(crate) mod hash;
 #[cfg(feature = "reconcile")]
 /// Invertible Bloom Lookup Tables for unordered set reconciliation.
 pub mod ibl;
 #[cfg(kani)]
 /// Kani formal-verification harnesses for the Core layer.
 mod kani_proofs;
+#[cfg(feature = "compression")]
+/// In-tree LZ77 lossless compressor (replaces the `zstd` dependency).
+mod lz;
+#[cfg(feature = "archive")]
+/// In-tree read-only memory mapping (replaces the `memmap2` dependency).
+mod mmap;
 #[cfg(feature = "parallel")]
 /// Ordered multi-core batch encoding and decoding.
 pub mod parallel;
 /// Optional transform product surface.
 pub mod pipeline;
+/// Exact structural probe for one value (allocation-free preflight).
+pub mod probe;
 #[cfg(feature = "projection")]
 /// Projectable self-authenticating records with projection soundness.
 pub mod projection;
@@ -169,7 +203,6 @@ pub mod trust;
 /// Core output sinks for caller-owned and counting serialization.
 pub mod writer;
 
-#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
@@ -210,6 +243,7 @@ pub use evolution::{
 pub use ibl::{encode_set, reconcile, splitmix64, Cell, Iblt, IbltEntry};
 #[cfg(feature = "parallel")]
 pub use parallel::ParallelConfig;
+pub use probe::{probe, Probe};
 #[cfg(feature = "projection")]
 pub use projection::{
     prove, schema_root, verify, verify_untrusted, Projection, ProjectionError, ProjectionLimits,
@@ -228,9 +262,12 @@ pub use simd::{hardware_capabilities, simd_backend, HardwareCapabilities, SimdBa
 pub use static_size::StaticSize;
 #[cfg(feature = "trust")]
 pub use trust::{
-    AuthLevel, Authenticated, Closed, Codec, Handshake, Session, TrustedConfig, Untrusted,
-    Verified, Verifier,
+    AuthLevel, Authenticated, Closed, Codec, TrustedConfig, Untrusted, Verified, Verifier,
 };
+// The duplex session is built on byte-level I/O, so it is only available with
+// the `std` feature; the `TrustedConfig` type-level calculus is `no_std`.
+#[cfg(all(feature = "trust", feature = "std"))]
+pub use trust::{Handshake, Session};
 pub use writer::{CountWriter, EncodeWriter, SliceWriter};
 
 #[cfg(all(feature = "derive", feature = "bit-packing"))]
@@ -256,6 +293,11 @@ pub use rustbinary_derive::Fingerprint;
 pub use rustbinary_derive::Reflect;
 #[cfg(all(feature = "derive", feature = "static-size"))]
 pub use rustbinary_derive::StaticSize;
+// The `Archive` and `Serialize` derives belong to the zero-copy archive
+// layer; `archive` implies `derive` (see Cargo.toml), so both are available
+// whenever `--features archive` is on.
+#[cfg(all(feature = "derive", feature = "archive"))]
+pub use rustbinary_derive::{Archive, Serialize};
 
 /// Re-exports nextjson's format-neutral serialization contracts.
 ///
@@ -277,7 +319,6 @@ pub const fn legacy_options() -> Config {
 }
 
 /// Serializes a value with the bounded compact Core profile.
-#[cfg(feature = "alloc")]
 pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Config::standard().serialize(value)
 }
@@ -326,6 +367,9 @@ pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    use alloc::borrow::ToOwned;
+    use alloc::string::String;
+    use alloc::vec;
     use std::{
         cell::Cell,
         collections::BTreeMap,
@@ -524,8 +568,8 @@ mod tests {
             assert_eq!(config.deserialize::<PackedHeader>(&bytes).unwrap(), header);
             assert!(bytes.len() <= PackedHeader::PACKED_MAX_SIZE);
         }
-        const { assert!(PackedHeader::MAX_SIZE > 0) };
-        const { assert!(PackedHeader::PACKED_MAX_BITS > 0) };
+        const _: () = assert!(PackedHeader::MAX_SIZE > 0);
+        const _: () = assert!(PackedHeader::PACKED_MAX_BITS > 0);
 
         for event in [
             PackedEvent::Empty,
@@ -781,11 +825,15 @@ mod tests {
                 .unwrap(),
             map
         );
-        let nan = f64::NAN;
-        assert!(options()
-            .deserialize::<f64>(&options().serialize(&nan).unwrap())
-            .unwrap()
-            .is_nan());
+        // nextjson 0.1.4 rejects non-finite floats on both encode and decode;
+        // this is the documented safety contract (a NaN cannot round-trip).
+        // RustBinary's encoder enforces the same rule on the wire boundary.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                options().serialize(&value),
+                Err(Error::NonFiniteFloat)
+            ));
+        }
     }
 
     #[test]
@@ -843,7 +891,7 @@ mod tests {
         ));
         // An array of 65 unit values exceeds the collection limit.
         let mut hostile = vec![0x0a];
-        hostile.extend(std::iter::repeat_n(0x00, 65));
+        hostile.extend(std::iter::repeat(0x00).take(65));
         hostile.push(0xff);
         assert!(matches!(
             legacy_options()
@@ -868,7 +916,7 @@ mod tests {
         // 64 nested arrays over a single unit value.
         let mut deep = vec![0x0a; 64];
         deep.push(0x00);
-        deep.extend(std::iter::repeat_n(0xff, 64));
+        deep.extend(std::iter::repeat(0xff).take(64));
         // The default cap (128) accepts 64 levels.
         assert!(options().deserialize::<nextjson::Value>(&deep).is_ok());
         // A tighter cap rejects the same input.
@@ -1078,8 +1126,8 @@ mod tests {
         };
         assert!(options().serialize(&value).unwrap().len() <= ProtocolRecord::MAX_SIZE);
         assert!(legacy_options().serialize(&value).unwrap().len() <= ProtocolRecord::MAX_SIZE);
-        const { assert!(ProtocolRecord::MAX_SIZE > 0) };
-        const { assert!(ProtocolRecord::PACKED_MAX_BITS > 0) };
+        const _: () = assert!(ProtocolRecord::MAX_SIZE > 0);
+        const _: () = assert!(ProtocolRecord::PACKED_MAX_BITS > 0);
 
         let TypeShape::Struct(fields) = ProtocolRecord::SHAPE else {
             panic!("record must reflect as a struct");
@@ -1288,7 +1336,7 @@ mod tests {
         let repeated = vec![0u8; 2000];
         let compressed = options()
             .with_limit(8192)
-            .with_zstd_compression(3)
+            .with_compression(3)
             .with_compression_threshold(128);
         let frame = compressed.serialize(&repeated).unwrap();
         assert_eq!(&frame[..4], b"RBZ1");
@@ -1296,11 +1344,11 @@ mod tests {
         assert!(frame.len() < repeated.len() / 4);
         assert_eq!(compressed.deserialize::<Vec<u8>>(&frame).unwrap(), repeated);
 
-        let small = options().with_zstd_compression(3).serialize(&7u8).unwrap();
+        let small = options().with_compression(3).serialize(&7u8).unwrap();
         assert_eq!(u16::from_le_bytes([small[6], small[7]]), 0);
         assert_eq!(
             options()
-                .with_zstd_compression(3)
+                .with_compression(3)
                 .deserialize::<u8>(&small)
                 .unwrap(),
             7
@@ -1333,7 +1381,7 @@ mod tests {
         assert!(matches!(
             options()
                 .with_limit(1024)
-                .with_zstd_compression(3)
+                .with_compression(3)
                 .deserialize_from::<_, Vec<u8>>(reader),
             Err(Error::SizeLimit { limit: 1024 })
         ));
@@ -1346,7 +1394,7 @@ mod tests {
         let config = options()
             .with_cbor_format()
             .with_deterministic_encoding()
-            .with_zstd_compression(5)
+            .with_compression(5)
             .with_compression_threshold(64);
         let frame = config.serialize(&value).unwrap();
         assert_eq!(
@@ -1365,7 +1413,7 @@ mod tests {
             .with_limit(4096)
             .with_encryption(EncryptionKey::new([0x42; 32]));
         assert_eq!(
-            format!("{:?}", EncryptionKey::new([0x42; 32])),
+            alloc::format!("{:?}", EncryptionKey::new([0x42; 32])),
             "EncryptionKey([REDACTED])"
         );
 

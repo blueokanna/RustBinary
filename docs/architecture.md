@@ -75,8 +75,9 @@ graph above as long as it only depends on `core`.
    `rustbinary = { features = ["cbor"] }` keeps working.
 3. **Kani.** `kani_proofs` moves with `core` (canonical), plus harnesses in
    `schema` (bounded algebra) and `secure-frame` (projection geometry).
-4. **Archive's blake3.** `archive` keeps the audited `blake3` crate as its
-   own optional dependency; `core` stays hash-free.
+4. **Archive's blake3.** `archive` hashes with the in-tree `crate::hash`
+   BLAKE3 implementation; if the archive is ever split into its own crate,
+   the hash module moves with it and `core` stays hash-free.
 5. **No behavior change.** The split is a packaging change. The wire bytes,
    the error types, the limits, and the test vectors are identical before and
    after each migration step.

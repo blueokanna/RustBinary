@@ -1,4 +1,3 @@
-#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
@@ -164,7 +163,7 @@ impl Config {
     ///
     /// Without a byte limit the raw codec performs no size accounting, so this
     /// mode is only for trusted, in-memory data. Decompression is an exception
-    /// that remains bounded: the compression wrapper (`with_zstd_compression`)
+    /// that remains bounded: the compression wrapper ([`Config::with_compression`])
     /// always caps the decompressed size at the crate-wide
     /// [`DEFAULT_SIZE_LIMIT`] when no explicit limit is configured, so a
     /// hostile frame cannot expand without bound.
@@ -231,8 +230,17 @@ impl Config {
     pub const fn with_cbor_format(self) -> crate::CborConfig {
         crate::CborConfig::new(self)
     }
-    /// Wraps binary payloads in an adaptive Zstandard compression frame.
+    /// Wraps binary payloads in an in-tree LZ77 compression frame.
     #[cfg(feature = "compression")]
+    pub const fn with_compression(self, level: i32) -> crate::CompressedConfig {
+        crate::CompressedConfig::binary(self, level)
+    }
+    /// Legacy name for [`Config::with_compression`].
+    ///
+    /// The frame is the in-tree LZ77 codec, not Zstandard; the old name is
+    /// kept only for source compatibility and will not change bytes.
+    #[cfg(feature = "compression")]
+    #[deprecated(note = "use `with_compression`; the frame is the in-tree LZ77 codec")]
     pub const fn with_zstd_compression(self, level: i32) -> crate::CompressedConfig {
         crate::CompressedConfig::binary(self, level)
     }
@@ -282,7 +290,6 @@ impl Config {
         self
     }
     /// Serializes a value into a new vector.
-    #[cfg(feature = "alloc")]
     pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         ser::to_vec(value, self)
     }
@@ -325,6 +332,16 @@ impl Config {
         reader: R,
     ) -> Result<T> {
         crate::adapters::deserialize_from(self, reader)
+    }
+    /// Probes the exact structural footprint of the next value in `input`
+    /// without materializing it.
+    ///
+    /// Returns the exact byte length, container count, element count, and
+    /// maximum nesting depth of one value, honoring the same limits and
+    /// malformed-input rejection as [`Config::deserialize`]. The walk performs
+    /// no allocation, so it is a safe preflight probe for hostile frames.
+    pub fn probe(self, input: &[u8]) -> Result<crate::Probe> {
+        crate::probe::probe(self, input)
     }
 }
 
@@ -377,7 +394,6 @@ pub trait Options: Sized {
     fn allow_trailing_bytes(self) -> Config {
         self.config().allow_trailing_bytes()
     }
-    #[cfg(feature = "alloc")]
     fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         self.config().serialize(value)
     }
@@ -408,6 +424,11 @@ pub trait Options: Sized {
         reader: R,
     ) -> Result<T> {
         self.config().deserialize_from(reader)
+    }
+    /// Probes the exact structural footprint of the next value without
+    /// materializing it.
+    fn probe(self, input: &[u8]) -> Result<crate::Probe> {
+        self.config().probe(input)
     }
 }
 

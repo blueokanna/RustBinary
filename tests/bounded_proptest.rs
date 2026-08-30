@@ -9,7 +9,7 @@
 //!   `work` never exceed the compile-time algebra.
 //! - The reported allocation bound always covers the bytes read.
 
-#![cfg(all(feature = "bounded", feature = "alloc"))]
+#![cfg(feature = "bounded")]
 
 use proptest::prelude::*;
 
@@ -78,9 +78,7 @@ proptest! {
         c in any::<bool>(),
         d in prop::array::uniform3(any::<i32>()),
     ) {
-        const {
-            assert!(StaticP::STATICALLY_BOUNDED);
-        };
+        const _: () = assert!(StaticP::STATICALLY_BOUNDED);
         let value = StaticP { a, b, c, d };
         let bytes = rustbinary::options().serialize(&value).unwrap();
         let decoded = decode_bounded::<StaticP>(&bytes, Budget::from_type::<StaticP>()).unwrap();

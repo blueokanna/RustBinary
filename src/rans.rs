@@ -687,7 +687,7 @@ mod tests {
 
     fn roundtrip_model(model: &Model, symbols: &[u32]) {
         let config = EntropyConfig::new(Config::standard());
-        let models: Vec<&Model> = core::iter::repeat_n(model, symbols.len()).collect();
+        let models: Vec<&Model> = core::iter::repeat(model).take(symbols.len()).collect();
         let frame = config.encode_sequence(&models, symbols).unwrap();
         let decoded = config.decode_sequence(&models, &frame).unwrap();
         assert_eq!(decoded, symbols, "roundtrip for model {:?}", model);
@@ -712,7 +712,7 @@ mod tests {
         let model = Model::from_uniform(3).unwrap();
         let config = EntropyConfig::new(Config::standard());
         let symbols = [0u32, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
-        let models: Vec<&Model> = core::iter::repeat_n(&model, symbols.len()).collect();
+        let models: Vec<&Model> = core::iter::repeat(&model).take(symbols.len()).collect();
         let frame = config.encode_sequence(&models, &symbols).unwrap();
         // 12 symbols * 1.585 bits = 19.02 bits -> 3 bytes + 24-byte header.
         assert!(frame.len() < 24 + 12, "frame too large: {}", frame.len());
@@ -1013,7 +1013,7 @@ mod tests {
         assert!(encoder.put_symbol(&model, 3).is_err());
 
         let config = EntropyConfig::new(Config::standard());
-        let models: Vec<&Model> = core::iter::repeat_n(&model, 2).collect();
+        let models: Vec<&Model> = core::iter::repeat(&model).take(2).collect();
         let frame = config.encode_sequence(&models, &[0, 1]).unwrap();
         // Mismatched model count must be rejected.
         let one_model = &models[..1];

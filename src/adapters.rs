@@ -37,6 +37,12 @@ pub fn deserialize_from<R: Read, T: for<'de> nextjson::NsonDeserialize<'de>>(
 
 #[cfg(feature = "compression")]
 #[doc(inline)]
+pub use crate::compression;
+/// Legacy module name: the compression layer is the in-tree LZ77 codec, not
+/// Zstandard. Kept for compatibility; new code should use `compression`.
+#[cfg(feature = "compression")]
+#[deprecated(note = "use `compression`; the layer is the in-tree LZ77 codec")]
+#[doc(inline)]
 pub use crate::compression as zstd;
 #[cfg(feature = "encryption")]
 #[doc(inline)]

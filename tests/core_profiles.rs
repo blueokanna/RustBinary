@@ -93,7 +93,6 @@ fn defaults_are_bounded_and_errors_have_stable_responsibility() {
     );
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn top_level_api_uses_the_compact_core_profile() {
     let value = (251_u64, -2_i32, "A");
@@ -138,7 +137,6 @@ fn adaptive_profile_has_pure_no_std_caller_buffer_paths() {
     assert_eq!(decoded_values, values);
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn alloc_profile_preserves_owned_values() {
     let value = ("owned".to_owned(), vec![1u32, 251, 65_536]);
@@ -147,7 +145,6 @@ fn alloc_profile_preserves_owned_values() {
     assert_eq!(decoded, value);
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn type_mismatch_errors_name_the_expecting_type() {
     // nextjson 0.1.3's `FormatDecoder::set_expecting` lets a derived decoder
@@ -203,7 +200,6 @@ fn type_mismatch_errors_name_the_expecting_type() {
     );
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn collection_limit_applies_to_nested_sibling_containers() {
     // Per-collection accounting: each nested container gets its own element

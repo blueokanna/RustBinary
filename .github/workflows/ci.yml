@@ -19,14 +19,20 @@ jobs:
         include:
           - profile: core-no-std
             command: cargo test --no-default-features
-          - profile: core-alloc
-            command: cargo test --no-default-features --features alloc
+          - profile: compact
+            command: cargo test --no-default-features --features compact
           - profile: protocol
             command: cargo test --no-default-features --features protocol
-          - profile: pipeline
-            command: cargo test --no-default-features --features pipeline
+          - profile: cbor
+            command: cargo test --no-default-features --features cbor
           - profile: sync
             command: cargo test --no-default-features --features sync
+          - profile: bounded
+            command: cargo test --no-default-features --features bounded
+          - profile: projection
+            command: cargo test --no-default-features --features projection
+          - profile: pipeline
+            command: cargo test --no-default-features --features pipeline
           - profile: archive
             command: cargo test --no-default-features --features archive
     steps:
@@ -38,10 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.87.0
-      - run: cargo check -p rustbinary --lib --no-default-features
-      - run: cargo check -p rustbinary --lib --no-default-features --features alloc
-      - run: cargo check -p rustbinary --lib --no-default-features --features archive
+      - uses: dtolnay/rust-toolchain@1.78.0
+      - run: cargo check --workspace --all-targets --all-features
+      - run: cargo test --workspace --all-features
 
   quality:
     runs-on: ubuntu-latest

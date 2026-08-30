@@ -8,8 +8,13 @@ description = "Standalone benchmark crate comparing rustbinary against bincode 1
 [workspace]
 
 [dependencies]
-rustbinary = { path = "..", features = ["derive", "compact", "entropy", "schema-evolution"] }
-nextjson = { version = "0.1", features = ["derive"] }
+rustbinary = { path = "..", features = [
+    "derive",
+    "compact",
+    "entropy",
+    "schema-evolution",
+] }
+nextjson = { version = "0.1.4", features = ["derive"] }
 
 # serde-family opponents (bench-only; never part of rustbinary itself).
 serde = { version = "1", features = ["derive"] }

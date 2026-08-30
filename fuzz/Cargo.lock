@@ -71,18 +71,18 @@ dependencies = [
 
 [[package]]
 name = "nextjson"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75a81ba3adb913c492e318440d7ff094bed671fe78950b8c9cc644c676ad0d82"
+checksum = "57e11456b12f6d0776f7e431232b638d1315a3deffd790b0bf818277a7d8efca"
 dependencies = [
  "nextjson-derive",
 ]
 
 [[package]]
 name = "nextjson-derive"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa68dc9385489f5d9495ddc5824e55327c8f2825f6f20af91e0aee3e48b2e1c4"
+checksum = "84d8161c22b5b2d74b022b89480cdced97c716e9f819bf123fec0d810cb8bb86"
 
 [[package]]
 name = "proc-macro2"
@@ -110,7 +110,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rustbinary"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "nextjson",
  "rustbinary-derive",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "rustbinary-derive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "proc-macro2",
  "quote",

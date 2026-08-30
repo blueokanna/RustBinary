@@ -1,10 +1,9 @@
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use std::{fmt, io::Read};
 
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
-use zeroize::{Zeroize, Zeroizing};
+use crate::aead::{Key, Payload, XChaCha20Poly1305, XNonce};
+use crate::entropy::{fill_os_random, Zeroize, Zeroizing};
 
 #[cfg(feature = "cbor")]
 use crate::CborConfig;
@@ -29,7 +28,7 @@ impl EncryptionKey {
     }
 
     fn as_key(&self) -> &Key {
-        self.0.as_slice().try_into().expect("fixed key length")
+        &self.0
     }
 }
 
@@ -114,11 +113,8 @@ impl EncryptedConfig {
         let plaintext = Zeroizing::new(self.serialize_payload(value)?);
         self.enforce_plaintext_limit(plaintext.len() as u64)?;
         let mut nonce_bytes = [0; NONCE_LEN];
-        getrandom::fill(&mut nonce_bytes).map_err(|error| Error::Randomness(error.to_string()))?;
-        let nonce: &XNonce = nonce_bytes
-            .as_slice()
-            .try_into()
-            .expect("fixed nonce length");
+        fill_os_random(&mut nonce_bytes).map_err(|error| Error::Randomness(error.to_string()))?;
+        let nonce: &XNonce = &nonce_bytes;
         let ciphertext_len = plaintext
             .len()
             .checked_add(TAG_LEN)
@@ -129,7 +125,7 @@ impl EncryptedConfig {
             .encrypt(
                 nonce,
                 Payload {
-                    msg: &plaintext,
+                    msg: plaintext.as_slice(),
                     aad: &header,
                 },
             )
@@ -170,7 +166,7 @@ impl EncryptedConfig {
         if plaintext.len() as u64 != plaintext_len {
             return Err(Error::InvalidFrame("AEAD plaintext length mismatch"));
         }
-        self.deserialize_payload(&plaintext)
+        self.deserialize_payload(plaintext.as_slice())
     }
 
     /// Reads exactly one encrypted frame and leaves subsequent frames unread.

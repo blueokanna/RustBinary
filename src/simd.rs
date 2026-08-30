@@ -92,7 +92,9 @@ const fn detect_sme() -> bool {
 /// dispatch (`is_ascii`, `plain_varint_prefix`) reuses the result instead of
 /// re-running CPU feature detection on each call.
 pub fn simd_backend() -> SimdBackend {
-    static BACKEND: std::sync::LazyLock<SimdBackend> = std::sync::LazyLock::new(|| {
+    // `OnceLock` (1.70) instead of `LazyLock` (1.80) keeps the MSRV at 1.78.
+    static BACKEND: std::sync::OnceLock<SimdBackend> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(|| {
         let capabilities = hardware_capabilities();
         if capabilities.avx2 {
             SimdBackend::Avx2
@@ -103,8 +105,7 @@ pub fn simd_backend() -> SimdBackend {
         } else {
             SimdBackend::Scalar
         }
-    });
-    *BACKEND
+    })
 }
 
 #[cfg(feature = "adaptive")]
@@ -175,6 +176,11 @@ fn scalar_plain_prefix(bytes: &[u8]) -> usize {
 
 #[cfg(all(feature = "adaptive", target_arch = "x86_64"))]
 mod x86 {
+    // The compute intrinsics (set1 / xor / cmpgt / movemask) are `unsafe fn` on
+    // Rust 1.78 but safe to call in newer releases. The blocks below keep the
+    // code compiling on both, and this allow silences the redundant-unsafe
+    // warning that newer Rust would otherwise emit.
+    #![allow(unused_unsafe)]
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2")]
@@ -183,7 +189,7 @@ mod x86 {
         while offset + 32 <= bytes.len() {
             // SAFETY: the loop proves that a complete unaligned vector is readable.
             let vector = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast()) };
-            let mask = _mm256_movemask_epi8(vector) as u32;
+            let mask = unsafe { _mm256_movemask_epi8(vector) } as u32;
             if mask != 0 {
                 return offset + mask.trailing_zeros() as usize;
             }
@@ -198,7 +204,7 @@ mod x86 {
         while offset + 16 <= bytes.len() {
             // SAFETY: the loop proves that a complete unaligned vector is readable.
             let vector = unsafe { _mm_loadu_si128(bytes.as_ptr().add(offset).cast()) };
-            let mask = _mm_movemask_epi8(vector) as u32;
+            let mask = unsafe { _mm_movemask_epi8(vector) } as u32;
             if mask != 0 {
                 return offset + mask.trailing_zeros() as usize;
             }
@@ -210,14 +216,14 @@ mod x86 {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn plain_prefix_avx2(bytes: &[u8]) -> usize {
         let mut offset = 0;
-        let sign = _mm256_set1_epi8(i8::MIN);
-        let threshold = _mm256_set1_epi8(122);
+        let sign = unsafe { _mm256_set1_epi8(i8::MIN) };
+        let threshold = unsafe { _mm256_set1_epi8(122) };
         while offset + 32 <= bytes.len() {
             // SAFETY: the loop proves that a complete unaligned vector is readable.
             let vector = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast()) };
-            let unsigned_order = _mm256_xor_si256(vector, sign);
-            let markers = _mm256_cmpgt_epi8(unsigned_order, threshold);
-            let mask = _mm256_movemask_epi8(markers) as u32;
+            let unsigned_order = unsafe { _mm256_xor_si256(vector, sign) };
+            let markers = unsafe { _mm256_cmpgt_epi8(unsigned_order, threshold) };
+            let mask = unsafe { _mm256_movemask_epi8(markers) } as u32;
             if mask != 0 {
                 return offset + mask.trailing_zeros() as usize;
             }
@@ -229,14 +235,14 @@ mod x86 {
     #[target_feature(enable = "sse2")]
     pub(super) unsafe fn plain_prefix_sse2(bytes: &[u8]) -> usize {
         let mut offset = 0;
-        let sign = _mm_set1_epi8(i8::MIN);
-        let threshold = _mm_set1_epi8(122);
+        let sign = unsafe { _mm_set1_epi8(i8::MIN) };
+        let threshold = unsafe { _mm_set1_epi8(122) };
         while offset + 16 <= bytes.len() {
             // SAFETY: the loop proves that a complete unaligned vector is readable.
             let vector = unsafe { _mm_loadu_si128(bytes.as_ptr().add(offset).cast()) };
-            let unsigned_order = _mm_xor_si128(vector, sign);
-            let markers = _mm_cmpgt_epi8(unsigned_order, threshold);
-            let mask = _mm_movemask_epi8(markers) as u32;
+            let unsigned_order = unsafe { _mm_xor_si128(vector, sign) };
+            let markers = unsafe { _mm_cmpgt_epi8(unsigned_order, threshold) };
+            let mask = unsafe { _mm_movemask_epi8(markers) } as u32;
             if mask != 0 {
                 return offset + mask.trailing_zeros() as usize;
             }
@@ -248,16 +254,19 @@ mod x86 {
 
 #[cfg(all(feature = "adaptive", target_arch = "aarch64"))]
 mod arm {
+    // See the `x86` module: NEON compute intrinsics are `unsafe fn` on Rust
+    // 1.78 but safe in newer releases.
+    #![allow(unused_unsafe)]
     use std::arch::aarch64::*;
 
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn ascii_prefix_neon(bytes: &[u8]) -> usize {
         let mut offset = 0;
-        let threshold = vdupq_n_u8(127);
+        let threshold = unsafe { vdupq_n_u8(127) };
         while offset + 16 <= bytes.len() {
             // SAFETY: the loop proves that a complete unaligned vector is readable.
             let vector = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
-            let compared = vcgtq_u8(vector, threshold);
+            let compared = unsafe { vcgtq_u8(vector, threshold) };
             let mut lanes = [0u8; 16];
             // SAFETY: `lanes` has exactly one vector of writable storage.
             unsafe { vst1q_u8(lanes.as_mut_ptr(), compared) };
@@ -272,11 +281,11 @@ mod arm {
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn plain_prefix_neon(bytes: &[u8]) -> usize {
         let mut offset = 0;
-        let threshold = vdupq_n_u8(250);
+        let threshold = unsafe { vdupq_n_u8(250) };
         while offset + 16 <= bytes.len() {
             // SAFETY: the loop proves that a complete unaligned vector is readable.
             let vector = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
-            let compared = vcgtq_u8(vector, threshold);
+            let compared = unsafe { vcgtq_u8(vector, threshold) };
             let mut lanes = [0u8; 16];
             // SAFETY: `lanes` has exactly one vector of writable storage.
             unsafe { vst1q_u8(lanes.as_mut_ptr(), compared) };
@@ -292,6 +301,8 @@ mod arm {
 #[cfg(all(test, feature = "adaptive"))]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn dispatched_scanners_match_scalar_at_vector_boundaries() {

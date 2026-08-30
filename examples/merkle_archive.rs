@@ -2,7 +2,7 @@
 //!
 //! Run: `cargo run --example merkle_archive --features archive`
 //!
-//! Every archive (format v2) carries a SHA-256 Merkle root over fixed-size
+//! Every archive (format v3) carries a BLAKE3 Merkle root over fixed-size
 //! payload blocks. This example shows both access modes:
 //!
 //! - full [`rustbinary::archive::MappedArchive::open`] (validate everything
@@ -15,6 +15,7 @@ use rustbinary::archive::{
 };
 
 #[derive(rustbinary::archive::Archive, rustbinary::archive::Serialize)]
+#[archive(check_bytes)]
 struct Ledger {
     epoch: u64,
     // 64 KiB of state so the archive spans many Merkle blocks.
@@ -40,8 +41,6 @@ fn main() -> Result<(), ArchiveError> {
         hex_prefix(&archive.root_digest())
     );
 
-    // Proofs are self-contained: blocks + siblings + root. A light client
-    // that only holds the root can verify a range without the file.
     let proof = archive.proof_for(0, 1024)?;
     proof.verify()?;
     let extracted = proof.extract()?;
@@ -52,11 +51,9 @@ fn main() -> Result<(), ArchiveError> {
         proof.siblings().len()
     );
 
-    // Write the archive and re-open it fully.
     let path = std::env::temp_dir().join("rustbinary-merkle-example.rba");
     let _ = std::fs::remove_file(&path);
     archive.write_new(&path)?;
-    // SAFETY: unique owned path, no concurrent writer.
     let mapped = unsafe { MappedArchive::<Ledger>::open(&path, limits) }?;
     let _ = std::fs::remove_file(&path);
     println!(
@@ -65,15 +62,11 @@ fn main() -> Result<(), ArchiveError> {
         mapped.root_digest() == archive.root_digest()
     );
 
-    // A tampered payload is caught by proof verification even in header-only
-    // mode (the forensic-on-access path). The corrupted byte must fall inside
-    // the proved range for the proof to be invalidated.
     let mut tampered = archive.as_bytes().to_vec();
     tampered[rustbinary::archive::PAYLOAD_OFFSET + 4200] ^= 0x40;
     let tampered_path = std::env::temp_dir().join("rustbinary-merkle-tampered.rba");
     let _ = std::fs::remove_file(&tampered_path);
     std::fs::write(&tampered_path, &tampered).unwrap();
-    // SAFETY: unique owned path, no concurrent writer.
     let header_only = unsafe { MappedArchive::<Ledger>::open_header_only(&tampered_path, limits) }?;
     let _ = std::fs::remove_file(&tampered_path);
     let bad_proof = header_only.proof_for(4096, 512)?;
@@ -85,8 +78,10 @@ fn main() -> Result<(), ArchiveError> {
 }
 
 fn hex_prefix(bytes: &[u8; 32]) -> String {
-    bytes[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write;
+    let mut out = String::with_capacity(8);
+    for byte in &bytes[..8] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }

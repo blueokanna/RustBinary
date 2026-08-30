@@ -207,8 +207,7 @@ fn pipeline_raw_compression_vector_is_stable() {
     let golden = [
         b'R', b'B', b'Z', b'1', 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 7,
     ];
-    let config: rustbinary::pipeline::CompressedConfig =
-        rustbinary::options().with_zstd_compression(3);
+    let config: rustbinary::pipeline::CompressedConfig = rustbinary::options().with_compression(3);
     assert_eq!(config.serialize(&7_u8).unwrap(), golden);
     assert_eq!(config.deserialize::<u8>(&golden).unwrap(), 7);
 }

@@ -1,4 +1,3 @@
-#[cfg(feature = "alloc")]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use crate::{
@@ -99,7 +98,6 @@ impl AdaptiveConfig {
     }
 
     /// Uses value-width adaptive varints for a regular nextjson payload.
-    #[cfg(feature = "alloc")]
     pub fn serialize<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         self.base.serialize(value)
     }
@@ -113,7 +111,6 @@ impl AdaptiveConfig {
     }
 
     /// Encodes a string using raw UTF-8 or 7-bit ASCII packing, whichever is smaller.
-    #[cfg(feature = "alloc")]
     pub fn encode_string(self, value: &str) -> Result<Vec<u8>> {
         if self.mode == AdaptiveMode::Off {
             // Direct raw UTF-8 with no ASCII scan: the low-latency default.
@@ -186,7 +183,6 @@ impl AdaptiveConfig {
     }
 
     /// Decodes and validates an adaptively encoded string.
-    #[cfg(feature = "alloc")]
     pub fn decode_string(self, input: &[u8]) -> Result<String> {
         Ok(self.decode_string_borrowed(input)?.into_owned())
     }
@@ -247,8 +243,7 @@ impl AdaptiveConfig {
     ///
     /// ASCII7 payloads require expansion and are therefore returned as owned
     /// strings. The returned [`Cow`] makes that distinction explicit.
-    #[cfg(feature = "alloc")]
-    pub fn decode_string_borrowed<'a>(self, input: &'a [u8]) -> Result<Cow<'a, str>> {
+    pub fn decode_string_borrowed(self, input: &[u8]) -> Result<Cow<'_, str>> {
         self.enforce_byte_limit(input.len())?;
         let mut cursor = Cursor::new(input);
         let strategy = cursor.byte()?;
@@ -287,7 +282,6 @@ impl AdaptiveConfig {
     }
 
     /// Encodes an `i64` slice using raw, delta, or run-length varints.
-    #[cfg(feature = "alloc")]
     pub fn encode_i64_slice(self, values: &[i64]) -> Result<Vec<u8>> {
         if self.mode == AdaptiveMode::Off {
             // Direct raw encoding with a single growing pass: the low-latency
@@ -381,7 +375,6 @@ impl AdaptiveConfig {
     }
 
     /// Decodes an adaptive `i64` collection with checked delta reconstruction.
-    #[cfg(feature = "alloc")]
     pub fn decode_i64_vec(self, input: &[u8]) -> Result<Vec<i64>> {
         let length = self.decoded_i64_slice_len(input)?;
         let mut values = Vec::new();
@@ -493,7 +486,7 @@ impl AdaptiveConfig {
 }
 
 fn validate_ascii_padding(bytes: &[u8], meaningful_bits: usize) -> Result<()> {
-    if !meaningful_bits.is_multiple_of(8)
+    if meaningful_bits % 8 != 0
         && bytes
             .last()
             .is_some_and(|last| last >> (meaningful_bits % 8) != 0)
@@ -672,7 +665,7 @@ struct OutputCursor<'a> {
 }
 
 impl<'a> OutputCursor<'a> {
-    const fn new(output: &'a mut [u8]) -> Self {
+    fn new(output: &'a mut [u8]) -> Self {
         Self {
             output,
             position: 0,

@@ -74,11 +74,8 @@
 use core::fmt;
 use core::marker::PhantomData;
 
-#[cfg(feature = "alloc")]
 use alloc::boxed::Box;
-#[cfg(feature = "alloc")]
 use alloc::string::String;
-#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::config::{Config, DEFAULT_COLLECTION_LIMIT, DEFAULT_SIZE_LIMIT};
@@ -631,7 +628,6 @@ tuple_bounded!(A, B, C, D, E, F);
 tuple_bounded!(A, B, C, D, E, F, G);
 tuple_bounded!(A, B, C, D, E, F, G, H);
 
-#[cfg(feature = "alloc")]
 impl DecodeBounded for String {
     const MAX_INPUT: usize = usize::MAX;
     const MAX_ALLOC: usize = usize::MAX;
@@ -641,7 +637,6 @@ impl DecodeBounded for String {
     const MAX_STRUCTURAL_ELEMENT: usize = 0;
 }
 
-#[cfg(feature = "alloc")]
 impl<T: DecodeBounded> DecodeBounded for Vec<T> {
     const MAX_INPUT: usize = usize::MAX;
     const MAX_ALLOC: usize = usize::MAX;
@@ -652,7 +647,6 @@ impl<T: DecodeBounded> DecodeBounded for Vec<T> {
     const MAX_STRUCTURAL_ELEMENT: usize = max(core::mem::size_of::<T>(), T::MAX_STRUCTURAL_ELEMENT);
 }
 
-#[cfg(feature = "alloc")]
 impl<T: DecodeBounded> DecodeBounded for Box<T> {
     const MAX_INPUT: usize = T::MAX_INPUT;
     const MAX_ALLOC: usize = saturating_add(T::MAX_ALLOC, core::mem::size_of::<T>());
@@ -716,6 +710,9 @@ pub const fn depth_plus_one(depth: usize) -> usize {
 mod tests {
     use super::*;
     use crate::Error;
+    use alloc::borrow::ToOwned;
+    use alloc::format;
+    use alloc::vec;
 
     #[derive(
         Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize, crate::DecodeBounded,
@@ -761,12 +758,8 @@ mod tests {
         assert_eq!(decoded.use_.depth_bound, 2);
         assert_eq!(decoded.use_.work_bound, StaticRecord::MAX_WORK as u64);
         // The type reports itself as statically bounded.
-        const {
-            assert!(StaticRecord::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(!DynamicRecord::STATICALLY_BOUNDED);
-        };
+        const _: () = assert!(StaticRecord::STATICALLY_BOUNDED);
+        const _: () = assert!(!DynamicRecord::STATICALLY_BOUNDED);
     }
 
     #[test]
@@ -1064,9 +1057,7 @@ mod tests {
         assert_eq!(NestedRecord::MAX_DEPTH, 3);
         assert_eq!(NestedRecord::MAX_ALLOC, 0);
         assert_eq!(NestedRecord::MAX_STRUCTURAL_ELEMENT, 0);
-        const {
-            assert!(NestedRecord::STATICALLY_BOUNDED);
-        };
+        const _: () = assert!(NestedRecord::STATICALLY_BOUNDED);
     }
 
     #[test]
@@ -1079,9 +1070,7 @@ mod tests {
         assert_eq!(StaticEnum::MAX_DEPTH, 2);
         assert_eq!(StaticEnum::MAX_ALLOC, 0);
         assert_eq!(StaticEnum::MAX_STRUCTURAL_ELEMENT, 0);
-        const {
-            assert!(StaticEnum::STATICALLY_BOUNDED);
-        };
+        const _: () = assert!(StaticEnum::STATICALLY_BOUNDED);
         // ShapeEnum: the Named variant carries a String, so B/A/W are dynamic
         // (usize::MAX). Depth stays finite: the Named variant adds the String
         // level (D=1) inside its own object level, and the enum adds another
@@ -1091,9 +1080,7 @@ mod tests {
         assert_eq!(ShapeEnum::MAX_WORK, usize::MAX);
         assert_eq!(ShapeEnum::MAX_DEPTH, 3);
         assert_eq!(ShapeEnum::MAX_STRUCTURAL_ELEMENT, 0);
-        const {
-            assert!(!ShapeEnum::STATICALLY_BOUNDED);
-        };
+        const _: () = assert!(!ShapeEnum::STATICALLY_BOUNDED);
     }
 
     #[test]
@@ -1320,29 +1307,13 @@ mod tests {
 
     #[test]
     fn static_boundedness_flags_are_correct() {
-        const {
-            assert!(StaticRecord::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(NestedRecord::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(StaticEnum::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(!DynamicRecord::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(!ShapeEnum::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(!<Vec<u8>>::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(<Option<u8>>::STATICALLY_BOUNDED);
-        };
-        const {
-            assert!(<[u8; 4]>::STATICALLY_BOUNDED);
-        };
+        const _: () = assert!(StaticRecord::STATICALLY_BOUNDED);
+        const _: () = assert!(NestedRecord::STATICALLY_BOUNDED);
+        const _: () = assert!(StaticEnum::STATICALLY_BOUNDED);
+        const _: () = assert!(!DynamicRecord::STATICALLY_BOUNDED);
+        const _: () = assert!(!ShapeEnum::STATICALLY_BOUNDED);
+        const _: () = assert!(!<Vec<u8>>::STATICALLY_BOUNDED);
+        const _: () = assert!(<Option<u8>>::STATICALLY_BOUNDED);
+        const _: () = assert!(<[u8; 4]>::STATICALLY_BOUNDED);
     }
 }

@@ -26,6 +26,8 @@ and the `derive` feature are additive and independent.
 | `Reflect` | `rustbinary::Reflect` | Inspect static field and variant metadata |
 | `BitPacked` | `rustbinary::BitPack` | Pack bounded fields at bit granularity |
 | `CompactBinary` | `rustbinary::compact::{CompactEncode, CompactDecode}` | Schema-guided compact wire profile (no tags, no field names) |
+| `Archive` | `rustbinary::archive_codec::{Archive, ArchivedValue, CheckBytes}` | Zero-copy archived mirror for mmap archives (read-only object stores) |
+| `Serialize` | `rustbinary::archive_codec::ArchiveWrite` | Two-phase archive serializer (use with `Archive`) |
 
 The macros do not implement `nextjson::NsonSerialize` or
 `nextjson::NsonDeserialize`. Combine them with nextjson derives when the
@@ -39,8 +41,9 @@ macros:
 
 ```toml
 [dependencies]
-nextjson = { version = "0.1", features = ["derive"] }
-rustbinary = { version = "0.1.4", features = [
+# Pin to the exact runtime target (0.1.4 rejects non-finite floats).
+nextjson = { version = "=0.1.4", features = ["derive"] }
+rustbinary = { version = "0.1.8", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -61,13 +64,13 @@ refer to `::rustbinary`:
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.4", features = [
+rustbinary = { version = "0.1.8", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.4"
+rustbinary-derive = "0.1.5"
 ```
 
 The `path` plus `version` dependency in the workspace is intentional. Local
@@ -354,6 +357,58 @@ struct Outer {
 Custom field types can implement `BitPack` or `BitValue` in the runtime crate.
 The derive only selects the appropriate trait path; it does not guess a
 custom type's representation.
+
+## `Archive` and `Serialize`
+
+These two derives power the `rustbinary` archive feature — read-only,
+Merkle-verified, memory-mapped object stores. They replace the former rkyv
+based archive with an in-tree, root-first relative-pointer codec.
+
+Apply both to the same named struct:
+
+```rust
+use rustbinary::archive::{Archive, Serialize};
+
+#[derive(Archive, Serialize)]
+#[archive(check_bytes)] // accepted for compatibility; validation is always generated
+struct Reading {
+    sensor_id: u32,
+    label: String,
+    samples: Vec<i32>,
+}
+```
+
+- `Archive` generates the `ArchivedReading` mirror type (`#[repr(C)]`, derived
+  `Clone` + `Copy`), the `rustbinary::archive_codec::Archive` impl, the
+  `ArchivedValue` marker (so archived structs can sit inside `ArchivedVec`
+  element slices), and the `CheckBytes` structural validator. The validator
+  reproduces the C-ABI field offsets and bounds-checks every relative pointer,
+  length, and range in one pass.
+- `Serialize` generates the two-phase `ArchiveWrite` serializer: a skeleton
+  pass writes the fixed-size mirror (with the same alignment padding the C
+  ABI inserts) and records placeholder positions; a bodies pass writes the
+  string/vec data and patches the placeholders. `Vec<T>` of a nested archived
+  struct writes all element mirrors contiguously first, then their bodies, so
+  the element array is a run of fixed-size values.
+
+Supported field types:
+
+- scalar primitives `u8`…`f64` (inline);
+- `String` (a 4-byte relative pointer + `u32` length + UTF-8 bytes);
+- `Vec<T>` where `T` is a scalar or a nested archived struct;
+- a direct nested archived struct field.
+
+Rejected with a span-aware compile error: `bool` (not every byte pattern is a
+valid `bool`, so zero-copy element slices would be unsound), `Vec<String>`,
+nested `Vec<Vec<…>>`, generic type parameters, enums, and unions. Tuples and
+array fields are not supported yet — keep archive types to the surface above.
+The archived mirror is immutable; `build`/`OwnedArchive`/`MappedArchive` are
+documented in the runtime crate.
+
+Unlike the other derives, `Archive`/`Serialize` emit `::std::` paths in the
+generated code (`VecDeque`, `String`). That is intentional: the `archive`
+runtime feature implies `std`, so the generated code only ever expands in
+`std` contexts.
 
 ## Accepted Rust Shapes
 

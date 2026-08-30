@@ -100,7 +100,9 @@ use alloc::{
 use std::collections::HashMap;
 
 use crate::{
-    canonical::{decode_varint_le, encode_varint_le, zigzag_decode, zigzag_encode},
+    canonical::{
+        decode_varint_le, decode_varint_le_u64, encode_varint_le, zigzag_decode, zigzag_encode,
+    },
     config::{Config, TrailingBytes},
     error::{Error, Result},
     tags::{MARKER_U128, MARKER_U16, MARKER_U32, MARKER_U64},
@@ -683,8 +685,16 @@ impl<'de> CompactCursor<'de> {
                     .get(position + 1..end)
                     .ok_or(Error::UnexpectedEnd)?;
                 self.position = end;
-                let value = decode_varint_le(marker, bytes).ok_or(Error::NonCanonicalVarint)?;
-                u64::try_from(value).map_err(|_| Error::IntegerOverflow { target: "u64" })
+                if marker == MARKER_U128 {
+                    // A `u64` read hitting a 128-bit marker: the payload may
+                    // be a valid canonical varint whose value exceeds
+                    // `u64::MAX` — that is an overflow, not a canonicality
+                    // failure.
+                    let value = decode_varint_le(marker, bytes).ok_or(Error::NonCanonicalVarint)?;
+                    u64::try_from(value).map_err(|_| Error::IntegerOverflow { target: "u64" })
+                } else {
+                    decode_varint_le_u64(marker, bytes).ok_or(Error::NonCanonicalVarint)
+                }
             }
         }
     }
@@ -847,11 +857,22 @@ impl<'de> CompactCursor<'de> {
                         .input
                         .get(position + 1..end)
                         .ok_or(Error::UnexpectedEnd)?;
-                    let value = decode_varint_le(marker, bytes).ok_or(Error::NonCanonicalVarint)?;
-                    out.push(
-                        u64::try_from(value)
-                            .map_err(|_| Error::IntegerOverflow { target: "u64" })?,
-                    );
+                    if marker == MARKER_U128 {
+                        // A `Vec<u64>` element hitting a 128-bit marker: the
+                        // payload may be a valid canonical varint above
+                        // `u64::MAX` — that is an overflow, not a
+                        // canonicality failure.
+                        let value =
+                            decode_varint_le(marker, bytes).ok_or(Error::NonCanonicalVarint)?;
+                        out.push(
+                            u64::try_from(value)
+                                .map_err(|_| Error::IntegerOverflow { target: "u64" })?,
+                        );
+                    } else {
+                        out.push(
+                            decode_varint_le_u64(marker, bytes).ok_or(Error::NonCanonicalVarint)?,
+                        );
+                    }
                     self.position = end;
                     remaining -= 1;
                 }
@@ -879,7 +900,7 @@ fn read_f64_vec(cursor: &mut CompactCursor<'_>, len: usize) -> Result<Vec<f64>> 
     out.try_reserve_exact(len)
         .map_err(|_| Error::SizeLimit { limit: u64::MAX })?;
     if cfg!(target_endian = "little")
-        && (bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<f64>())
+        && (bytes.as_ptr() as usize) % core::mem::align_of::<f64>() == 0
     {
         // SAFETY: `f64` has no invalid bit patterns and no padding; the
         // alignment check above makes the cast sound, and the target is
@@ -907,7 +928,7 @@ fn read_f32_vec(cursor: &mut CompactCursor<'_>, len: usize) -> Result<Vec<f32>> 
     out.try_reserve_exact(len)
         .map_err(|_| Error::SizeLimit { limit: u64::MAX })?;
     if cfg!(target_endian = "little")
-        && (bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<f32>())
+        && (bytes.as_ptr() as usize) % core::mem::align_of::<f32>() == 0
     {
         // SAFETY: `f32` has no invalid bit patterns and no padding; the
         // alignment check above makes the cast sound, and the target is

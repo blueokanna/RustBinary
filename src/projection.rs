@@ -65,13 +65,13 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::canonical::{decode_varint_le, encode_varint_le, zigzag_decode, zigzag_encode};
+use crate::hash;
 
-/// The audited BLAKE3 crate is the only hash primitive used by this module.
+/// The in-tree BLAKE3 implementation is the only hash primitive used by this
+/// module (byte-for-byte compatible with the official crate).
 fn blake3(input: &[u8]) -> [u8; 32] {
-    *blake3_crate::hash(input).as_bytes()
+    hash::blake3(input)
 }
-
-use blake3 as blake3_crate;
 
 /// Stable application field identifier inside one record.
 ///
@@ -693,9 +693,9 @@ pub fn verify<'a>(
 /// claimed root. This detects corruption and inconsistent proofs but **not**
 /// substitution by an attacker (an attacker can forge a self-consistent
 /// proof). Only use where corruption detection, not authenticity, is required.
-pub fn verify_untrusted<'a>(
-    proof: &'a ProjectionProof,
-) -> Result<Vec<VerifiedField<'a>>, ProjectionError> {
+pub fn verify_untrusted(
+    proof: &ProjectionProof,
+) -> Result<Vec<VerifiedField<'_>>, ProjectionError> {
     let recomputed = recompute_proof_root(proof)?;
     if recomputed != proof.claimed_root {
         return Err(ProjectionError::RootMismatch);
@@ -815,7 +815,7 @@ where
                     .get(&j)
                     .copied()
                     .ok_or(ProjectionError::IncompleteProof)?;
-                let parent = if i.is_multiple_of(2) {
+                let parent = if i % 2 == 0 {
                     node_hash(&frontier[&i], &sh)
                 } else {
                     node_hash(&sh, &frontier[&i])
@@ -1084,6 +1084,7 @@ fn read_u32(input: &[u8], cursor: &mut usize) -> Result<u32, ProjectionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn build_fixture() -> (Vec<u8>, [u8; 32], u32) {
         let mut builder = RecordBuilder::new(7);
@@ -1258,6 +1259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn parser_rejects_non_canonical_and_corrupt_records() {
         let (record, _, _) = build_fixture();
         let limits = ProjectionLimits::new();
@@ -1496,6 +1498,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "std")]
     fn truncation_never_panics_across_record_shapes() {
         let shapes: Vec<Vec<u8>> = vec![
             RecordBuilder::new(1).finish().unwrap(),

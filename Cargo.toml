@@ -1,21 +1,18 @@
 [workspace]
 members = ["rustbinary-derive"]
-# `fuzz` is a standalone cargo-fuzz crate; excluding it keeps `cargo metadata`
-# (and therefore `cargo fmt --all`) from treating it as a stray member of this
-# workspace. `rustbinary-bench` breaks out via its own empty `[workspace]`
-# table.
 exclude = ["fuzz"]
 resolver = "2"
 
 [package]
 name = "rustbinary"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["blueokanna", "HyphenTeam"]
 keywords = ["binary", "serialization", "rust", "networking", "middleware"]
 categories = ["encoding", "data-structures", "network-programming"]
 license = "Apache-2.0"
 readme = "README.md"
+rust-version = "1.78"
 homepage = "https://github.com/blueokanna/RustBinary"
 repository = "https://github.com/blueokanna/RustBinary"
 documentation = "https://docs.rs/rustbinary"
@@ -25,9 +22,6 @@ description = "A bounded nextjson binary codec with adaptive frames, zero-alloca
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -35,8 +29,7 @@ opt-level = 3
 
 [features]
 default = ["std", "compact"]
-alloc = []
-std = ["alloc", "nextjson/std"]
+std = ["nextjson/std"]
 protocol = [
     "adaptive",
     "bit-packing",
@@ -47,30 +40,27 @@ protocol = [
     "schema-evolution",
     "static-size",
 ]
-# Schema-guided compact profile: no per-value tags, no field names, and
-# length-prefixed containers with byte/float/string fast paths. See
-# `src/compact.rs` for the wire layout. Additive: it never changes the
-# self-describing profile's payloads.
-compact = ["alloc"]
+
+compact = ["derive"]
 pipeline = ["cbor", "compression", "encryption", "parallel"]
 sync = ["entropy", "reconcile", "trust"]
-archive = ["std", "dep:memmap2", "dep:rkyv", "dep:blake3"]
-entropy = ["alloc", "reflection"]
-reconcile = ["alloc"]
-trust = ["alloc", "std"]
+archive = ["std", "derive"]
+entropy = ["reflection"]
+reconcile = []
+trust = []
 derive = ["dep:rustbinary-derive", "nextjson/derive"]
-fingerprint = ["alloc"]
+fingerprint = []
 reflection = []
 static-size = []
-cbor = ["std"]
-compression = ["std", "dep:zstd"]
-encryption = ["std", "dep:chacha20poly1305", "dep:getrandom", "dep:zeroize"]
+cbor = []
+compression = ["std"]
+encryption = ["std"]
 bit-packing = []
 adaptive = ["bit-packing"]
 parallel = ["std"]
-schema-evolution = ["alloc"]
-bounded = ["alloc", "std", "derive"]
-projection = ["std", "dep:blake3"]
+schema-evolution = []
+bounded = ["derive"]
+projection = []
 simd = ["std"]
 
 [[example]]
@@ -138,28 +128,12 @@ required-features = ["reconcile"]
 
 [[example]]
 name = "trust_session"
-required-features = ["trust"]
+required-features = ["trust", "std"]
 
 [dependencies]
-nextjson = { version = "0.1.3", default-features = false }
-rustbinary-derive = { version = "0.1.4", path = "rustbinary-derive", optional = true }
-zstd = { version = "0.13.3", optional = true }
-chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = [
-    "alloc",
-] }
-getrandom = { version = "0.4.3", optional = true }
-zeroize = { version = "1.9.0", optional = true }
-memmap2 = { version = "0.9.11", optional = true }
-blake3 = { version = "1.8", optional = true, default-features = false, features = [
-    "std",
-] }
-rkyv = { version = "0.8.18", optional = true, default-features = false, features = [
-    "bytecheck",
-    "little_endian",
-    "pointer_width_32",
-    "std",
-] }
+nextjson = { version = "0.1.4", default-features = false }
+rustbinary-derive = { version = "0.1.5", path = "rustbinary-derive", optional = true }
 
 [dev-dependencies]
-nextjson = { version = "0.1" }
-proptest = "1.6.0"
+nextjson = { version = "0.1.4" }
+proptest = "1.8.0"

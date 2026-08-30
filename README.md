@@ -7,6 +7,15 @@ across a wire or into a file, where the other side might be hostile, where
 memory is scarce, and where you want to know exactly what a decoder will
 consume before it runs.
 
+- **MSRV**: Rust 1.78 (hard-pinned in both crates and verified by CI on the
+  exact toolchain; the dependency graph is locked to versions that still
+  build on 1.78).
+- **`no_std` first**: the crate is unconditionally `#![no_std]` + `alloc`;
+  `std` is an opt-in feature that only adds the I/O adapters and the std-only
+  transform layers. The self-describing core and every self-implemented
+  feature (adaptive, entropy, reconcile, evolution, projection, bounded,
+  probe) build without `std`.
+
 Every feature in here answers a concrete question — "can I afford to reject
 this frame?", "can a light client read one field without scanning the whole
 record?", "what is the worst case this type can do to my heap?" — and the
@@ -50,42 +59,51 @@ records that must round-trip unambiguously and be readable without an
 out-of-band schema, the tag tax buys you that.
 
 The `archive` feature is **not a second stream format**. It is a separate
-storage format — rkyv's flat relative pointers inside a RustBinary envelope —
-for read-only memory-mapped object stores, and it is versioned on its own
-(`RBARC002`). The stream codec never casts memory, never emits relative
-pointers, and never changes its behavior based on which Cargo features are on.
+storage format — an in-tree, root-first relative-pointer codec inside a
+RustBinary envelope — for read-only memory-mapped object stores, and it is
+versioned on its own (`RBARC004`). The stream codec never casts memory, never
+emits relative pointers, and never changes its behavior based on which Cargo
+features are on.
 
 ## Dependency policy
 
-The stream path depends on nextjson and, optionally, the derive crate. The
-optional pipeline adds zstd, chacha20poly1305, getrandom, and zeroize. The
-archive adds memmap2, rkyv, and **blake3**. Supply-chain strategy and crypto
-implementation strategy are deliberately separate decisions:
+This crate is deliberately **self-contained**. The stream path depends on
+nextjson and, optionally, the derive crate; every primitive that other codecs
+would pull in as a third-party dependency is implemented in-tree:
 
-- **Supply chain**: third-party dependencies are confined to the layers that
-  need them (pipeline codecs, archive storage, Merkle hashing) and are
-  optional Cargo features. The stream core stays dependency-light.
-- **Crypto implementation**: every primitive that is load-bearing for
-  security or integrity is a vetted crate, not an in-tree reimplementation.
-  The archive Merkle tree hashes with the official **`blake3`** crate (a
-  formally reviewed implementation); this crate does not ship its own hash
-  primitive. The entropy layer needs no hash at all — it verifies frames by
-  replay, and the residual detection gap is documented in the entropy
-  section.
+| Primitive            | In-tree module        | Replaces        |
+| -------------------- | --------------------- | --------------- |
+| BLAKE3 (Merkle + projection proofs) | `crate::hash`   | `blake3`        |
+| XChaCha20-Poly1305 AEAD (RFC 8439)  | `crate::aead`   | `chacha20poly1305` |
+| OS CSPRNG + zeroize  | `crate::entropy`      | `getrandom`, `zeroize` |
+| LZ77 lossless compression | `crate::lz`    | `zstd`          |
+| Read-only mmap       | `crate::mmap`         | `memmap2`       |
+| Zero-copy archive codec | `crate::archive_codec` | `rkyv`        |
 
-If a threat model demands an even smaller dependency surface, the blake3
-crate can be swapped for any implementation of `fn(&[u8]) -> [u8; 32]` without
-changing the archive layout (the call site is a single wrapper in
-`src/archive.rs`); domain separation and tree geometry are owned by the
-archive module, not by the hash primitive.
+- **MSRV**: the crate is pinned to Rust 1.78 (`rust-version = "1.78"` in both
+  `rustbinary` and `rustbinary-derive`), and the CI matrix verifies every
+  feature combination on that exact toolchain. nextjson is pinned to `=0.1.4`,
+  whose serialize/deserialize path **rejects non-finite floats** (`NaN`/`±Inf`
+  are errors, not round-trippable values); RustBinary inherits and tests that
+  contract.
+- **Supply chain**: the runtime dependency graph is exactly `nextjson` (+ its
+  derive) and the in-tree `rustbinary-derive`. No other crate is linked at
+  runtime; the dev-dependencies (proptest for property tests) are pinned to
+  versions that still build on 1.78.
+- **Crypto implementation**: every primitive is implemented in-tree and
+  validated against official vectors — BLAKE3 against the RFC test suite,
+  ChaCha20-Poly1305 against the RFC 8439 vectors, and the AEAD framing
+  byte-for-byte against the previous `chacha20poly1305`-based pipeline (a
+  golden-vector test holds the old bytes). The Merkle tree also uses the
+  in-tree BLAKE3, so the whole integrity path is dependency-free.
 
 ## Layers
 
 | Layer       | Module                 | Default | Scope                                                                        |
 | ----------- | ---------------------- | ------- | ---------------------------------------------------------------------------- |
-| **Core**    | `rustbinary::core`     | yes     | compact encode/decode, limits, trailing policy, caller buffers, `no_std`     |
+| **Core**    | `rustbinary::core`     | yes     | compact encode/decode, limits, trailing policy, caller buffers; `no_std` always |
 | **Protocol**| `rustbinary::protocol` | no      | schema evolution, fingerprints, reflection, static bounds, bit packing       |
-| **Pipeline**| `rustbinary::pipeline` | no      | CBOR, compression, encryption, ordered parallel batches                      |
+| **Pipeline**| `rustbinary::pipeline` | no      | CBOR, compression, encryption, ordered parallel batches (`std`)              |
 | **Sync**    | `sync`                 | no      | rANS entropy coding, differential frames, IBLT reconciliation, trust calculus|
 | **Archive** | `rustbinary::archive`  | no      | Merkle-verified read-only memory-mapped object stores                        |
 | **Projection**| `rustbinary::projection`| no    | self-authenticating projectable records with projection soundness            |
@@ -109,27 +127,30 @@ archive module, not by the hash primitive.
 | Compile-time bounds         | Implemented    | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                                  |
 | RFC 8949 CBOR               | Implemented    | crate-owned streaming CBOR codec (no value tree); optional canonical map ordering           |
 | Schema evolution            | Implemented    | stable field IDs, versions, defaults, unknown-field skipping                                |
-| Compression                 | Implemented    | adaptive Zstandard; raw data is kept when it is smaller                                     |
+| Compression                 | Implemented    | in-tree LZ77 (hash-chained matches); raw data is kept when it is smaller  |
 | Encryption                  | Implemented    | XChaCha20-Poly1305, random 192-bit nonce, authenticated header                              |
 | Parallel serialization      | Implemented    | ordered batch frames, scheduling-independent output                                         |
 | Runtime reflection          | Implemented    | allocation-free compile-time metadata (`Reflect`), per-field symbol alphabets               |
 | Differential frames         | Implemented    | baseline-relative integer deltas + deterministic HPACK-style dynamic tables                 |
 | IBLT set reconciliation     | Implemented    | from-scratch invertible Bloom lookup tables (Goodrich and Mitzenmacher)                     |
 | Trust calculus              | Implemented    | type-level authentication state machine; unauthenticated receive is unrepresentable         |
-| Merkle archives             | Implemented    | audited BLAKE3 tree, O(log n) proofs, header-only open                                      |
+| Merkle archives             | Implemented    | in-tree BLAKE3 tree, O(log n) proofs, header-only open                                      |
 | Projectable self-auth. records | Implemented | projection soundness, O(log n) proofs, schema-version binding, unknown-field skipping      |
 | Resource-bounded decoding   | Implemented    | schema-derived B/A/D/W cost algebra, budget-enforced `decode_bounded` with evidence          |
+| Exact frame probing         | Implemented    | allocation-free `Config::probe`: exact bytes/containers/elements/depth of one value, honors every limit |
 | Configurable depth limit    | Implemented    | `Config::with_depth_limit` caps nesting on encode and decode                              |
 | Formal verification         | Kani harnesses | varint/ZigZag core + projection tree geometry + budget-limit algebra                        |
-| `no_std`                    | Implemented    | compact slice codec and caller buffers need no default features                             |
-| `no_std + alloc`            | Implemented    | owned values, fingerprints, evolution, adaptive, entropy, reconcile                        |
+| `no_std` first               | Implemented    | the crate is unconditionally `no_std` + `alloc`; `std` is an opt-in feature                  |
+| `no_std` layers             | Implemented    | compact, adaptive, entropy, reconcile, evolution, projection, bounded, probe, CBOR, trust calculus all build without `std` |
 
 ## Installation
 
 ```toml
 [dependencies]
 rustbinary = "0.1"
-nextjson = { version = "0.1", features = ["derive"] }
+# nextjson is pinned to the exact codec target: 0.1.4 rejects non-finite
+# floats on both encode and decode, and RustBinary inherits that contract.
+nextjson = { version = "=0.1.4", features = ["derive"] }
 ```
 
 Enable only the systems you use:
@@ -140,21 +161,28 @@ rustbinary = { version = "0.1", features = ["sync"] }       # entropy + reconcil
 rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap archives
 ```
 
-Zstandard needs a C toolchain on the build host. Everything else is pure Rust;
-the entropy coder is dependency-free and the archive hashes with the audited
-`blake3` crate (see the dependency policy).
+For `no_std` targets, opt out of `std` and pull in the layers you need — the
+core, the protocol, and every self-implemented feature build without `std`:
+
+```toml
+rustbinary = { version = "0.1", default-features = false, features = ["compact"] }
+```
+
+Everything is pure Rust with no C build step, and the runtime dependency
+graph is exactly nextjson plus the in-tree derive (see the dependency
+policy).
 
 ### Feature matrix
 
 | Feature            | Default | Purpose                                                                                                  |
 | ------------------ | ------- | -------------------------------------------------------------------------------------------------------- |
-| `std`              | yes     | owned Core and I/O APIs; required by Pipeline, SIMD, trust                                               |
-| `alloc`            | via std | compatibility marker; owned APIs always available                                                         |
+| `std`              | yes     | I/O adapters and the std-only transform layers (archive, compression, encryption, parallel, SIMD, trust sessions); the self-describing core is always `no_std` |
 | `protocol`         | no      | bundle: adaptive, bit-packing, derive, fingerprint, reflection, schema-evolution, static-size            |
 | `pipeline`         | no      | bundle: cbor, compression, encryption, parallel                                                          |
 | `sync`             | no      | bundle: entropy, reconcile, trust                                                                        |
-| `archive`          | no      | Merkle-verified mmap archives; requires `std`, rkyv, memmap2                                             |
-| `derive`           | no      | re-exports the procedural macros with their runtime feature                                              |
+| `archive`          | no      | Merkle-verified mmap archives; in-tree codec, mmap, and BLAKE3; requires `std` and `derive` |
+| `compact`          | yes     | schema-guided compact profile runtime; implies `derive` (the profile is consumed through the `CompactBinary` derive) |
+| `derive`           | no      | re-exports the procedural macros with their runtime feature; implied by `compact` and `archive` |
 | `fingerprint`      | no      | structural fingerprint runtime and frames                                                                |
 | `reflection`       | no      | allocation-free reflection runtime                                                                      |
 | `static-size`      | no      | compile-time bounds runtime                                                                             |
@@ -165,12 +193,12 @@ the entropy coder is dependency-free and the archive hashes with the audited
 | `reconcile`        | no      | differential frames (`delta`) and IBLT (`ibl`)                                                          |
 | `trust`            | no      | type-level trust calculus and session state machine                                                      |
 | `cbor`             | no      | crate-owned streaming RFC 8949 CBOR codec; optional canonical ordering                             |
-| `compression`      | no      | adaptive Zstandard frame                                                                                |
+| `compression`      | no      | in-tree LZ77 frame                                                                        |
 | `encryption`       | no      | XChaCha20-Poly1305, OS randomness, zeroized keys                                                         |
 | `parallel`         | no      | scoped-thread ordered batch frames                                                                       |
 | `schema-evolution` | no      | stable-field-ID versioned frames                                                                         |
-| `bounded`          | no      | `DecodeBounded` cost algebra (B/A/D/W), `Budget`, `decode_bounded`; requires `std` and `derive` |
-| `projection`       | no      | self-authenticating projectable records and projection proofs; requires `std`, audited `blake3` |
+| `bounded`          | no      | `DecodeBounded` cost algebra (B/A/D/W), `Budget`, `decode_bounded`; `no_std`, requires `derive` |
+| `projection`       | no      | self-authenticating projectable records and projection proofs; `no_std`, in-tree BLAKE3 |
 
 ## Quick start
 
@@ -216,7 +244,7 @@ let secure = rustbinary::options()
     .with_limit(16 * 1024 * 1024)
     .with_cbor_format()
     .with_deterministic_encoding()
-    .with_zstd_compression(3)
+    .with_compression(3)
     .with_compression_threshold(256)
     .with_encryption(rustbinary::EncryptionKey::new([0xA5; 32]));
 # let value = vec![1u32, 2, 3];
@@ -645,14 +673,50 @@ Kani-proven (see Verification). `Config::with_depth_limit` (always available)
 caps container nesting on encode and decode below the crate-wide 128 ceiling
 and is clamped so a hostile limit cannot cause out-of-bounds indexing.
 
+## Frame probing (exact preflight)
+
+A normal decode materializes the value; a skip discards it. `Config::probe`
+occupies the space in between: it walks the wire format and reports the
+**exact** structural footprint of the next value — byte length, container
+count, element count, and maximum nesting depth — with zero allocation and
+without ever building a value.
+
+The probe is a byte-exact mirror of the decoder: it reads with the same
+boundary semantics, honors the same byte/collection/depth limits, and rejects
+the same malformed input (invalid tags, non-canonical varints, truncation,
+trailing bytes). A value accepted by `probe` decodes with the same byte count;
+a value rejected by `probe` is rejected by `deserialize` for the same reason.
+The drift-guard tests pin this against the encoder.
+
+```rust
+let frame = rustbinary::options().serialize(&vec![1u32, 2, 3])?;
+let probe = rustbinary::options().probe(&frame)?;
+assert_eq!(probe.bytes(), frame.len());       // exact frame length
+assert_eq!(probe.containers(), 1);            // one array
+assert_eq!(probe.elements(), 3);              // three entries
+assert_eq!(probe.depth(), 1);                 // one nesting level
+
+// Preflight against a budget before decoding: reject by shape, not by decode.
+#[cfg(feature = "bounded")]
+{
+    let budget = rustbinary::Budget::default().with_max_input(8);
+    assert!(!probe.fits_budget(budget));
+}
+# Ok::<(), rustbinary::Error>(())
+```
+
+Use cases: a gateway decides "should I decode this frame?" from its exact
+shape before spending memory on it; an inspector routes by shape without
+parsing values; a stream hand-off already knows the exact frame length.
+
 ## CBOR, compression, and encryption
 
 The pipeline is explicit and ordered: serialize, optionally compress, then
 encrypt. Deterministic CBOR recursively sorts canonical map keys. Compression
-runs only above a size threshold and stores Zstandard output only when it is
-strictly smaller. Encryption authenticates the full frame header (algorithm,
-nonce, lengths) as AEAD associated data and uses a fresh 192-bit nonce each
-time, so ciphertext is intentionally nondeterministic.
+runs only above a size threshold and stores the in-tree LZ77 output only when
+it is strictly smaller. Encryption authenticates the full frame header
+(algorithm, nonce, lengths) as AEAD associated data and uses a fresh 192-bit
+nonce each time, so ciphertext is intentionally nondeterministic.
 
 - CBOR is the crate's own streaming RFC 8949 codec (`src/cbor_codec.rs`):
   values encode and decode directly between `T` and the bytes with no
@@ -680,14 +744,24 @@ overhead.
 
 ## Memory-mapped archives with Merkle proofs
 
-The `archive` feature is a storage format: rkyv's flat relative-pointer
-layout inside a 128-byte RustBinary envelope. `build` produces the envelope,
-the little-endian payload, and a stored BLAKE3 Merkle tree over fixed-size
-payload blocks. Hashing uses the audited `blake3` crate (see the dependency
-policy); domain separation (`LEAF`/`NODE`/`PAD` tags plus big-endian index)
-and tree geometry are this module's own. The envelope records the format
-version, flags, a non-zero application schema ID, payload/file lengths, block
-size and count, the Merkle root, and the hash-section location.
+The `archive` feature is a storage format: the in-tree, root-first
+relative-pointer codec (`crate::archive_codec`) inside a 128-byte RustBinary
+envelope. `build` produces the envelope, the little-endian payload, and a
+stored BLAKE3 Merkle tree over fixed-size payload blocks. Hashing uses the
+in-tree BLAKE3 (`crate::hash`, validated against the official test vectors);
+domain separation (`LEAF`/`NODE`/`PAD` tags plus big-endian index) and tree
+geometry are this module's own. The envelope records the format version,
+flags, a non-zero application schema ID, payload/file lengths, block size and
+count, the Merkle root, and the hash-section location.
+
+Archived types are ordinary structs with `#[derive(Archive, Serialize)]`
+(`#[archive(check_bytes)]` is accepted for compatibility). The derive emits a
+packed-free `#[repr(C)]` mirror type with 32-bit relative pointers (root at
+payload offset 0), a one-pass structural validator (`CheckBytes`), and a
+two-phase writer; every offset, length, and range is bounds-checked before
+any zero-copy access. `bool` fields are rejected by the derive (not every
+byte pattern is a valid `bool`), and the supported field surface is
+documented in the derive crate.
 
 Two access modes:
 
@@ -836,11 +910,11 @@ that `leaf_count` yields a complete tree that never more than doubles. The
 bounded harnesses prove the derived enforced limits never exceed the budget
 and that the documented allocation ceiling holds.
 
-The archive hashes with the audited `blake3` crate, which maintains its own
-formal review and test vectors. Correctness of the Merkle *geometry* (domain
-separation, sibling extraction, root recomputation) is this crate's
-responsibility and is covered by the archive tests and the projection Kani
-harness for tree aggregation.
+The archive hashes with the in-tree BLAKE3 implementation (`crate::hash`),
+which is validated byte-for-byte against the official BLAKE3 test vectors.
+Correctness of the Merkle *geometry* (domain separation, sibling extraction,
+root recomputation) is this crate's responsibility and is covered by the
+archive tests and the projection Kani harness for tree aggregation.
 
 ### Property tests (proptest)
 
@@ -974,7 +1048,7 @@ release notes. Long-lived deployments should pin the version, record the
 complete configuration, keep golden vectors, and use explicit schema IDs. Two
 format families exist and are versioned independently: the stream format
 (`RBAN` entropy frames, `RBZ1`/`RBX1` pipeline frames) and the archive storage
-format (`RBARC002`). A change to one never silently changes the other.
+format (`RBARC004`). A change to one never silently changes the other.
 
 ## Non-goals
 

@@ -6,7 +6,7 @@
 //! and do not rely on internal constants, so they serve as an external
 //! correctness contract for the coder.
 
-#![cfg(all(feature = "entropy", feature = "alloc"))]
+#![cfg(feature = "entropy")]
 
 use proptest::prelude::*;
 use rustbinary::{EntropyConfig, Model, RansDecoder, RansEncoder};

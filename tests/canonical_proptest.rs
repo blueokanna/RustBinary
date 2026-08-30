@@ -4,8 +4,6 @@
 //! properties symbolically for the full `u128` domain; this file spot-checks
 //! them with randomized inputs through the public codec API.
 
-#![cfg(feature = "alloc")]
-
 use proptest::prelude::*;
 
 proptest! {

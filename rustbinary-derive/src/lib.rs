@@ -111,6 +111,507 @@ pub fn derive_bit_packed(input: TokenStream) -> TokenStream {
         .into()
 }
 
+#[proc_macro_derive(Archive, attributes(archive))]
+/// Derives the zero-copy archived mirror used by
+/// `rustbinary::archive::build` / `OwnedArchive` / `MappedArchive`.
+///
+/// For a named struct, `Archive` generates:
+///
+/// - the `Archived{Name}` mirror (`#[repr(C)]`, derived `Clone` + `Copy`)
+///   whose fields are the archived forms of the source fields,
+/// - the `rustbinary::archive_codec::Archive` impl,
+/// - the `rustbinary::archive_codec::ArchivedValue` marker,
+/// - the `rustbinary::archive_codec::CheckBytes` structural validator that
+///   bounds-checks every relative offset, length, and range in one pass.
+///
+/// Supported field types: scalar primitives (`u8`…`f64`, no `bool`),
+/// `String`, `Vec<T>` of a scalar or of a nested archived struct, and a
+/// nested archived struct field. `bool` is rejected: it has no
+/// `ArchivedValue` (not every byte pattern is a valid `bool`) and would make
+/// zero-copy element slices unsound. Generic type parameters, enums, unions,
+/// `Vec<String>`, and nested `Vec<Vec<…>>` are rejected with a compile
+/// error rather than generating subtly wrong code.
+pub fn derive_archive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    archive_impl(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[proc_macro_derive(Serialize)]
+/// Derives `rustbinary::archive_codec::ArchiveWrite`, the two-phase archive
+/// serializer (skeleton pass then bodies pass).
+///
+/// Apply together with `#[derive(Archive)]` on the same named struct. The
+/// supported field types and rejections match the `Archive` derive.
+pub fn derive_serialize(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    serialize_impl(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// `Archive` and `Serialize` shared field-type guards.
+fn reject_unsupported_archive_fields(fields: &Fields, what: &str) -> syn::Result<()> {
+    for field in fields {
+        let ty = &field.ty;
+        if is_bool(ty) {
+            return Err(syn::Error::new_spanned(
+                ty,
+                format!("{what} does not support `bool` fields (no ArchivedValue; use `u8` with 0/1 or a manual archive implementation)"),
+            ));
+        }
+        if let Some(inner) = vec_element(ty) {
+            if is_bool(inner) {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    format!(
+                        "{what} does not support `Vec<bool>` fields (bool has no ArchivedValue)"
+                    ),
+                ));
+            }
+            if is_string(inner) {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    format!("{what} does not support `Vec<String>` fields yet"),
+                ));
+            }
+        }
+        if is_string(ty) || is_bool(ty) {
+            continue;
+        }
+        if vec_element(ty).is_some() {
+            continue;
+        }
+        if is_scalar(ty) {
+            continue;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the type names the `bool` primitive.
+fn is_bool(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident == "bool")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Whether the type is a scalar primitive supported by the archive codec.
+fn is_scalar(ty: &syn::Type) -> bool {
+    scalar_write_method(ty).is_some()
+}
+
+/// The serializer write method for a scalar primitive, if supported.
+fn scalar_write_method(ty: &syn::Type) -> Option<&'static str> {
+    let path = match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => &type_path.path,
+        _ => return None,
+    };
+    let ident = path.segments.last()?.ident.to_string();
+    match ident.as_str() {
+        "u8" => Some("write_u8"),
+        "u16" => Some("write_u16"),
+        "u32" => Some("write_u32"),
+        "u64" => Some("write_u64"),
+        "i8" => Some("write_i8"),
+        "i16" => Some("write_i16"),
+        "i32" => Some("write_i32"),
+        "i64" => Some("write_i64"),
+        "f32" => Some("write_f32"),
+        "f64" => Some("write_f64"),
+        _ => None,
+    }
+}
+
+/// Whether the type is `String` under any leading path.
+fn is_string(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident == "String")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// If the type is `Vec<T>`, returns the element type.
+fn vec_element(ty: &syn::Type) -> Option<&syn::Type> {
+    let path = match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => &type_path.path,
+        _ => return None,
+    };
+    if path.segments.len() != 1 || path.segments[0].ident != "Vec" {
+        return None;
+    }
+    match &path.segments[0].arguments {
+        syn::PathArguments::AngleBracketed(args) if args.args.len() == 1 => match &args.args[0] {
+            syn::GenericArgument::Type(inner) => Some(inner),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The archived mirror field type for a source field type.
+fn archived_field_type(ty: &syn::Type) -> syn::Result<proc_macro2::TokenStream> {
+    if is_scalar(ty) {
+        Ok(quote!(#ty))
+    } else if is_string(ty) {
+        Ok(quote!(::rustbinary::archive_codec::ArchivedString))
+    } else if let Some(inner) = vec_element(ty) {
+        if is_scalar(inner) {
+            Ok(quote!(::rustbinary::archive_codec::ArchivedVec<#inner>))
+        } else {
+            let archived_inner = quote!(<#inner as ::rustbinary::archive_codec::Archive>::Archived);
+            Ok(quote!(::rustbinary::archive_codec::ArchivedVec<#archived_inner>))
+        }
+    } else {
+        Ok(quote!(<#ty as ::rustbinary::archive_codec::Archive>::Archived))
+    }
+}
+
+/// Alignment of the archived mirror field for a source field type. This is
+/// the alignment the `#[repr(C)]` mirror assigns to the field, which the
+/// serializer and validator replicate with `align_to` / `align_up`.
+fn archived_field_align(ty: &syn::Type) -> proc_macro2::TokenStream {
+    if is_scalar(ty) {
+        quote!(::core::mem::align_of::<#ty>())
+    } else if is_string(ty) {
+        quote!(::core::mem::align_of::<
+            ::rustbinary::archive_codec::ArchivedString,
+        >())
+    } else if let Some(inner) = vec_element(ty) {
+        let archived_inner = if is_scalar(inner) {
+            quote!(#inner)
+        } else {
+            quote!(<#inner as ::rustbinary::archive_codec::Archive>::Archived)
+        };
+        quote!(
+            ::core::mem::align_of::<::rustbinary::archive_codec::ArchivedVec<#archived_inner>>()
+        )
+    } else {
+        let archived_ty = quote!(<#ty as ::rustbinary::archive_codec::Archive>::Archived);
+        quote!(::core::mem::align_of::<#archived_ty>())
+    }
+}
+
+/// Size of the archived mirror field for a source field type.
+fn archived_field_size(ty: &syn::Type) -> proc_macro2::TokenStream {
+    if is_scalar(ty) {
+        quote!(::core::mem::size_of::<#ty>())
+    } else if is_string(ty) {
+        quote!(::core::mem::size_of::<
+            ::rustbinary::archive_codec::ArchivedString,
+        >())
+    } else if let Some(inner) = vec_element(ty) {
+        let archived_inner = if is_scalar(inner) {
+            quote!(#inner)
+        } else {
+            quote!(<#inner as ::rustbinary::archive_codec::Archive>::Archived)
+        };
+        quote!(
+            ::core::mem::size_of::<::rustbinary::archive_codec::ArchivedVec<#archived_inner>>()
+        )
+    } else {
+        let archived_ty = quote!(<#ty as ::rustbinary::archive_codec::Archive>::Archived);
+        quote!(::core::mem::size_of::<#archived_ty>())
+    }
+}
+
+fn archive_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let archived_name = syn::Ident::new(&format!("Archived{name}"), name.span());
+
+    if !input.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &input.generics,
+            "the Archive derive does not support generic type parameters",
+        ));
+    }
+    let fields = match &input.data {
+        Data::Struct(data) => &data.fields,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "the Archive derive only supports structs (enums and unions are rejected)",
+            ))
+        }
+    };
+    reject_unsupported_archive_fields(fields, "the Archive derive")?;
+
+    let archived_fields: Vec<proc_macro2::TokenStream> = fields
+        .iter()
+        .map(|field| {
+            let ident = field.ident.as_ref().expect("named archive field");
+            let ty = &field.ty;
+            let archived = archived_field_type(ty)?;
+            Ok(quote!(#ident: #archived))
+        })
+        .collect::<syn::Result<_>>()?;
+    let check_body = archive_check_body(fields)?;
+
+    Ok(quote! {
+        #[doc = "Archived mirror of `"]
+        #[doc = stringify!(#name)]
+        #[doc = "`, generated by the `Archive` derive."]
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        pub struct #archived_name {
+            #(#archived_fields,)*
+        }
+
+        impl ::rustbinary::archive_codec::Archive for #name {
+            type Archived = #archived_name;
+        }
+
+        unsafe impl ::rustbinary::archive_codec::ArchivedValue for #archived_name {}
+
+        impl ::rustbinary::archive_codec::CheckBytes for #archived_name {
+            fn check_at(
+                bytes: &[u8],
+                base: usize,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                #check_body
+            }
+        }
+    })
+}
+
+/// Structural validator body for the archived mirror of `fields`.
+///
+/// The archived mirror is `#[repr(C)]`, so every field sits at the C-ABI
+/// offset: the size of the previous fields rounded up to the field's
+/// alignment. The generated code reproduces that exact algorithm with
+/// `align_up(offset, align)` and advances by `size_of`, then validates
+/// variable-width fields. Because both sides run the same algorithm, the
+/// validator always walks the same offsets the mirror uses for access.
+fn archive_check_body(fields: &Fields) -> syn::Result<proc_macro2::TokenStream> {
+    let mut statements = Vec::new();
+    for field in fields {
+        let ty = &field.ty;
+        let align = archived_field_align(ty);
+        let size = archived_field_size(ty);
+        if is_scalar(ty) {
+            statements.push(quote! {
+                offset = (offset + ((#align) - (offset % (#align))) % (#align));
+                offset += #size;
+            });
+        } else if is_string(ty) {
+            statements.push(quote! {
+                offset = (offset + ((#align) - (offset % (#align))) % (#align));
+                ::rustbinary::archive_codec::check_string_field(bytes, offset)?;
+                offset += #size;
+            });
+        } else if let Some(inner) = vec_element(ty) {
+            if is_scalar(inner) {
+                statements.push(quote! {
+                    offset = (offset + ((#align) - (offset % (#align))) % (#align));
+                    ::rustbinary::archive_codec::check_vec_field(
+                        bytes,
+                        offset,
+                        ::core::mem::size_of::<#inner>(),
+                        ::core::mem::align_of::<#inner>(),
+                    )?;
+                    offset += #size;
+                });
+            } else {
+                let archived_inner =
+                    quote!(<#inner as ::rustbinary::archive_codec::Archive>::Archived);
+                statements.push(quote! {
+                    offset = (offset + ((#align) - (offset % (#align))) % (#align));
+                    ::rustbinary::archive_codec::check_vec_nested::<#archived_inner>(
+                        bytes,
+                        offset,
+                        ::core::mem::size_of::<#archived_inner>(),
+                        ::core::mem::align_of::<#archived_inner>(),
+                    )?;
+                    offset += #size;
+                });
+            }
+        } else {
+            let archived_ty = quote!(<#ty as ::rustbinary::archive_codec::Archive>::Archived);
+            statements.push(quote! {
+                offset = (offset + ((#align) - (offset % (#align))) % (#align));
+                <#archived_ty as ::rustbinary::archive_codec::CheckBytes>::check_at(
+                    bytes,
+                    offset,
+                )?;
+                offset += #size;
+            });
+        }
+    }
+    Ok(quote! {
+        let mut offset = base;
+        #(#statements)*
+        Ok(())
+    })
+}
+
+fn serialize_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+
+    if !input.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &input.generics,
+            "the Serialize derive does not support generic type parameters",
+        ));
+    }
+    let fields = match &input.data {
+        Data::Struct(data) => &data.fields,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "the Serialize derive only supports structs (enums and unions are rejected)",
+            ))
+        }
+    };
+    reject_unsupported_archive_fields(fields, "the Serialize derive")?;
+
+    let skeleton = serialize_skeleton_body(fields)?;
+    let bodies = serialize_bodies_body(fields)?;
+
+    Ok(quote! {
+        impl ::rustbinary::archive_codec::ArchiveWrite for #name {
+            fn write_skeleton(
+                &self,
+                serializer: &mut ::rustbinary::archive_codec::ArchiveSerializer,
+                positions: &mut ::std::collections::VecDeque<usize>,
+            ) {
+                #skeleton
+            }
+
+            fn write_bodies(
+                &self,
+                serializer: &mut ::rustbinary::archive_codec::ArchiveSerializer,
+                positions: &mut ::std::collections::VecDeque<usize>,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                #bodies
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Skeleton phase: write inline scalars (C-aligned), reserve a `RelPtr`
+/// placeholder for every variable-width field, and recurse into direct nested
+/// structs. Every field is preceded by `align_to` so the buffer matches the
+/// `#[repr(C)]` mirror byte for byte.
+fn serialize_skeleton_body(fields: &Fields) -> syn::Result<proc_macro2::TokenStream> {
+    let mut statements = Vec::new();
+    for field in fields {
+        let member = field.ident.as_ref().expect("named archive field");
+        let ty = &field.ty;
+        let align = archived_field_align(ty);
+        if let Some(method) = scalar_write_method(ty) {
+            let method = syn::Ident::new(method, ty.span());
+            statements.push(quote! {
+                serializer.align_to(#align);
+                serializer.#method(self.#member);
+            });
+        } else if is_string(ty) || vec_element(ty).is_some() {
+            statements.push(quote! {
+                serializer.align_to(#align);
+                positions.push_back(serializer.reserve_ptr());
+            });
+        } else {
+            statements.push(quote! {
+                serializer.align_to(#align);
+                ::rustbinary::archive_codec::ArchiveWrite::write_skeleton(
+                    &self.#member,
+                    serializer,
+                    positions,
+                );
+            });
+        }
+    }
+    Ok(quote!(#(#statements)*))
+}
+
+/// Bodies phase: write string/vec data and patch placeholders, or recurse
+/// into direct nested structs. `Vec<T>` of a scalar uses the Pod fast path;
+/// `Vec<T>` of a nested struct writes all element skeletons contiguously
+/// first (so the element array is a run of fixed-size mirrors) and then all
+/// element bodies.
+fn serialize_bodies_body(fields: &Fields) -> syn::Result<proc_macro2::TokenStream> {
+    let mut statements = Vec::new();
+    for field in fields {
+        let member = field.ident.as_ref().expect("named archive field");
+        let ty = &field.ty;
+        if is_scalar(ty) {
+            // Inline scalar: nothing to do in the bodies phase.
+        } else if is_string(ty) {
+            statements.push(quote! {
+                {
+                    let field_pos = positions
+                        .pop_front()
+                        .ok_or("archive: missing string body position")?;
+                    serializer.write_string_at(field_pos, &self.#member);
+                }
+            });
+        } else if let Some(inner) = vec_element(ty) {
+            if is_scalar(inner) {
+                statements.push(quote! {
+                    {
+                        let field_pos = positions
+                            .pop_front()
+                            .ok_or("archive: missing vec body position")?;
+                        serializer.write_vec_at(field_pos, &self.#member);
+                    }
+                });
+            } else {
+                let archived_inner =
+                    quote!(<#inner as ::rustbinary::archive_codec::Archive>::Archived);
+                statements.push(quote! {
+                    {
+                        let field_pos = positions
+                            .pop_front()
+                            .ok_or("archive: missing vec body position")?;
+                        let data_pos = serializer.len();
+                        serializer.write_u32(
+                            ::core::convert::TryInto::try_into(self.#member.len())
+                                .unwrap_or(::core::u32::MAX),
+                        );
+                        serializer.align_to(::core::mem::align_of::<#archived_inner>());
+                        for element in &self.#member {
+                            ::rustbinary::archive_codec::ArchiveWrite::write_skeleton(
+                                element,
+                                serializer,
+                                positions,
+                            );
+                        }
+                        for element in &self.#member {
+                            ::rustbinary::archive_codec::ArchiveWrite::write_bodies(
+                                element,
+                                serializer,
+                                positions,
+                            )?;
+                        }
+                        serializer.patch_ptr(field_pos, data_pos);
+                    }
+                });
+            }
+        } else {
+            statements.push(quote! {
+                ::rustbinary::archive_codec::ArchiveWrite::write_bodies(
+                    &self.#member,
+                    serializer,
+                    positions,
+                )?;
+            });
+        }
+    }
+    Ok(quote!(#(#statements)*))
+}
+
 #[proc_macro_derive(CompactBinary, attributes(njson))]
 /// Derives `rustbinary::compact::CompactEncode` and
 /// `rustbinary::compact::CompactDecode` — the schema-guided compact binary
@@ -230,9 +731,6 @@ fn compact_variant_encode(fields: &Fields) -> syn::Result<proc_macro2::TokenStre
 
 fn compact_decode_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
-
-    // `impl` generics: `'de` first, `CompactDecode<'de>` bounds on every type
-    // parameter, and `'de: 'a` predicates so borrowed fields can borrow input.
     let mut impl_generics = input.generics.clone();
     impl_generics.params.insert(0, parse_quote!('de));
     for parameter in impl_generics.type_params_mut() {
@@ -857,13 +1355,12 @@ fn declared_symbols(field: &syn::Field) -> syn::Result<Option<u32>> {
             "use #[entropy(symbols = N)]",
         ));
     };
-    // Parse and validate in one pass; the parsed value is the result.
+
     let mut count = None;
     list.parse_nested_meta(|meta| {
         if meta.path.is_ident("symbols") {
             let value: syn::LitInt = meta.value()?.parse()?;
             let parsed: u32 = value.base10_parse()?;
-            // The rANS alphabet is capped by the total frequency M = 2^15.
             if parsed == 0 || parsed > 1 << 15 {
                 return Err(meta.error("symbols must be in 1..=32768"));
             }

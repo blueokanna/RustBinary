@@ -5,6 +5,12 @@ RustBinary 是一个基于 [nextjson](https://crates.io/crates/nextjson) 的有�
 把结构化数据搬上线或落进文件——对面可能是恶意的，内存可能很紧，而且你希望在解码器跑起来
 之前就知道它最多会吃掉多少资源。
 
+- **MSRV**：Rust 1.78（两个 crate 均硬性锁定，CI 在精确工具链上验证；依赖图锁定在仍能在
+  1.78 构建的版本）。
+- **`no_std` 优先**：crate 无条件 `#![no_std]` + `alloc`；`std` 是可选 feature，只额外提供
+  I/O 适配器与仅 std 的转换层。自描述核心与所有自研 feature（adaptive、entropy、reconcile、
+  evolution、projection、bounded、probe）均可不带 `std` 构建。
+
 这里每个特性都回答一个具体问题——"这个帧我拒得起吗？"、"轻客户端能不能不扫全记录就读
 一个字段？"、"这种类型最坏能把我的堆怎么样？"——下文先给答案，再说明代价。本库没有装饰
 性功能；凡是取舍而非纯赢的特性，README 都会直说。
@@ -35,33 +41,44 @@ bincode-next、postcard、rkyv、minicbor 对比，输在哪一行都写得清�
 这部分差距。如果你的负载是异构记录、必须无歧义往返、且在没有带外 schema 的情况下可读，
 标签税买来的就是这些。
 
-`archive` 特性**不是第二种流格式**。它是独立的存储格式——rkyv 扁平相对指针 + RustBinary
-信封——用于只读内存映射对象存储，并独立版本化（`RBARC002`）。流编解码器从不做内存强转、
-从不产生相对指针、也从不因为某个 Cargo feature 改变自己的行为。
+`archive` 特性**不是第二种流格式**。它是独立的存储格式——库内自研、根在前的相对指针
+编解码器 + RustBinary 信封——用于只读内存映射对象存储，并独立版本化（`RBARC004`）。
+流编解码器从不做内存强转、从不产生相对指针、也从不因为某个 Cargo feature 改变自己的
+行为。
 
 ## 依赖策略
 
-流路径依赖 nextjson，以及可选的派生 crate。可选 pipeline 增加 zstd、
-chacha20poly1305、getrandom、zeroize。archive 增加 memmap2、rkyv 与 **blake3**。
-供应链策略与密码实现策略是刻意分离的两个决策：
+这个库刻意**自包含**。流路径依赖 nextjson 与可选的派生 crate；其他 codec 会以第三方
+依赖引入的每个原语，这里都在库内实现：
 
-- **供应链**：第三方依赖被限制在真正需要的层（pipeline 编解码、归档存储、Merkle
-  哈希），且都是可选 Cargo feature；流核心保持轻依赖。
-- **密码实现**：凡是承载安全或完整性语义的原语都用经过审计的 crate，而不是库内
-  自研。归档 Merkle 树使用官方 **`blake3`** crate（正式审查过的实现）；本库不再
-  自带任何哈希原语。熵层完全不需要哈希——它靠重放校验帧，残余检测缺口见熵编码一节。
+| 原语              | 库内模块           | 替代        |
+| ----------------- | ------------------ | ----------- |
+| BLAKE3（Merkle + 投影证明） | `crate::hash` | `blake3`    |
+| XChaCha20-Poly1305 AEAD（RFC 8439） | `crate::aead` | `chacha20poly1305` |
+| OS CSPRNG + zeroize | `crate::entropy`  | `getrandom`、`zeroize` |
+| LZ77 无损压缩     | `crate::lz`        | `zstd`      |
+| 只读 mmap         | `crate::mmap`      | `memmap2`   |
+| 零拷贝归档编解码器 | `crate::archive_codec` | `rkyv`  |
 
-若威胁模型要求更小的依赖面，`blake3` crate 可替换为任何 `fn(&[u8]) -> [u8; 32]`
-实现而不改变归档布局（调用点只有 `src/archive.rs` 里的一处包装）；域分离与树几何
-归归档模块所有，不归哈希原语所有。
+- **MSRV**：crate 钉死 Rust 1.78（`rustbinary` 与 `rustbinary-derive` 均为
+  `rust-version = "1.78"`），CI 矩阵在该精确工具链上验证每种 feature 组合。nextjson
+  钉到 `=0.1.4`——其序列化/反序列化路径**拒绝非有限浮点**（`NaN`/`±Inf` 是错误，
+  不是可往返的值）；RustBinary 继承并测试该契约。
+- **供应链**：运行时依赖图恰好是 `nextjson`（及其派生）与库内 `rustbinary-derive`，
+  不再链接任何其他 crate；dev-dependencies（proptest 做属性测试）钉在仍能在 1.78
+  构建的版本。
+- **密码实现**：每个原语都在库内实现并用官方向量校验——BLAKE3 对官方测试套件、
+  ChaCha20-Poly1305 对 RFC 8439 向量，AEAD framing 与旧 `chacha20poly1305` 管线
+  逐字节一致（golden-vector 测试锁定旧字节）。Merkle 树同样用库内 BLAKE3，整个
+  完整性路径零依赖。
 
 ## 分层
 
 | 层          | 模块                   | 默认启用 | 职责                                                                 |
 | ----------- | ---------------------- | -------- | -------------------------------------------------------------------- |
-| **Core**    | `rustbinary::core`     | 是       | 紧凑编解码、资源上限、尾随策略、调用方缓冲区、`no_std`              |
+| **Core**    | `rustbinary::core`     | 是       | 紧凑编解码、资源上限、尾随策略、调用方缓冲区；始终 `no_std`          |
 | **Protocol**| `rustbinary::protocol` | 否       | Schema 演进、指纹、反射、静态上界、位打包                           |
-| **Pipeline**| `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理                                    |
+| **Pipeline**| `rustbinary::pipeline` | 否       | CBOR、压缩、加密、有序并行批处理（`std`）                           |
 | **Sync**    | `sync`                 | 否       | rANS 熵编码、差分帧、IBLT 集合协调、信任演算                        |
 | **Archive** | `rustbinary::archive`  | 否       | Merkle 校验的只读内存映射对象存储                                   |
 | **Projection**| `rustbinary::projection`| 否     | 可投影自认证记录，具备投影健全性                                     |
@@ -91,20 +108,22 @@ chacha20poly1305、getrandom、zeroize。archive 增加 memmap2、rkyv 与 **bla
 | 差分帧                  | 已实现     | 基准相对整数差分 + 确定性 HPACK 式动态表                                    |
 | IBLT 集合协调           | 已实现     | 自研可逆布隆查找表（Goodrich 与 Mitzenmacher）                              |
 | 信任演算                | 已实现     | 类型级认证状态机；未认证接收在类型层面不可表达                              |
-| Merkle 归档             | 已实现     | 审计 BLAKE3 树，O(log n) 证明，仅信封打开                                |
+| Merkle 归档             | 已实现     | 库内 BLAKE3 树，O(log n) 证明，仅信封打开                                |
 | 可投影自认证记录        | 已实现     | 投影健全性、O(log n) 证明、schema 版本绑定、跳过未知字段                   |
 | 资源有界解码            | 已实现     | schema 派生 B/A/D/W 成本代数，预算强制的 `decode_bounded` 并带用量证据      |
 | 可配置深度上限          | 已实现     | `Config::with_depth_limit` 在编码与解码两侧限制嵌套深度                     |
 | 形式化验证              | Kani 证明  | varint/ZigZag 核心 + 投影树几何 + 预算极限代数                              |
-| `no_std`                | 已实现     | Compact slice 编解码与调用方缓冲区无需默认 feature                          |
-| `no_std + alloc`        | 已实现     | owned 值、指纹、演进、自适应、熵、集合协调                                  |
+| `no_std` 优先               | 已实现     | crate 无条件 `no_std` + `alloc`；`std` 是可选 feature                  |
+| `no_std` 各层              | 已实现     | compact、adaptive、entropy、reconcile、evolution、projection、bounded、probe、CBOR、trust 演算均可不带 `std` 构建 |
 
 ## 安装
 
 ```toml
 [dependencies]
 rustbinary = "0.1"
-nextjson = { version = "0.1", features = ["derive"] }
+# nextjson 钉到精确的 codec 目标：0.1.4 在编码与解码两侧拒绝非有限浮点，
+# RustBinary 继承该契约。
+nextjson = { version = "=0.1.4", features = ["derive"] }
 ```
 
 按需启用：
@@ -115,20 +134,26 @@ rustbinary = { version = "0.1", features = ["sync"] }       # 熵 + 集合协调
 rustbinary = { version = "0.1", features = ["archive"] }    # Merkle mmap 归档
 ```
 
-Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵编码器零依赖，归档用审计过的
-`blake3` crate 做哈希（见依赖策略）。
+`no_std` 目标关闭 `std` 并按需启用各层——核心、Protocol 以及所有自研 feature 均可不带 `std` 构建：
+
+```toml
+rustbinary = { version = "0.1", default-features = false, features = ["compact"] }
+```
+
+全部是纯 Rust，无 C 构建步骤，运行时依赖图恰好是 nextjson 加库内派生 crate（见依赖
+策略）。
 
 ### 特性矩阵
 
 | Feature            | 默认 | 用途                                                                        |
 | ------------------ | ---- | --------------------------------------------------------------------------- |
-| `std`              | 是   | owned Core 与 I/O API；Pipeline、SIMD、trust 需要                           |
-| `alloc`            | via std | 兼容标记；owned API 始终可用                                          |
+| `std`              | 是   | I/O 适配器与仅 std 的转换层（archive、compression、encryption、parallel、SIMD、trust 会话）；自描述核心始终 `no_std` |
 | `protocol`         | 否   | 聚合：adaptive, bit-packing, derive, fingerprint, reflection, schema-evolution, static-size |
 | `pipeline`         | 否   | 聚合：cbor, compression, encryption, parallel                               |
 | `sync`             | 否   | 聚合：entropy, reconcile, trust                                             |
-| `archive`          | 否   | Merkle 校验的 mmap 归档；需要 `std`, rkyv, memmap2                          |
-| `derive`           | 否   | 重导出过程宏及其运行时 feature                                              |
+| `archive`          | 否   | Merkle 校验的 mmap 归档；库内 codec、mmap 与 BLAKE3；需要 `std` 与 `derive`  |
+| `compact`          | 是   | schema 指导的紧凑简档运行时；隐含 `derive`（该简档通过 `CompactBinary` derive 使用） |
+| `derive`           | 否   | 重导出过程宏及其运行时 feature；被 `compact` 与 `archive` 隐含                        |
 | `fingerprint`      | 否   | 结构指纹运行时与 frame                                                      |
 | `reflection`       | 否   | 无分配反射运行时                                                            |
 | `static-size`      | 否   | 编译期上界运行时                                                            |
@@ -139,12 +164,12 @@ Zstandard 需要构建主机上有 C 工具链；其余全部是纯 Rust，熵�
 | `reconcile`        | 否   | 差分帧（`delta`）与 IBLT（`ibl`）                                          |
 | `trust`            | 否   | 类型级信任演算与会话状态机                                                  |
 | `cbor`             | 否   | 经 nextjson 中继的 RFC 8949 CBOR                                           |
-| `compression`      | 否   | 自适应 Zstandard frame                                                      |
+| `compression`      | 否   | 库内 LZ77 frame                                                            |
 | `encryption`       | 否   | XChaCha20-Poly1305、OS 随机、zeroize 密钥                                   |
 | `parallel`         | 否   | scoped 线程有序 batch frame                                                 |
 | `schema-evolution` | 否   | 稳定字段 ID 版本化 frame                                                    |
-| `bounded`          | 否   | `DecodeBounded` 成本代数（B/A/D/W）、`Budget`、`decode_bounded`；需要 `std` 与 `derive` |
-| `projection`       | 否   | 可投影自认证记录与投影证明；需要 `std` 与审计过的 `blake3`                  |
+| `bounded`          | 否   | `DecodeBounded` 成本代数（B/A/D/W）、`Budget`、`decode_bounded`；`no_std`，需要 `derive` |
+| `projection`       | 否   | 可投影自认证记录与投影证明；`no_std`，库内 BLAKE3                          |
 
 ## 快速开始
 
@@ -187,7 +212,7 @@ let secure = rustbinary::options()
     .with_limit(16 * 1024 * 1024)
     .with_cbor_format()
     .with_deterministic_encoding()
-    .with_zstd_compression(3)
+    .with_compression(3)
     .with_compression_threshold(256)
     .with_encryption(rustbinary::EncryptionKey::new([0xA5; 32]));
 # let value = vec![1u32, 2, 3];
@@ -494,7 +519,7 @@ W(T)  最坏工作量（读字节 + 逐字段开销）
 ## CBOR、压缩与加密
 
 pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR 递归排序规范 map 键。压缩
-只在超过大小阈值时运行，且仅当 Zstandard 输出严格更小时才存储。加密把完整 frame 头
+只在超过大小阈值时运行，且仅当库内 LZ77 输出严格更小时才存储。加密把完整 frame 头
 （算法、nonce、长度）作为 AEAD 关联数据认证，每次使用全新 192-bit nonce，因此密文
 刻意不确定。
 
@@ -516,12 +541,17 @@ pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR �
 
 ## 带 Merkle 证明的内存映射归档
 
-`archive` 特性是存储格式：rkyv 扁平相对指针布局包在 128 字节 RustBinary 信封里。`build`
-产出信封、小端负载，以及覆盖固定大小负载块的 BLAKE3 Merkle 树。哈希使用审计过的
-`blake3` crate（见依赖策略）；域分离（`LEAF`/`NODE`/`PAD` 标签加大端索引）与树几何
-是本模块自己的。信封记录格式版本、flags、非零应用 schema
-ID、负载/文件
-长度、块大小与块数、Merkle 根与哈希区位置。
+`archive` 特性是存储格式：库内自研、根在前的相对指针编解码器（`crate::archive_codec`）
+包在 128 字节 RustBinary 信封里。`build` 产出信封、小端负载，以及覆盖固定大小负载块
+的 BLAKE3 Merkle 树。哈希使用库内 BLAKE3（`crate::hash`，用官方测试向量校验）；
+域分离（`LEAF`/`NODE`/`PAD` 标签加大端索引）与树几何是本模块自己的。信封记录格式
+版本、flags、非零应用 schema ID、负载/文件长度、块大小与块数、Merkle 根与哈希区位置。
+
+归档类型是普通 struct 加 `#[derive(Archive, Serialize)]`（`#[archive(check_bytes)]`
+为兼容而接受）。derive 生成 `#[repr(C)]` 镜像类型（32 位相对指针，根在负载偏移 0）、
+一次性结构校验器（`CheckBytes`）与两阶段写入器；任何零拷贝访问前，每个偏移、长度、
+区间都被边界检查。`bool` 字段被 derive 拒绝（并非每个字节模式都是合法 `bool`）；
+支持的字段面在派生 crate 中说明。
 
 两种访问模式：
 
@@ -626,8 +656,8 @@ cargo kani -p rustbinary --harness canonical::zigzag_injective
 cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
 ```
 
-归档的 BLAKE3 用官方 BLAKE3 测试向量校验，覆盖单块、块组边界与多块组长度。
-测试向量只校验正确性，不是实现级审计——见依赖策略。
+归档的 BLAKE3 用库内实现（`crate::hash`），并按官方 BLAKE3 测试向量逐字节校验，覆盖
+单块、块组边界与多块组长度。测试向量只校验正确性；实现级的每次改动由同一测试套件把关。
 
 ### 属性测试（proptest）
 
@@ -734,7 +764,7 @@ cargo doc --workspace --all-features --no-deps
 1.0 之前，线格式可能在 minor 版本之间变化，并必须在发布说明中点名。长期部署应锁定
 版本、记录完整配置、保留 golden vectors、使用显式 schema ID。存在两个独立版本化的
 格式族：流格式（`RBAN` 熵 frame、`RBZ1`/`RBX1` pipeline frame）与归档存储格式
-（`RBARC002`）。一个格式族的变更绝不静默影响另一个。
+（`RBARC004`）。一个格式族的变更绝不静默影响另一个。
 
 ## 非目标
 

@@ -22,6 +22,9 @@
 | `StaticSize` | `rustbinary::StaticSize` | 获取编译期最坏大小上界 |
 | `Reflect` | `rustbinary::Reflect` | 读取静态字段和 variant 元数据 |
 | `BitPacked` | `rustbinary::BitPack` | 对有界字段按 bit 压缩存储 |
+| `CompactBinary` | `rustbinary::compact::{CompactEncode, CompactDecode}` | schema 指导的紧凑线格式（无 tag、无字段名） |
+| `Archive` | `rustbinary::archive_codec::{Archive, ArchivedValue, CheckBytes}` | 供 mmap 归档（只读对象存储）使用的零拷贝镜像 |
+| `Serialize` | `rustbinary::archive_codec::ArchiveWrite` | 两阶段归档序列化（与 `Archive` 搭配） |
 
 这些宏不会实现 `nextjson::NsonSerialize` 或 `nextjson::NsonDeserialize`。需要普通二进制、
 CBOR、压缩、加密或 Schema 演进时，应把它们和 nextjson derive 组合使用。
@@ -32,8 +35,9 @@ CBOR、压缩、加密或 Schema 演进时，应把它们和 nextjson derive 组
 
 ```toml
 [dependencies]
-nextjson = { version = "0.1", features = ["derive"] }
-rustbinary = { version = "0.1.4", features = [
+# 钉到精确的 runtime 目标（0.1.4 拒绝非有限浮点）。
+nextjson = { version = "=0.1.4", features = ["derive"] }
+rustbinary = { version = "0.1.8", features = [
     "derive",
     "fingerprint",
     "reflection",
@@ -52,13 +56,13 @@ rustbinary = { version = "0.1.4", features = [
 
 ```toml
 [dependencies]
-rustbinary = { version = "0.1.4", features = [
+rustbinary = { version = "0.1.8", features = [
     "fingerprint",
     "reflection",
     "static-size",
     "bit-packing",
 ] }
-rustbinary-derive = "0.1.4"
+rustbinary-derive = "0.1.5"
 ```
 
 workspace 中同时写 `path` 和 `version` 是有意设计的。本地构建使用路径，
@@ -310,6 +314,50 @@ struct Outer {
 
 自定义字段类型可以在 runtime crate 中实现 `BitPack` 或 `BitValue`。derive
 只会选择对应 trait 路径，不会猜测自定义类型的表示方式。
+
+## `Archive` 与 `Serialize`
+
+这两个 derive 支撑 `rustbinary` 的 archive 特性——只读、Merkle 校验、内存映射的
+对象存储。它们用库内自研、根在前的相对指针编解码器取代了原先基于 rkyv 的归档。
+
+对同一个命名 struct 同时使用：
+
+```rust
+use rustbinary::archive::{Archive, Serialize};
+
+#[derive(Archive, Serialize)]
+#[archive(check_bytes)] // 为兼容而接受；校验始终生成
+struct Reading {
+    sensor_id: u32,
+    label: String,
+    samples: Vec<i32>,
+}
+```
+
+- `Archive` 生成 `ArchivedReading` 镜像类型（`#[repr(C)]`，派生 `Clone` + `Copy`）、
+  `rustbinary::archive_codec::Archive` impl、`ArchivedValue` 标记（使归档 struct
+  可以放进 `ArchivedVec` 元素切片）以及 `CheckBytes` 结构校验器。校验器复刻
+  C-ABI 字段偏移，并在一次遍历中边界检查每个相对指针、长度与区间。
+- `Serialize` 生成两阶段 `ArchiveWrite` 序列化器：骨架阶段写出定长镜像（与 C ABI
+  相同的对齐填充）并记录占位符位置；body 阶段写出字符串/向量数据并回填占位符。
+  `Vec<T>`（T 为嵌套归档 struct）先把全部元素镜像连续写出，再写它们的 body，
+  因此元素数组是一串定长值。
+
+支持的字段类型：
+
+- 标量原语 `u8`…`f64`（内联）；
+- `String`（4 字节相对指针 + `u32` 长度 + UTF-8 字节）；
+- `Vec<T>`，其中 `T` 是标量或嵌套归档 struct；
+- 直接嵌套的归档 struct 字段。
+
+以下情况会在宏展开时报出带源码位置的编译错误：`bool`（并非每个字节模式都是合法
+`bool`，零拷贝元素切片会不健全）、`Vec<String>`、嵌套 `Vec<Vec<…>>`、泛型类型
+参数、枚举与 union。元组与数组字段暂不支持——归档类型请保持在上述范围内。镜像
+不可变；`build`/`OwnedArchive`/`MappedArchive` 见 runtime crate 文档。
+
+与其他 derive 不同，`Archive`/`Serialize` 生成的代码使用 `::std::` 路径
+（`VecDeque`、`String`）。这是刻意的：`archive` runtime feature 隐含 `std`，
+因此生成代码只会在 `std` 上下文中展开。
 
 ## 支持的数据形状
 
