@@ -12,7 +12,8 @@
 //!   [ data region: string / vec bodies   ]
 //! ```
 //!
-//! Every variable-width field in a struct is a [`RelPtr`]: a signed 32-bit
+//! Every variable-width field in a struct is a
+//! [`crate::archive_codec::RelPtr`]: a signed 32-bit
 //! byte offset **from the field's own address** to its data. Because the data
 //! region always follows the struct that references it, offsets are positive
 //! and the pointer math is monotonic.
@@ -20,11 +21,11 @@
 //! - A `String` body is `u32 byte_len` followed by UTF-8 bytes.
 //! - A `Vec<T>` body is `u32 count`, padding to `align_of::<T>()`, then
 //!   `count` `T` elements. The padding keeps the element array aligned so
-//!   [`ArchivedVec::as_slice`] can build a `&[T]` without an unaligned
+//!   [`crate::archive_codec::ArchivedVec::as_slice`] can build a `&[T]` without an unaligned
 //!   read.
 //! - Archived structs are fixed-size mirrors of their source (primitives
-//!   inline, strings and vecs as [`RelPtr`]), so a `Vec<Reading>` is a
-//!   contiguous array of fixed-size [`ArchivedVec`] elements.
+//!   inline, strings and vecs as [`crate::archive_codec::RelPtr`]), so a `Vec<Reading>` is a
+//!   contiguous array of fixed-size [`crate::archive_codec::ArchivedVec`] elements.
 //!
 //! # Two-phase serialization
 //!
@@ -39,7 +40,7 @@
 //!
 //! The only `unsafe` is `from_raw_parts` for slices of archived primitives
 //! and `from_utf8_unchecked` for validated strings, both reached only after
-//! [`CheckBytes`] has proven every offset, length, and range in-bounds. The
+//! [`crate::archive_codec::CheckBytes`] has proven every offset, length, and range in-bounds. The
 //! backing buffer is `ALIGN`-aligned (see the archive envelope), so the root
 //! and every element array start on an alignment boundary.
 
@@ -452,7 +453,9 @@ pub(crate) fn vec_elements_offset(body_base: usize, align: usize) -> usize {
     after_count + pad
 }
 
-/// [`vec_elements_offset`] for a concrete element type.
+/// The alignment helper for a concrete element type, mirroring the private
+/// `vec_elements_offset` used by the writer and validators (crate-private, so
+/// not linkable from public docs).
 pub fn vec_elements_offset_of<T>(body_base: usize) -> usize {
     vec_elements_offset(body_base, core::mem::align_of::<T>())
 }

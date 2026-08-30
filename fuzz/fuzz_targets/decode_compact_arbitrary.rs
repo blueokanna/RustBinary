@@ -33,8 +33,6 @@ enum FuzzEvent {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Tight resource policies so a hostile length prefix cannot force a huge
-    // allocation; the decoder must reject it instead.
     let config = rustbinary::options()
         .with_limit(1 << 20)
         .with_collection_limit(1 << 16)

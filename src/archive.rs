@@ -8,7 +8,8 @@
 //! **Merkle tree over the payload**.
 //!
 //! Every archive (format version 4) carries a BLAKE3 Merkle root in the
-//! envelope, computed with the in-tree [`crate::hash`] implementation. A full
+//! envelope, computed with the in-tree BLAKE3 implementation (`crate::hash`).
+//! A full
 //! [`crate::archive::MappedArchive::open`] validates the envelope, the
 //! relative-pointer graph, and the Merkle root once. For TB-scale archives,
 //! [`crate::archive::MappedArchive::open_header_only`] verifies only the envelope, and every
