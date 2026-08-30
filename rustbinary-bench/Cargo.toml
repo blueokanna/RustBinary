@@ -1,6 +1,6 @@
 [package]
 name = "rustbinary-bench"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "Standalone benchmark crate comparing rustbinary against bincode 1/2, postcard, cbor4ii, and minicbor"
@@ -16,7 +16,6 @@ rustbinary = { path = "..", features = [
 ] }
 nextjson = { version = "0.1.4", features = ["derive"] }
 
-# serde-family opponents (bench-only; never part of rustbinary itself).
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 bincode2 = { package = "bincode", version = "2.0.1", features = ["serde"] }

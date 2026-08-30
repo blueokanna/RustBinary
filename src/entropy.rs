@@ -20,7 +20,6 @@
 //! of key material is the operating system CSPRNG, so that is exactly what
 //! this module exposes.
 
-use alloc::format;
 use alloc::string::{String, ToString};
 
 /// Fills `output` with cryptographically secure random bytes.
@@ -37,6 +36,7 @@ pub fn fill_os_random(output: &mut [u8]) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn fill_windows(output: &mut [u8]) -> Result<(), String> {
+    use alloc::format;
     use core::ffi::c_void;
     use std::os::raw::c_ulong;
 

@@ -125,6 +125,8 @@ impl Mmap {
         use std::os::unix::io::AsRawFd;
 
         // Minimal POSIX mmap interface; linked against the system libc.
+        // `munmap` is declared locally in `Drop`, which owns the only unmap
+        // call site, so it is not repeated here.
         extern "C" {
             fn mmap(
                 addr: *mut core::ffi::c_void,
@@ -134,7 +136,6 @@ impl Mmap {
                 fd: i32,
                 offset: i64,
             ) -> *mut core::ffi::c_void;
-            fn munmap(addr: *mut core::ffi::c_void, length: usize) -> i32;
         }
 
         const PROT_READ: i32 = 0x1;
@@ -149,14 +150,20 @@ impl Mmap {
                 len: 0,
             });
         }
-        let mapped = mmap(
-            core::ptr::null_mut(),
-            len,
-            PROT_READ,
-            MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        );
+        // SAFETY: `mmap` is linked against the system libc and called with a
+        // null address (kernel chooses), a real fd from the live file, and
+        // read-only private flags. The returned pointer is checked against
+        // `MAP_FAILED` and null before use.
+        let mapped = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
         if mapped == MAP_FAILED || mapped.is_null() {
             return Err(std::io::Error::last_os_error());
         }

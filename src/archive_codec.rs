@@ -189,6 +189,11 @@ impl<T: ArchivedValue> core::ops::Index<usize> for ArchivedVec<T> {
 /// All such values are `Copy`; their alignment is at most 8, which the archive
 /// buffer guarantees for every element array.
 ///
+/// # Safety
+///
+/// Implementing types must have `align_of::<Self>() <= 8`, be `Copy`, and
+/// their bytes must be a valid in-memory value for every possible byte
+/// pattern.
 pub unsafe trait ArchivedValue: 'static + Copy {}
 
 macro_rules! archived_primitive {
