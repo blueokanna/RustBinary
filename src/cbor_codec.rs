@@ -1,51 +1,14 @@
-//! Streaming RFC 8949 CBOR codec implementing [`nextjson::FormatEncoder`]
-//! and [`nextjson::FormatDecoder`] directly over the wire bytes.
+//! Streaming CBOR over nextjson format traits, without an intermediate value tree.
+//! Supports the JSON value model, native byte strings, and 128-bit bignums.
+//! Maps require text keys. Encoding uses indefinite containers; decoding also
+//! accepts definite containers. This is not RFC 8949 deterministic encoding.
 //!
-//! This module is RustBinary's own CBOR implementation. It is the native
-//! `T -> events -> CBOR bytes` / `CBOR bytes -> events -> T` path: values are
-//! decoded straight from the input slice into the requested type with no
-//! intermediate value tree and no JSON text round-trip, so the memory peak of
-//! a decoded value is the decoded value itself.
-//!
-//! # Wire profile
-//!
-//! The profile is deliberately small and follows the JSON-compatible
-//! subset of RFC 8949 plus explicit native byte strings, matching what the
-//! rest of the crate's cross-format surface accepts:
-//!
-//! - `null` → `0xf6`, `false`/`true` → `0xf4`/`0xf5`;
-//! - integers encode with the shortest definite head (major 0/1); values
-//!   beyond `u64`/`i64` use the RFC 8949 bignum tags `2`/`3`;
-//! - `f32`/`f64` → `0xfa`/`0xfb`; half-precision `0xf9` decodes to `f64`;
-//! - text strings → major 3, byte strings → major 2 (native byte-string wire
-//!   type used by [`FormatEncoder::write_bytes`]);
-//! - arrays and maps use the indefinite-length forms (`0x9f`/`0xbf` …
-//!   `0xff`), matching the crate's streaming encoder (no length patching);
-//! - object keys are text strings, matching the JSON data model;
-//! - `Option` maps to the JSON shape: `None` → `null`, `Some` → payload.
-//!
-//! Decoding accepts both definite- and indefinite-length containers and text
-//! strings. Non-`2/3` semantic tags are ignored (their payload is decoded),
-//! matching RFC 8949's model that tags annotate, never replace, a value.
-//!
-//! # Resource limits
-//!
-//! The same [`crate::Config`] policies as the native codec apply: the byte
-//! limit bounds every read/write, the collection limit bounds the element
-//! count of one sequence or map (checked eagerly for definite containers),
-//! and nesting is capped at [`crate::tags::MAX_DEPTH`].
-//!
-//! # Semantics of `bytes`
-//!
-//! [`FormatDecoder::bytes`] is overridden to read the native major-2 byte
-//! string (or an array of `u8`, matching the JSON spelling). Because the
-//! nextjson token model has no byte-string token, `peek_token`/`next_token`
-//! reject a raw major-2 value as outside the JSON-compatible value model;
-//! `bytes()` and `option_tag` inspect the wire directly so `Option<Bytes>`
-//! style payloads keep working.
+//! Byte, per-collection and configured depth limits apply. These limits do not
+//! constrain custom trait code or allocator overhead. Native byte strings use
+//! `FormatDecoder::bytes`; nextjson's token model cannot represent them.
 
 use alloc::borrow::Cow;
-use alloc::borrow::ToOwned;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use nextjson::de::Mark;
@@ -76,10 +39,6 @@ pub(crate) struct CborEncoder<W: EncodeWriter> {
 }
 
 impl<W: EncodeWriter> CborEncoder<W> {
-    /// Creates an encoder over `writer` with the resource policies of
-    /// `config`. Only the byte and collection limits are honored; CBOR itself
-    /// fixes byte order (big endian) and shortest-head integers, so
-    /// `config`'s endian/integer profile does not apply here.
     pub(crate) fn new(writer: W, config: Config) -> Self {
         Self {
             writer,
@@ -91,7 +50,6 @@ impl<W: EncodeWriter> CborEncoder<W> {
         }
     }
 
-    /// Encodes `value` and returns the number of bytes written.
     pub(crate) fn finish<T: nextjson::NsonSerialize + ?Sized>(mut self, value: &T) -> Result<u64> {
         nextjson::NsonSerialize::nextencode(value, &mut self).map_err(|error| {
             self.wire_error
@@ -192,7 +150,7 @@ impl<W: EncodeWriter> CborEncoder<W> {
     }
 
     fn enter_container(&mut self) -> NextjsonResult<()> {
-        if self.depth >= MAX_DEPTH {
+        if self.depth >= self.config.depth_limit {
             return Err(self.fail(Error::Custom("encoder nesting depth limit exceeded".into())));
         }
         self.depth += 1;
@@ -369,9 +327,6 @@ impl HeadArg {
 }
 
 /// Streaming RFC 8949 CBOR decoder implementing [`nextjson::FormatDecoder`].
-///
-/// Pull-based: every read advances over the input slice directly, so decoded
-/// text strings borrow from the input and no value tree is materialized.
 pub(crate) struct CborDecoder<'de> {
     input: &'de [u8],
     cursor: usize,
@@ -382,6 +337,8 @@ pub(crate) struct CborDecoder<'de> {
     lookahead: Option<Token<'de>>,
     wire_error: Option<Error>,
     expecting: Option<&'static str>,
+    container_len: Option<u64>,
+    lookahead_start: usize,
 }
 
 impl<'de> CborDecoder<'de> {
@@ -396,11 +353,11 @@ impl<'de> CborDecoder<'de> {
             lookahead: None,
             wire_error: None,
             expecting: None,
+            container_len: None,
+            lookahead_start: 0,
         }
     }
 
-    /// Decodes one value that may borrow from `input`, then validates the
-    /// trailing-byte policy.
     pub(crate) fn decode<T: nextjson::NsonDeserialize<'de>>(mut self) -> Result<T> {
         let value = T::nextdecode(&mut self).map_err(|error| {
             self.wire_error
@@ -450,6 +407,12 @@ impl<'de> CborDecoder<'de> {
         Ok(bytes)
     }
 
+    fn take_length(&mut self, len: u64) -> NextjsonResult<&'de [u8]> {
+        let len = usize::try_from(len)
+            .map_err(|_| self.fail(Error::IntegerOverflow { target: "usize" }))?;
+        self.take(len).map_err(|error| self.fail(error))
+    }
+
     fn peek_byte(&mut self) -> Result<u8> {
         let byte = *self.input.get(self.cursor).ok_or(Error::UnexpectedEnd)?;
         if let Some(limit) = self.config.limit {
@@ -461,10 +424,6 @@ impl<'de> CborDecoder<'de> {
     }
 
     /// Reads one RFC 8949 head (major type + argument), consuming it.
-    ///
-    /// Major type 7 is special: `ai` 25/26/27 denote the float types
-    /// themselves (no argument follows), `ai` 24 stores a simple value in the
-    /// next byte, and 20/21/22 are `false`/`true`/`null`.
     fn read_head(&mut self) -> NextjsonResult<(u8, HeadArg)> {
         let initial = self.take(1).map_err(|error| self.fail(error))?[0];
         let major = initial >> 5;
@@ -521,10 +480,12 @@ impl<'de> CborDecoder<'de> {
                 _ => unreachable!("additional information is five bits"),
             }
         };
+        if matches!(argument, HeadArg::Indefinite) && matches!(major, 0 | 1 | 6) {
+            return Err(self.fail(Error::Custom("indefinite integer or tag".into())));
+        }
         Ok((major, argument))
     }
 
-    /// Decrements the definite element counter of the current container.
     fn dec_remaining(&mut self) -> NextjsonResult<()> {
         let underflow = match self.frames.last_mut() {
             Some(frame) => match &mut frame.definite {
@@ -545,14 +506,12 @@ impl<'de> CborDecoder<'de> {
         Ok(())
     }
 
-    /// Pushes a container frame after validating nesting depth and, for
-    /// definite containers, the collection limit.
     fn enter_container(
         &mut self,
         kind: ContainerKind,
         definite: Option<u64>,
     ) -> NextjsonResult<()> {
-        if self.depth >= MAX_DEPTH {
+        if self.depth >= self.config.depth_limit {
             return Err(self.fail(Error::Custom("decoder nesting depth limit exceeded".into())));
         }
         if let Some(count) = definite {
@@ -596,37 +555,47 @@ impl<'de> CborDecoder<'de> {
             }
         }
         self.counts[index] = count;
+        self.dec_remaining()
+    }
+
+    fn check_next_element(&mut self) -> NextjsonResult<()> {
+        if let (Some(index), Some(limit)) =
+            (self.depth.checked_sub(1), self.config.collection_limit)
+        {
+            if self.counts[index] >= limit {
+                return Err(self.fail(Error::CollectionLimit { limit }));
+            }
+        }
         Ok(())
     }
 
-    /// Whether the current container still has elements (does not count).
     fn has_more(&mut self) -> NextjsonResult<bool> {
         if self.lookahead.is_some() {
+            self.check_next_element()?;
             return Ok(true);
         }
         let frame = match self.frames.last().copied() {
             Some(frame) => frame,
             None => return Err(self.fail(Error::Custom("separator outside any container".into()))),
         };
-        match frame.definite {
-            Some(remaining) => Ok(remaining > 0),
-            None => Ok(self.peek_byte().map_err(|error| self.fail(error))? != 0xff),
+        let more = match frame.definite {
+            Some(remaining) => remaining > 0,
+            None => self.peek_byte().map_err(|error| self.fail(error))? != 0xff,
+        };
+        if more {
+            self.check_next_element()?;
         }
+        Ok(more)
     }
 
-    /// Reads the next token, consuming it. Container heads push a frame; the
-    /// indefinite break (`0xff`) returns an end token without popping (the
-    /// `end_array`/`end_object` methods own the pop).
     fn read_token(&mut self) -> NextjsonResult<Token<'de>> {
         loop {
             let (major, argument) = self.read_head()?;
             match major {
                 0 => {
-                    self.dec_remaining()?;
                     return Ok(Token::Number(Number::U64(argument.value())));
                 }
                 1 => {
-                    self.dec_remaining()?;
                     let negative = argument.value();
                     // Value = -1 - negative, widened to i128 so i64::MIN.. works
                     // and values below i64::MIN stay exact as i128.
@@ -645,27 +614,24 @@ impl<'de> CborDecoder<'de> {
                 }
                 3 => {
                     let token = self.read_text(argument)?;
-                    self.dec_remaining()?;
                     return Ok(token);
                 }
                 4 => {
-                    self.dec_remaining()?;
                     let definite = match argument {
                         HeadArg::Value(count) => Some(count),
                         HeadArg::Indefinite => None,
                         _ => return Err(self.fail(Error::Custom("invalid array length".into()))),
                     };
-                    self.enter_container(ContainerKind::Array, definite)?;
+                    self.container_len = definite;
                     return Ok(Token::BeginArray);
                 }
                 5 => {
-                    self.dec_remaining()?;
                     let definite = match argument {
                         HeadArg::Value(count) => Some(count),
                         HeadArg::Indefinite => None,
                         _ => return Err(self.fail(Error::Custom("invalid object length".into()))),
                     };
-                    self.enter_container(ContainerKind::Object, definite)?;
+                    self.container_len = definite;
                     return Ok(Token::BeginObject);
                 }
                 6 => {
@@ -673,12 +639,10 @@ impl<'de> CborDecoder<'de> {
                     match tag {
                         2 => {
                             let token = self.read_bignum(false)?;
-                            self.dec_remaining()?;
                             return Ok(token);
                         }
                         3 => {
                             let token = self.read_bignum(true)?;
-                            self.dec_remaining()?;
                             return Ok(token);
                         }
                         // Other semantic tags annotate rather than replace a
@@ -688,15 +652,12 @@ impl<'de> CborDecoder<'de> {
                 }
                 7 => match argument {
                     HeadArg::Value(20) => {
-                        self.dec_remaining()?;
                         return Ok(Token::Bool(false));
                     }
                     HeadArg::Value(21) => {
-                        self.dec_remaining()?;
                         return Ok(Token::Bool(true));
                     }
                     HeadArg::Value(22) => {
-                        self.dec_remaining()?;
                         return Ok(Token::Null);
                     }
                     HeadArg::Value(23) => {
@@ -713,7 +674,6 @@ impl<'de> CborDecoder<'de> {
                         );
                     }
                     HeadArg::Float16 => {
-                        self.dec_remaining()?;
                         let bytes: [u8; 2] = self
                             .take(2)
                             .map_err(|error| self.fail(error))?
@@ -724,7 +684,6 @@ impl<'de> CborDecoder<'de> {
                         )))));
                     }
                     HeadArg::Float32 => {
-                        self.dec_remaining()?;
                         let bytes: [u8; 4] = self
                             .take(4)
                             .map_err(|error| self.fail(error))?
@@ -734,7 +693,6 @@ impl<'de> CborDecoder<'de> {
                         return Ok(Token::Number(Number::F64(value as f64)));
                     }
                     HeadArg::Float64 => {
-                        self.dec_remaining()?;
                         let bytes: [u8; 8] = self
                             .take(8)
                             .map_err(|error| self.fail(error))?
@@ -748,18 +706,7 @@ impl<'de> CborDecoder<'de> {
                     // The indefinite break that terminates an indefinite
                     // container.
                     HeadArg::Indefinite => {
-                        let kind = match self.frames.last().copied() {
-                            Some(frame) => frame.kind,
-                            None => {
-                                return Err(self.fail(Error::Custom(
-                                    "indefinite break outside any container".into(),
-                                )))
-                            }
-                        };
-                        return Ok(match kind {
-                            ContainerKind::Array => Token::EndArray,
-                            ContainerKind::Object => Token::EndObject,
-                        });
+                        return Err(self.fail(Error::Custom("break in value position".into())))
                     }
                 },
                 _ => unreachable!("major type is three bits"),
@@ -767,11 +714,10 @@ impl<'de> CborDecoder<'de> {
         }
     }
 
-    /// Reads a text string whose head has already been consumed.
     fn read_text(&mut self, argument: HeadArg) -> NextjsonResult<Token<'de>> {
         match argument {
             HeadArg::Value(len) => {
-                let bytes = self.take(len as usize).map_err(|error| self.fail(error))?;
+                let bytes = self.take_length(len)?;
                 let text = core::str::from_utf8(bytes).map_err(|_| {
                     self.fail(Error::Custom("CBOR text string is not valid UTF-8".into()))
                 })?;
@@ -780,42 +726,30 @@ impl<'de> CborDecoder<'de> {
             HeadArg::Indefinite => {
                 // Chunked text string: definite-length chunks terminated by
                 // 0xff. Decoded chunks must be materialized.
-                let mut out = Vec::new();
+                let mut out = String::new();
                 loop {
-                    let byte = self.peek_byte().map_err(|error| self.fail(error))?;
-                    if byte == 0xff {
-                        self.cursor += 1;
+                    if self.peek_byte().map_err(|error| self.fail(error))? == 0xff {
+                        self.take(1).map_err(|error| self.fail(error))?;
                         break;
                     }
                     let (major, argument) = self.read_head()?;
-                    if major != 3 {
-                        return Err(self.fail(Error::Custom(
-                            "indefinite text string contains a non-text chunk".into(),
-                        )));
-                    }
-                    let len = match argument {
-                        HeadArg::Value(len) => len,
+                    let len = match (major, argument) {
+                        (3, HeadArg::Value(len)) => len,
                         _ => {
-                            return Err(
-                                self.fail(Error::Custom("invalid text string length".into()))
-                            )
+                            return Err(self.fail(Error::Custom("invalid text string chunk".into())))
                         }
                     };
-                    out.extend_from_slice(
-                        self.take(len as usize).map_err(|error| self.fail(error))?,
-                    );
+                    let bytes = self.take_length(len)?;
+                    let chunk = core::str::from_utf8(bytes)
+                        .map_err(|error| self.fail(Error::InvalidUtf8(error)))?;
+                    out.push_str(chunk);
                 }
-                let text = core::str::from_utf8(&out).map_err(|_| {
-                    self.fail(Error::Custom("CBOR text string is not valid UTF-8".into()))
-                })?;
-                Ok(Token::Str(Cow::Owned(text.to_owned())))
+                Ok(Token::Str(Cow::Owned(out)))
             }
             _ => Err(self.fail(Error::Custom("invalid text string length".into()))),
         }
     }
-    /// Reads an RFC 8949 bignum (tag 2 or 3). The tag head is already
-    /// consumed; the payload is a major-2 byte string holding the big-endian
-    /// magnitude.
+    /// Reads the payload of RFC 8949 tag 2 or 3.
     fn read_bignum(&mut self, negative: bool) -> NextjsonResult<Token<'de>> {
         let (major, argument) = self.read_head()?;
         if major != 2 {
@@ -832,7 +766,7 @@ impl<'de> CborDecoder<'de> {
                 return Err(self.fail(Error::Custom("bignum payload must be a byte string".into())))
             }
         };
-        let bytes = self.take(len as usize).map_err(|error| self.fail(error))?;
+        let bytes = self.take_length(len)?;
         if bytes.len() > 16 {
             return Err(self.fail(Error::Custom(
                 "bignum wider than 128 bits is not supported".into(),
@@ -842,23 +776,22 @@ impl<'de> CborDecoder<'de> {
         magnitude[16 - bytes.len()..].copy_from_slice(bytes);
         let value = u128::from_be_bytes(magnitude);
         if negative {
-            // -1 - value
-            Ok(Token::Number(Number::I128(-1 - value as i128)))
+            let magnitude = i128::try_from(value)
+                .map_err(|_| self.fail(Error::IntegerOverflow { target: "i128" }))?;
+            Ok(Token::Number(Number::I128(-1 - magnitude)))
         } else {
             Ok(Token::Number(Number::U128(value)))
         }
     }
 
-    /// Reads the next token without consuming it (honoring any pending
-    /// lookahead).
     fn peek_token_inner(&mut self) -> NextjsonResult<Token<'de>> {
         if self.lookahead.is_none() {
+            self.lookahead_start = self.cursor;
             self.lookahead = Some(self.read_token()?);
         }
         Ok(self.lookahead.clone().expect("lookahead initialized"))
     }
 
-    /// Consumes and returns the next token.
     fn take_token(&mut self) -> NextjsonResult<Token<'de>> {
         match self.lookahead.take() {
             Some(token) => Ok(token),
@@ -866,30 +799,35 @@ impl<'de> CborDecoder<'de> {
         }
     }
 
-    /// Skips one complete value (used for unknown object fields).
     fn skip_value_inner(&mut self) -> NextjsonResult<()> {
-        let saved_depth = self.depth;
-        self.take_token()?;
-        while self.depth > saved_depth {
-            let frame = match self.frames.last().copied() {
-                Some(frame) => frame,
-                None => return Err(self.fail(Error::Custom("unbalanced container in skip".into()))),
-            };
-            let finished = match frame.definite {
-                Some(0) => true,
-                Some(_) => false,
-                None => self.peek_byte().map_err(|error| self.fail(error))? == 0xff,
-            };
-            if finished {
-                if frame.definite.is_none() {
-                    self.cursor += 1;
-                }
-                self.pop_frame(frame.kind)?;
-                continue;
-            }
-            self.take_token()?;
+        if self.lookahead.is_none() && self.peek_byte().map_err(|error| self.fail(error))? >> 5 == 2
+        {
+            self.bytes()?;
+            return Ok(());
         }
-        Ok(())
+        match self.take_token()? {
+            Token::BeginArray => {
+                self.enter_container(ContainerKind::Array, self.container_len)?;
+                while self.array_has_more()? {
+                    self.skip_value_inner()?;
+                    if !self.array_entry_sep()? {
+                        break;
+                    }
+                }
+                self.end_array()
+            }
+            Token::BeginObject => {
+                self.enter_container(ContainerKind::Object, self.container_len)?;
+                while self.object_key()?.is_some() {
+                    self.skip_value_inner()?;
+                    if !self.object_entry_sep()? {
+                        break;
+                    }
+                }
+                self.end_object()
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -898,7 +836,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
 
     fn begin_object(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
-            Token::BeginObject => Ok(()),
+            Token::BeginObject => self.enter_container(ContainerKind::Object, self.container_len),
             other => Err(self.invalid_type("an object", &other)),
         }
     }
@@ -934,6 +872,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
                 }
             }
         }
+        self.check_next_element()?;
         let (major, argument) = self.read_head()?;
         if major != 3 {
             let found = match major {
@@ -957,7 +896,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
 
     fn begin_array(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
-            Token::BeginArray => Ok(()),
+            Token::BeginArray => self.enter_container(ContainerKind::Array, self.container_len),
             other => Err(self.invalid_type("an array", &other)),
         }
     }
@@ -1028,7 +967,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
                 debug_assert_eq!(major2, 2);
                 match argument {
                     HeadArg::Value(len) => {
-                        let bytes = self.take(len as usize).map_err(|error| self.fail(error))?;
+                        let bytes = self.take_length(len)?;
                         Ok(Cow::Borrowed(bytes))
                     }
                     HeadArg::Indefinite => {
@@ -1036,7 +975,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
                         loop {
                             let next = self.peek_byte().map_err(|error| self.fail(error))?;
                             if next == 0xff {
-                                self.cursor += 1;
+                                self.take(1).map_err(|error| self.fail(error))?;
                                 break;
                             }
                             let (maj, arg) = self.read_head()?;
@@ -1052,9 +991,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
                                         .fail(Error::Custom("invalid byte string length".into())))
                                 }
                             };
-                            out.extend_from_slice(
-                                self.take(len as usize).map_err(|error| self.fail(error))?,
-                            );
+                            out.extend_from_slice(self.take_length(len)?);
                         }
                         Ok(Cow::Owned(out))
                     }
@@ -1087,7 +1024,7 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
         // Direct wire probe so `Option<Bytes>` keeps working even though the
         // token model rejects raw byte strings.
         if self.lookahead.is_none() && self.peek_byte().map_err(|error| self.fail(error))? == 0xf6 {
-            self.cursor += 1;
+            self.take(1).map_err(|error| self.fail(error))?;
             return Ok(OptionTag::None);
         }
         if matches!(self.lookahead, Some(Token::Null)) {
@@ -1110,12 +1047,19 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
     }
 
     fn save(&self) -> Mark {
-        Mark::new(self.cursor, self.depth as u32)
+        Mark::new(
+            if self.lookahead.is_some() {
+                self.lookahead_start
+            } else {
+                self.cursor
+            },
+            self.depth as u32,
+        )
     }
 
     fn restore(&mut self, mark: Mark) {
         let depth = (mark.depth() as usize).min(self.counts.len());
-        self.cursor = mark.pos();
+        self.cursor = mark.pos().min(self.input.len());
         self.depth = depth;
         self.frames.truncate(depth);
         for slot in &mut self.counts[depth..] {
@@ -1135,47 +1079,22 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
 }
 
 impl<'de> CborDecoder<'de> {
-    /// Shared container-close logic for `end_array` / `end_object`.
-    ///
-    /// Definite containers must have zero remaining elements (the caller
-    /// drained them through the separators); indefinite containers consume the
-    /// `0xff` break unless a pending lookahead already consumed it.
     fn end_container(&mut self, kind: ContainerKind) -> NextjsonResult<()> {
-        match self.lookahead.take() {
-            Some(Token::EndArray) | Some(Token::EndObject) => {}
-            Some(Token::BeginArray) | Some(Token::BeginObject) => {}
+        if self.lookahead.is_some() {
+            return Err(self.fail(Error::Custom("container ended with unread elements".into())));
+        }
+        let frame = self.frames.last().copied().ok_or_else(|| {
+            self.fail(Error::Custom("container end without matching start".into()))
+        })?;
+        match frame.definite {
+            Some(0) => {}
             Some(_) => {
                 return Err(self.fail(Error::Custom("container ended with unread elements".into())))
             }
             None => {
-                let frame = match self.frames.last().copied() {
-                    Some(frame) => frame,
-                    None => {
-                        return Err(
-                            self.fail(Error::Custom("container end without matching start".into()))
-                        )
-                    }
-                };
-                if frame.definite.is_none() {
-                    let byte = self.peek_byte().map_err(|error| self.fail(error))?;
-                    if byte != 0xff {
-                        return Err(
-                            self.fail(Error::Custom("container ended with unread elements".into()))
-                        );
-                    }
-                    self.cursor += 1;
+                if self.take(1).map_err(|error| self.fail(error))?[0] != 0xff {
+                    return Err(self.fail(Error::Custom("missing container break".into())));
                 }
-            }
-        }
-        let frame = match self.frames.last().copied() {
-            Some(frame) => frame,
-            None => {
-                return Err(self.fail(Error::Custom("container end without matching start".into())))
-            }
-        };
-        if let Some(remaining) = frame.definite {
-            if remaining != 0 {
-                return Err(self.fail(Error::Custom("container ended with unread elements".into())));
             }
         }
         self.pop_frame(kind)
@@ -1195,19 +1114,12 @@ fn token_name(token: &Token<'_>) -> &'static str {
     }
 }
 
-/// 2^n for `-1022 <= n <= 1023`, exact and available without `std`.
-///
-/// Powers of two are exactly representable in `f64`, and their bit pattern is
-/// `exponent = 1023 + n` in the IEEE 754 bias, so `from_bits` yields the value
-/// directly (no `powi`, which is a `std`-only method; `from_bits` is not const
-/// before Rust 1.83, so this stays a plain `fn`).
 fn pow2f(exponent: i32) -> f64 {
     // `i64` preserves the sign before biasing; casting a negative `i32`
     // directly to `u64` would wrap and overflow the bias addition.
     f64::from_bits(((exponent as i64 + 1023) as u64) << 52)
 }
 
-/// Converts an IEEE 754 half-precision value to `f64` (no `std` needed).
 fn half_to_f64(half: u16) -> f64 {
     let sign = if half & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = ((half >> 10) & 0x1f) as i32;

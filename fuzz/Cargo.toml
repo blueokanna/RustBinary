@@ -8,8 +8,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rustbinary = { path = "..", features = ["derive", "compact"] }
-nextjson = { version = "0.1.4", features = ["derive"] }
+rustbinary = { path = "..", features = ["derive", "compact", "cbor", "projection", "entropy"] }
+nextjson = { version = "0.1.5", features = ["derive"] }
 
 [[bin]]
 name = "decode_arbitrary_bytes"
@@ -28,6 +28,20 @@ bench = false
 [[bin]]
 name = "decode_compact_arbitrary"
 path = "fuzz_targets/decode_compact_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_cbor_arbitrary"
+path = "fuzz_targets/decode_cbor_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_frames_arbitrary"
+path = "fuzz_targets/decode_frames_arbitrary.rs"
 test = false
 doc = false
 bench = false

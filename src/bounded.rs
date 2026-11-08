@@ -1,75 +1,10 @@
-//! Resource-bounded decoding with a schema-derived cost algebra.
+//! Parser budgets and schema estimates for the self-describing profile.
+//! Runtime limits cover bytes, cumulative reads, global tokens, collection size
+//! and container depth. Depth alone does not bound branching.
 //!
-//! # Problem model
-//!
-//! `StaticSize` bounds the *encoded bytes* of a value. This module advances
-//! that idea to **provable resource semantics**: for every type `T` the derive
-//! generates a cost algebra
-//!
-//! ```text
-//! B(T)  maximum input bytes one decode of T can consume
-//! A(T)  maximum heap bytes one decode of T can allocate
-//! D(T)  maximum parser nesting depth (0 = no container)
-//! W(T)  worst-case work in abstract units (bytes read + per-field overhead)
-//! ```
-//!
-//! and [`decode_bounded`] runs the decode under a [`Budget`] that is enforced
-//! at runtime, returning a [`Decoded<T>`] whose [`ResourceUse`] carries the
-//! exact bytes read plus provable upper bounds for allocation, depth, and
-//! work. The algebra is *isomorphic to the parser*: the derive mirrors the
-//! exact container structure (object/array tags, terminators, per-field keys)
-//! that `ser`/`decoder` walk, so the constants are the parser's own worst case
-//! rather than a separate estimate.
-//!
-//! # What is proven vs. what is enforced
-//!
-//! - **Statically bounded types** (no dynamic collections or strings anywhere
-//!   in `T`): all four constants are finite and **exact**. A decode of such a
-//!   `T` reads at most `B(T)` input bytes, allocates at most `A(T)` bytes
-//!   (usually 0), nests at most `D(T)` containers, and performs at most
-//!   `W(T)` work units — by construction of the wire format.
-//! - **Dynamic types** (`Vec`, `String`, `&str`, ...): `B`, `A` and `W` are
-//!   content-dependent, so the derive reports `usize::MAX` and the *runtime*
-//!   budget enforces the caller's limits. The depth constant `D` stays exact
-//!   (a `Vec<T>` adds exactly one container level).
-//!
-//! # The allocation ceiling (what is proven)
-//!
-//! A decode allocates for two disjoint classes of bytes:
-//!
-//! - **Data**: the bytes materialized from input (string and byte-buffer
-//!   bodies). Every such byte is read from the wire, so `data ≤ read`.
-//! - **Structure**: collection backing buffers and boxes beyond their wire
-//!   data. The derive computes [`DecodeBounded::MAX_STRUCTURAL_ELEMENT`] — the
-//!   worst per-element structural allocation across every collection in the
-//!   type (for `Vec<T>` that is `size_of::<T>()`, for `Box<T>` it is
-//!   `size_of::<T>()`, for `String` it is `0`). A decode of `T` has at most
-//!   `D(T)` nested collection levels, each capped at the collection limit, so
-//!   total elements `≤ D(T) · collection_limit` and
-//!
-//!   ```text
-//!   allocation ≤ read + MAX_STRUCTURAL_ELEMENT · D(T) · collection_limit
-//!   ```
-//!
-//!   `decode_bounded` sets the collection limit so that this ceiling is at
-//!   most `max_input + max_alloc`, and returns it as
-//!   [`ResourceUse::alloc_bound`]. For types whose derive cannot know the
-//!   structural cost (manual [`DecodeBounded`] implementations that leave
-//!   `MAX_STRUCTURAL_ELEMENT` at its `usize::MAX` default), the budget's
-//!   `element_structure_bytes` knob is used instead; its default of
-//!   [`ELEMENT_STRUCTURE_BYTES`] (64) covers the standard collection shapes
-//!   (String headers, Vec backing entries, std BTreeMap nodes). Wide-tuple or
-//!   large-inline-element layouts should raise the knob or the `max_alloc`.
-//!
-//! # DoS contract
-//!
-//! `decode_bounded` rejects input *before* allocating when the budget is
-//! violated, and every failure reports which dimension was exceeded
-//! ([`BudgetExceeded`]). This is the entry point for DoS-sensitive consumers
-//! (blockchain nodes, enclaves, gateways): the caller picks a `Budget` from
-//! its policy — or from [`Budget::from_type::<T>()`], which derives tight
-//! defaults from the algebra — and receives evidence of what the decode
-//! actually consumed.
+//! Allocation estimates exclude spare capacity, transient buffers and allocator
+//! overhead. Custom traits are trusted code; their allocations and computation
+//! are not constrained here. Hard memory ceilings require external enforcement.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -82,57 +17,26 @@ use crate::config::{Config, DEFAULT_COLLECTION_LIMIT, DEFAULT_SIZE_LIMIT};
 use crate::decoder;
 use crate::tags::MAX_DEPTH;
 
-/// Default per-element structural allocation ceiling, in bytes.
-///
-/// Used as the fallback structural bound when a type's
-/// [`DecodeBounded::MAX_STRUCTURAL_ELEMENT`] is unknown (manual trait
-/// implementations), and as the default of [`Budget::element_structure_bytes`].
-/// 64 conservatively covers the standard collection shapes this codec drives:
-/// `String` headers (24 bytes), `Vec` backing entries (`size_of::<T>()`, 8 for
-/// pointers), and std `BTreeMap` nodes (~50 bytes per element for small
-/// keys). Data materialized from input bytes (string and byte-buffer bodies)
-/// is *not* structural; it is bounded by `max_input`. Types whose per-element
-/// structural footprint exceeds this (wide tuples of small collections,
-/// large inline element structs) must raise the budget knob or `max_alloc`.
+/// Default structural admission weight per token. This is a policy heuristic,
+/// not a bound on Rust collections, allocator overhead or custom trait code.
 pub const ELEMENT_STRUCTURE_BYTES: u64 = 64;
 
-/// Compile-time cost algebra for one type, mirroring the parser structure.
-///
-/// Implementations are generated by `#[derive(DecodeBounded)]`; see the module
-/// documentation for the exact semantics of each constant and the distinction
-/// between statically bounded and dynamic types.
+/// Schema estimates used for admission policy. Implementations are trusted
+/// application metadata, including when generated by a derive. No constant
+/// constrains allocations or computation in a custom `NsonDeserialize`.
 pub trait DecodeBounded {
-    /// `B(T)`: worst-case input bytes consumed by one decode of `T`.
-    ///
-    /// `usize::MAX` when the encoded size depends on content (strings,
-    /// collections, borrowed text).
+    /// Estimated maximum encoded bytes, or `usize::MAX` if unknown.
     const MAX_INPUT: usize;
-    /// `A(T)`: worst-case heap bytes allocated by one decode of `T`.
-    ///
-    /// `usize::MAX` when allocation depends on content. A finite value (usually
-    /// `0`) marks the type as *statically bounded*.
+    /// Estimated owned storage; excludes allocator overhead and spare capacity.
     const MAX_ALLOC: usize;
-    /// `D(T)`: worst-case parser nesting depth (0 = no container).
-    ///
-    /// Always finite: even dynamic collections add exactly one container level.
+    /// Maximum schema container depth, or `usize::MAX` if unknown.
     const MAX_DEPTH: usize;
-    /// `W(T)`: worst-case work in abstract units.
-    ///
-    /// `usize::MAX` when content-dependent.
+    /// Estimated byte-read work, excluding speculative decoding and custom code.
     const MAX_WORK: usize;
-    /// Worst per-collection-element structural allocation ceiling, in bytes.
-    ///
-    /// The maximum, across every collection in `T`, of the heap a single
-    /// element's backing structure can occupy *beyond* the wire bytes it is
-    /// decoded from. The derive fills it from the element types (`Vec<T>` and
-    /// `Box<T>` report `size_of::<T>()`, `String` reports `0` because its heap
-    /// is data-bound). `usize::MAX` when unknown; `decode_bounded` then falls
-    /// back to the budget's `element_structure_bytes` knob.
+    /// Estimated largest element storage, or `usize::MAX` if unknown.
     const MAX_STRUCTURAL_ELEMENT: usize = usize::MAX;
 
-    /// Whether the type's resource use is content-independent.
-    ///
-    /// `true` when no field is dynamic (`MAX_ALLOC` is finite).
+    /// Whether the schema supplies a finite allocation estimate.
     const STATICALLY_BOUNDED: bool = Self::MAX_ALLOC != usize::MAX;
 }
 
@@ -144,6 +48,8 @@ pub struct Budget {
     max_depth: usize,
     max_work: u64,
     element_structure_bytes: u64,
+    max_values: u64,
+    max_collection: u64,
 }
 
 impl Budget {
@@ -157,6 +63,8 @@ impl Budget {
             max_depth,
             max_work,
             element_structure_bytes: ELEMENT_STRUCTURE_BYTES,
+            max_values: DEFAULT_COLLECTION_LIMIT,
+            max_collection: DEFAULT_COLLECTION_LIMIT,
         }
     }
 
@@ -164,8 +72,7 @@ impl Budget {
     ///
     /// Finite constants become tight limits; `usize::MAX` constants fall back
     /// to the crate-wide defaults ([`DEFAULT_SIZE_LIMIT`] for input/allocation/
-    /// work, `MAX_DEPTH` for depth). For statically bounded types the result
-    /// is exact.
+    /// work, `MAX_DEPTH` for depth). These defaults do not certify actual heap or CPU usage.
     pub const fn from_type<T: DecodeBounded>() -> Self {
         Self {
             max_input: const_or_default(T::MAX_INPUT, DEFAULT_SIZE_LIMIT),
@@ -177,6 +84,8 @@ impl Budget {
             },
             max_work: const_or_default(T::MAX_WORK, DEFAULT_SIZE_LIMIT),
             element_structure_bytes: ELEMENT_STRUCTURE_BYTES,
+            max_values: DEFAULT_COLLECTION_LIMIT,
+            max_collection: DEFAULT_COLLECTION_LIMIT,
         }
     }
 
@@ -186,7 +95,7 @@ impl Budget {
             Some(limit) => limit,
             None => DEFAULT_SIZE_LIMIT,
         };
-        let max_alloc = match config.collection_limit() {
+        let max_alloc = match config.value_limit() {
             Some(limit) => limit.saturating_mul(ELEMENT_STRUCTURE_BYTES),
             None => DEFAULT_COLLECTION_LIMIT.saturating_mul(ELEMENT_STRUCTURE_BYTES),
         };
@@ -194,8 +103,19 @@ impl Budget {
             max_input,
             max_alloc,
             max_depth: config.depth_limit(),
-            max_work: max_input,
+            max_work: match config.decode_work_limit() {
+                Some(n) => n,
+                None => max_input,
+            },
             element_structure_bytes: ELEMENT_STRUCTURE_BYTES,
+            max_collection: match config.collection_limit() {
+                Some(n) => n,
+                None => DEFAULT_COLLECTION_LIMIT,
+            },
+            max_values: match config.value_limit() {
+                Some(n) => n,
+                None => DEFAULT_COLLECTION_LIMIT,
+            },
         }
     }
 
@@ -205,8 +125,7 @@ impl Budget {
         self
     }
 
-    /// Sets the structural allocation budget (see the module documentation
-    /// for the exact ceiling it implies).
+    /// Caps the reported allocation estimate used for admission, not actual heap use.
     pub const fn with_max_alloc(mut self, limit: u64) -> Self {
         self.max_alloc = limit;
         self
@@ -220,13 +139,13 @@ impl Budget {
         self
     }
 
-    /// Sets the maximum work in abstract units.
+    /// Sets the cumulative parser byte-read limit, including retries.
     pub const fn with_max_work(mut self, limit: u64) -> Self {
         self.max_work = limit;
         self
     }
 
-    /// Sets the per-collection-element structural allocation ceiling in bytes.
+    /// Sets the per-token structural admission weight in bytes.
     ///
     /// Used only when the decoded type does not declare its own
     /// [`DecodeBounded::MAX_STRUCTURAL_ELEMENT`] (manual trait
@@ -237,12 +156,34 @@ impl Budget {
         self
     }
 
+    /// Sets the global token-visit limit, including keys and speculative retries.
+    pub const fn with_max_values(mut self, limit: u64) -> Self {
+        self.max_values = limit;
+        self
+    }
+
+    /// Sets the per-container entry limit, independently of global visits.
+    pub const fn with_max_collection(mut self, limit: u64) -> Self {
+        self.max_collection = limit;
+        self
+    }
+
+    /// Returns the per-container entry limit.
+    pub const fn max_collection(self) -> u64 {
+        self.max_collection
+    }
+
+    /// Returns the global token-visit limit.
+    pub const fn max_values(self) -> u64 {
+        self.max_values
+    }
+
     /// Returns the maximum input bytes.
     pub const fn max_input(self) -> u64 {
         self.max_input
     }
 
-    /// Returns the structural allocation budget.
+    /// Returns the allocation-estimate admission budget (not a heap limit).
     pub const fn max_alloc(self) -> u64 {
         self.max_alloc
     }
@@ -252,12 +193,12 @@ impl Budget {
         self.max_depth
     }
 
-    /// Returns the maximum work.
+    /// Returns the cumulative parser byte-read limit.
     pub const fn max_work(self) -> u64 {
         self.max_work
     }
 
-    /// Returns the per-element structural allocation ceiling.
+    /// Returns the per-element structural admission weight.
     pub const fn element_structure_bytes(self) -> u64 {
         self.element_structure_bytes
     }
@@ -271,27 +212,28 @@ impl Default for Budget {
             max_depth: MAX_DEPTH,
             max_work: DEFAULT_SIZE_LIMIT,
             element_structure_bytes: ELEMENT_STRUCTURE_BYTES,
+            max_values: DEFAULT_COLLECTION_LIMIT,
+            max_collection: DEFAULT_COLLECTION_LIMIT,
         }
     }
 }
 
-/// Measured resource use of one bounded decode.
+/// Parser measurements and explicitly unverified schema estimates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceUse {
     /// Exact input bytes consumed by the decode.
     pub read: u64,
-    /// Provable upper bound on heap allocation for this decode.
-    ///
-    /// Exact for statically bounded types (`A(T)`); the conservative ceiling
-    /// `read + ELEMENT_STRUCTURE_BYTES · collection_limit` for dynamic types.
-    pub alloc_bound: u64,
-    /// Enforced nesting-depth ceiling for this decode.
+    /// Unverified allocation estimate. Does not cover capacity growth,
+    /// transient allocations, allocator metadata or custom trait behavior.
+    /// Successful bounded decoding keeps this estimate within `max_alloc`.
+    pub alloc_estimate: u64,
+    /// Runtime parser depth ceiling, including unknown fields.
     pub depth_bound: usize,
-    /// Provable work bound for this decode.
-    ///
-    /// Exact `W(T)` for statically bounded types; the consumed byte count for
-    /// dynamic types (work is dominated by the linear input scan).
-    pub work_bound: u64,
+    /// Cumulative bytes read by the parser, including speculative rereads.
+    /// This is not a CPU-time bound on deserialization or custom code.
+    pub work_read: u64,
+    /// Tokens read across all branches, keys, skipped fields and retries.
+    pub values: u64,
 }
 
 /// A value decoded under a budget, together with its resource-use evidence.
@@ -304,7 +246,8 @@ pub struct Decoded<T> {
 }
 
 impl<T> Decoded<T> {
-    /// Maps the decoded value.
+    /// Maps the value, retaining the original decode metrics. Allocations and
+    /// work performed by `f` are not included in those metrics.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Decoded<U> {
         Decoded {
             value: f(self.value),
@@ -322,8 +265,7 @@ pub enum BudgetExceeded {
         /// The configured limit.
         limit: u64,
     },
-    /// The structural allocation budget would be exceeded (collections are
-    /// capped by the derived collection limit).
+    /// The allocation admission estimate exceeds the budget.
     Alloc {
         /// The configured allocation budget.
         limit: u64,
@@ -333,7 +275,12 @@ pub enum BudgetExceeded {
         /// The configured limit.
         limit: usize,
     },
-    /// The work budget was exceeded.
+    /// The global token-visit budget was exceeded.
+    Values {
+        /// Configured token limit.
+        limit: u64,
+    },
+    /// The cumulative byte-read budget was exceeded.
     Work {
         /// The configured limit.
         limit: u64,
@@ -358,10 +305,11 @@ impl fmt::Display for BudgetExceeded {
             Self::Alloc { limit } => {
                 write!(
                     f,
-                    "bounded decode: allocation budget {limit} would be exceeded"
+                    "bounded decode: schema allocation estimate exceeds admission budget {limit}"
                 )
             }
             Self::Depth { limit } => write!(f, "bounded decode: depth exceeds {limit}"),
+            Self::Values { limit } => write!(f, "bounded decode: tokens exceed {limit}"),
             Self::Work { limit } => write!(f, "bounded decode: work exceeds {limit} units"),
         }
     }
@@ -403,20 +351,15 @@ pub struct EnforcedLimits {
     pub byte_limit: u64,
     /// Per-collection element cap.
     pub collection_limit: u64,
+    /// Global token-visit cap, including all branches and retries.
+    pub value_limit: u64,
     /// Nesting-depth cap (clamped to `MAX_DEPTH`).
     pub depth_limit: usize,
 }
 
-/// Pure derivation of the enforced limits from a budget.
-///
-/// The byte limit is the tighter of input and work (every read costs at least
-/// one work unit). For dynamic types the collection limit caps the *per-
-/// collection* element count so that, together with the per-element structural
-/// ceiling and the type's nesting depth, the documented allocation ceiling
-/// `byte_limit + per_element_ceiling · collection_limit` holds. Statically
-/// bounded types have no dynamic collections, so their element count is
-/// bounded directly by the byte limit (every element costs at least one input
-/// byte).
+/// Converts schema weights into parser admission limits. For dynamic types,
+/// the caller first subtracts input storage from `max_alloc`. The remaining
+/// budget bounds weighted token visits, not real allocations.
 #[doc(hidden)]
 pub const fn derive_enforced_limits(
     budget: Budget,
@@ -431,12 +374,21 @@ pub const fn derive_enforced_limits(
     let collection_limit = if statically_bounded {
         byte_limit
     } else {
-        // `checked_div` yields `None` for a zero ceiling, meaning the type has
-        // no structural allocation and needs no per-element cap.
+        // A zero weight disables this heuristic; explicit parser limits remain.
         match budget.max_alloc.checked_div(per_element_ceiling) {
             Some(raw) if raw < byte_limit => raw,
             _ => byte_limit,
         }
+    };
+    let value_limit = if collection_limit < budget.max_values {
+        collection_limit
+    } else {
+        budget.max_values
+    };
+    let collection_limit = if collection_limit < budget.max_collection {
+        collection_limit
+    } else {
+        budget.max_collection
     };
     let depth_limit = if budget.max_depth < MAX_DEPTH {
         budget.max_depth
@@ -446,28 +398,18 @@ pub const fn derive_enforced_limits(
     EnforcedLimits {
         byte_limit,
         collection_limit,
+        value_limit,
         depth_limit,
     }
 }
 
-/// Decodes `T` from `input` under `budget`, returning resource-use evidence.
+/// Decodes a value with strict trailing-byte rejection and parser budgets.
 ///
-/// # Guarantees
-///
-/// On success, the returned [`ResourceUse`] satisfies:
-///
-/// - `read ≤ min(max_input, max_work)` (measured exactly).
-/// - `alloc_bound ≤ max_input + max_alloc` and the real allocation is at most
-///   `alloc_bound` (see the module documentation for the exact ceiling).
-/// - `depth_bound ≤ min(max_depth, MAX_DEPTH)` and the parser never nested
-///   deeper (enforced by the decoder).
-/// - `work_bound` equals `W(T)` for statically bounded types and `read`
-///   otherwise.
-///
-/// Trailing bytes are rejected (strict decode).
+/// Byte reads, global token visits and depth are checked at runtime. Heap
+/// usage and custom trait computation are not bounded by this function.
 pub fn decode_bounded<'de, T>(input: &'de [u8], budget: Budget) -> Result<Decoded<T>, DecodeError>
 where
-    T: DecodeBounded + for<'a> nextjson::NsonDeserialize<'a>,
+    T: DecodeBounded + nextjson::NsonDeserialize<'de>,
 {
     let input_len = u64::try_from(input.len()).map_err(|_| {
         DecodeError::Budget(BudgetExceeded::Input {
@@ -479,8 +421,8 @@ where
             limit: budget.max_input,
         }));
     }
-    // Static types have exact compile-time bounds; reject budgets that cannot
-    // accommodate them before doing any work.
+    // Reject budgets that cannot accommodate the schema admission estimates.
+    // These constants are not measured allocation or work.
     if T::MAX_DEPTH != usize::MAX && T::MAX_DEPTH > budget.max_depth {
         return Err(DecodeError::Budget(BudgetExceeded::Depth {
             limit: budget.max_depth,
@@ -491,57 +433,70 @@ where
             limit: budget.max_work,
         }));
     }
-    // Per-element structural ceiling: the derive knows it exactly (the worst
-    // `size_of::<element>()` across the type's collections), otherwise fall
-    // back to the budget knob. Multiplying by the nesting depth bounds the
-    // total number of collection elements (`D(T)` levels, each capped at the
-    // collection limit).
+    if T::MAX_ALLOC != usize::MAX && T::MAX_ALLOC as u64 > budget.max_alloc {
+        return Err(DecodeError::Budget(BudgetExceeded::Alloc {
+            limit: budget.max_alloc,
+        }));
+    }
+    // A schema weight is an admission heuristic, never an allocation proof.
     let structural = if T::MAX_STRUCTURAL_ELEMENT == usize::MAX {
         budget.element_structure_bytes()
     } else {
         T::MAX_STRUCTURAL_ELEMENT as u64
     };
-    let depth_eff = if T::MAX_DEPTH == usize::MAX {
-        budget.max_depth as u64
+    let has_static_estimate = T::MAX_ALLOC != usize::MAX;
+    let structural_budget = if has_static_estimate {
+        budget
     } else {
-        T::MAX_DEPTH as u64
+        let remaining = budget
+            .max_alloc
+            .checked_sub(input_len)
+            .ok_or(DecodeError::Budget(BudgetExceeded::Alloc {
+                limit: budget.max_alloc,
+            }))?;
+        budget.with_max_alloc(remaining)
     };
-    let depth_eff = if depth_eff == 0 { 1 } else { depth_eff };
-    let per_element_ceiling = structural.saturating_mul(depth_eff);
-    let limits = derive_enforced_limits(budget, T::STATICALLY_BOUNDED, per_element_ceiling);
+    let limits = derive_enforced_limits(
+        structural_budget,
+        T::STATICALLY_BOUNDED && has_static_estimate,
+        structural,
+    );
     let config = Config::standard()
         .with_limit(limits.byte_limit)
         .with_collection_limit(limits.collection_limit)
-        .with_depth_limit(limits.depth_limit);
-    let (value, consumed) =
-        decoder::from_slice_with_consumed(input, config).map_err(DecodeError::Codec)?;
+        .with_depth_limit(limits.depth_limit)
+        .with_value_limit(limits.value_limit)
+        .with_decode_work_limit(budget.max_work);
+    let (value, consumed, work_read, values) = decoder::from_slice_with_resources(input, config)
+        .map_err(|error| match error {
+            crate::Error::WorkLimit { limit } => {
+                DecodeError::Budget(BudgetExceeded::Work { limit })
+            }
+            crate::Error::ValueLimit { limit } => {
+                DecodeError::Budget(BudgetExceeded::Values { limit })
+            }
+            other => DecodeError::Codec(other),
+        })?;
     if consumed != input.len() {
         return Err(DecodeError::Codec(crate::Error::TrailingBytes {
             remaining: input.len() - consumed,
         }));
     }
     let read = consumed as u64;
-    // The reported depth bound is the type's exact derived depth, capped by
-    // the actually enforced decoder ceiling (`min(budget.max_depth, MAX_DEPTH)`)
-    // for paths where a very deep type is clamped by the crate-wide cap.
-    let depth_bound = T::MAX_DEPTH.min(limits.depth_limit);
-    let (alloc_bound, work_bound) = if T::STATICALLY_BOUNDED {
-        (T::MAX_ALLOC as u64, T::MAX_WORK as u64)
+    let depth_bound = limits.depth_limit;
+    let alloc_estimate = if T::MAX_ALLOC != usize::MAX {
+        T::MAX_ALLOC as u64
     } else {
-        (
-            limits
-                .byte_limit
-                .saturating_add(limits.collection_limit.saturating_mul(per_element_ceiling)),
-            read,
-        )
+        read.saturating_add(values.saturating_mul(structural))
     };
     Ok(Decoded {
         value,
         use_: ResourceUse {
             read,
-            alloc_bound,
+            alloc_estimate,
             depth_bound,
-            work_bound,
+            work_read,
+            values,
         },
     })
 }
@@ -552,8 +507,6 @@ macro_rules! primitive {
             const MAX_INPUT: usize = $input;
             const MAX_ALLOC: usize = 0;
             const MAX_DEPTH: usize = 0;
-            // Work is the encoded bytes plus one field-transition unit, so
-            // MAX_WORK >= MAX_INPUT always holds for statically bounded types.
             const MAX_WORK: usize = $input + 1;
             const MAX_STRUCTURAL_ELEMENT: usize = 0;
         }
@@ -590,10 +543,10 @@ impl<T: DecodeBounded, const N: usize> DecodeBounded for [T; N] {
 }
 
 impl<T> DecodeBounded for PhantomData<T> {
-    const MAX_INPUT: usize = 0;
+    const MAX_INPUT: usize = 1;
     const MAX_ALLOC: usize = 0;
     const MAX_DEPTH: usize = 0;
-    const MAX_WORK: usize = 0;
+    const MAX_WORK: usize = 2;
     const MAX_STRUCTURAL_ELEMENT: usize = 0;
 }
 
@@ -631,7 +584,7 @@ tuple_bounded!(A, B, C, D, E, F, G, H);
 impl DecodeBounded for String {
     const MAX_INPUT: usize = usize::MAX;
     const MAX_ALLOC: usize = usize::MAX;
-    const MAX_DEPTH: usize = 1;
+    const MAX_DEPTH: usize = 0;
     const MAX_WORK: usize = usize::MAX;
     // The String heap is data-bound (every byte is read from the wire).
     const MAX_STRUCTURAL_ELEMENT: usize = 0;
@@ -642,8 +595,6 @@ impl<T: DecodeBounded> DecodeBounded for Vec<T> {
     const MAX_ALLOC: usize = usize::MAX;
     const MAX_DEPTH: usize = depth_plus_one(T::MAX_DEPTH);
     const MAX_WORK: usize = usize::MAX;
-    // The backing buffer costs size_of::<T>() per element beyond the wire
-    // data; nested collections inside T contribute their own ceilings.
     const MAX_STRUCTURAL_ELEMENT: usize = max(core::mem::size_of::<T>(), T::MAX_STRUCTURAL_ELEMENT);
 }
 
@@ -652,7 +603,7 @@ impl<T: DecodeBounded> DecodeBounded for Box<T> {
     const MAX_ALLOC: usize = saturating_add(T::MAX_ALLOC, core::mem::size_of::<T>());
     const MAX_DEPTH: usize = T::MAX_DEPTH;
     const MAX_WORK: usize = T::MAX_WORK;
-    // The box allocation costs at most size_of::<T>() beyond the wire data.
+    // Requested storage only; allocator overhead is excluded.
     const MAX_STRUCTURAL_ELEMENT: usize = max(core::mem::size_of::<T>(), T::MAX_STRUCTURAL_ELEMENT);
 }
 
@@ -754,9 +705,9 @@ mod tests {
         let decoded = decode_bounded::<StaticRecord>(&bytes, budget).unwrap();
         assert_eq!(decoded.value, value);
         assert_eq!(decoded.use_.read as usize, bytes.len());
-        assert_eq!(decoded.use_.alloc_bound, 0);
+        assert_eq!(decoded.use_.alloc_estimate, 0);
         assert_eq!(decoded.use_.depth_bound, 2);
-        assert_eq!(decoded.use_.work_bound, StaticRecord::MAX_WORK as u64);
+        assert_eq!(decoded.use_.work_read, bytes.len() as u64);
         // The type reports itself as statically bounded.
         const _: () = assert!(StaticRecord::STATICALLY_BOUNDED);
         const _: () = assert!(!DynamicRecord::STATICALLY_BOUNDED);
@@ -793,8 +744,8 @@ mod tests {
         assert_eq!(decoded.value, value);
         assert_eq!(decoded.use_.read as usize, bytes.len());
         // Dynamic ceiling: read + structural cap.
-        assert!(decoded.use_.alloc_bound >= bytes.len() as u64);
-        assert!(decoded.use_.work_bound >= bytes.len() as u64);
+        assert!(decoded.use_.alloc_estimate >= bytes.len() as u64);
+        assert!(decoded.use_.work_read >= bytes.len() as u64);
         // A tight input budget rejects the input up front.
         let tight = budget.with_max_input((bytes.len() - 2) as u64);
         assert!(matches!(
@@ -811,11 +762,10 @@ mod tests {
             tags: vec![0u8; 100],
         };
         let bytes = crate::options().serialize(&value).unwrap();
-        // max_alloc small -> collection_limit 0 -> collections are rejected.
         let budget = Budget::default().with_max_alloc(0);
         assert!(matches!(
             decode_bounded::<DynamicRecord>(&bytes, budget),
-            Err(DecodeError::Codec(Error::CollectionLimit { limit: 0 }))
+            Err(DecodeError::Budget(BudgetExceeded::Alloc { limit: 0 }))
         ));
     }
 
@@ -855,9 +805,12 @@ mod tests {
             .with_depth_limit(8);
         let budget = Budget::from_config(config);
         assert_eq!(budget.max_input(), 4096);
-        assert_eq!(budget.max_alloc(), 128 * ELEMENT_STRUCTURE_BYTES);
+        assert_eq!(
+            budget.max_alloc(),
+            DEFAULT_COLLECTION_LIMIT * ELEMENT_STRUCTURE_BYTES
+        );
         assert_eq!(budget.max_depth(), 8);
-        assert_eq!(budget.max_work(), 4096);
+        assert_eq!(budget.max_work(), DEFAULT_SIZE_LIMIT);
     }
 
     #[test]
@@ -922,49 +875,13 @@ mod tests {
     }
 
     #[test]
-    fn string_collection_allocation_is_covered_by_the_bound() {
-        // The documented ceiling must hold for Vec<String>: the per-element
-        // structural allocation (the String header in the backing buffer) is
-        // 24 bytes, which the type-derived bound accounts for exactly.
-        let value: Vec<String> = (0..200).map(|i| format!("s{i}")).collect();
-        let bytes = crate::options().serialize(&value).unwrap();
-        let budget = Budget::default();
-        let decoded = decode_bounded::<Vec<String>>(&bytes, budget).unwrap();
-        assert_eq!(decoded.use_.read as usize, bytes.len());
-        // 200 String headers (24 each) + the string data (~600 bytes) is the
-        // true allocation; the reported bound must cover it.
-        let true_alloc = 200 * core::mem::size_of::<String>() + 600;
-        assert!(
-            decoded.use_.alloc_bound as usize >= true_alloc,
-            "alloc_bound {} must cover the real allocation {}",
-            decoded.use_.alloc_bound,
-            true_alloc
-        );
-        // The budget knob is used only when the type does not declare its own
-        // structural bound; the declared bound is tighter for String.
-        assert!(
-            budget.element_structure_bytes()
-                >= <Vec<String> as DecodeBounded>::MAX_STRUCTURAL_ELEMENT as u64
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional algebra coverage: every primitive, composite shape, enum
-    // variant kind, and derived struct, plus budget-dimension boundaries.
-    // -----------------------------------------------------------------------
-
-    fn assert_primitive<T: DecodeBounded>(b: usize) {
-        assert_eq!(T::MAX_INPUT, b, "B");
-        assert_eq!(T::MAX_DEPTH, 0, "D");
-        assert_eq!(T::MAX_ALLOC, 0, "A");
-        assert_eq!(T::MAX_STRUCTURAL_ELEMENT, 0, "S");
-        // Work is the encoded bytes plus one field-transition unit.
-        assert_eq!(T::MAX_WORK, b + 1, "W");
-        assert!(T::STATICALLY_BOUNDED);
-    }
-
-    #[test]
     fn primitive_algebra_is_exact() {
+        fn assert_primitive<T: DecodeBounded>(b: usize) {
+            assert_eq!(T::MAX_INPUT, b);
+            assert_eq!(T::MAX_ALLOC, 0);
+            assert_eq!(T::MAX_DEPTH, 0);
+            assert_eq!(T::MAX_WORK, b + 1);
+        }
         assert_primitive::<()>(1);
         assert_primitive::<bool>(1);
         assert_primitive::<char>(13);
@@ -1007,11 +924,11 @@ mod tests {
             <(u8, u16, u32, u64, u128, i8, i16, i32) as DecodeBounded>::MAX_INPUT,
             2 + 9 + 9 + 9 + 10 + 18 + 9 + 9 + 9
         );
-        // PhantomData costs nothing on any dimension.
-        assert_eq!(<PhantomData<u64> as DecodeBounded>::MAX_INPUT, 0);
+        // PhantomData emits/consumes a null tag without owned storage.
+        assert_eq!(<PhantomData<u64> as DecodeBounded>::MAX_INPUT, 1);
         assert_eq!(<PhantomData<u64> as DecodeBounded>::MAX_DEPTH, 0);
         assert_eq!(<PhantomData<u64> as DecodeBounded>::MAX_ALLOC, 0);
-        assert_eq!(<PhantomData<u64> as DecodeBounded>::MAX_WORK, 0);
+        assert_eq!(<PhantomData<u64> as DecodeBounded>::MAX_WORK, 2);
     }
 
     #[derive(
@@ -1078,7 +995,7 @@ mod tests {
         assert_eq!(ShapeEnum::MAX_INPUT, usize::MAX);
         assert_eq!(ShapeEnum::MAX_ALLOC, usize::MAX);
         assert_eq!(ShapeEnum::MAX_WORK, usize::MAX);
-        assert_eq!(ShapeEnum::MAX_DEPTH, 3);
+        assert_eq!(ShapeEnum::MAX_DEPTH, 2);
         assert_eq!(ShapeEnum::MAX_STRUCTURAL_ELEMENT, 0);
         const _: () = assert!(!ShapeEnum::STATICALLY_BOUNDED);
     }
@@ -1099,9 +1016,9 @@ mod tests {
         assert_eq!(decoded.value, value);
         assert_eq!(decoded.use_.read as usize, bytes.len());
         assert!(decoded.use_.read <= NestedRecord::MAX_INPUT as u64);
-        assert_eq!(decoded.use_.alloc_bound, 0);
-        assert_eq!(decoded.use_.depth_bound, 3);
-        assert!(decoded.use_.work_bound <= NestedRecord::MAX_WORK as u64);
+        assert_eq!(decoded.use_.alloc_estimate, 0);
+        assert_eq!(decoded.use_.depth_bound, NestedRecord::MAX_DEPTH);
+        assert!(decoded.use_.work_read <= NestedRecord::MAX_WORK as u64);
     }
 
     #[test]
@@ -1115,7 +1032,7 @@ mod tests {
             let decoded =
                 decode_bounded::<StaticEnum>(&bytes, Budget::from_type::<StaticEnum>()).unwrap();
             assert_eq!(decoded.value, value);
-            assert_eq!(decoded.use_.alloc_bound, 0);
+            assert_eq!(decoded.use_.alloc_estimate, 0);
             assert_eq!(decoded.use_.depth_bound, 2);
             assert!(decoded.use_.read <= StaticEnum::MAX_INPUT as u64);
         }
@@ -1132,7 +1049,7 @@ mod tests {
             let bytes = crate::options().serialize(&value).unwrap();
             let decoded = decode_bounded::<ShapeEnum>(&bytes, Budget::default()).unwrap();
             assert_eq!(decoded.value, value);
-            assert_eq!(decoded.use_.depth_bound, 3);
+            assert_eq!(decoded.use_.depth_bound, Budget::default().max_depth());
         }
     }
 
@@ -1175,7 +1092,7 @@ mod tests {
         let exact = Budget::default().with_max_work(len);
         let decoded = decode_bounded::<Vec<u64>>(&dyn_bytes, exact).unwrap();
         assert_eq!(decoded.use_.read, len);
-        assert!(decoded.use_.work_bound >= len);
+        assert!(decoded.use_.work_read >= len);
         let tight = Budget::default().with_max_work(len - 1);
         let result = decode_bounded::<Vec<u64>>(&dyn_bytes, tight);
         assert!(
@@ -1186,21 +1103,19 @@ mod tests {
     }
 
     #[test]
-    fn alloc_budget_boundary_is_exact() {
-        // A Vec<u8> of 100 elements needs a collection limit >= 100. The
-        // per-element structural ceiling for Vec<u8> is size_of::<u8>() = 1
-        // and the depth is 1, so collection_limit = max_alloc / 1.
+    fn weighted_token_admission_boundary_is_exact() {
+        // Root array plus 100 elements requires 101 global tokens at weight 1.
         let value: Vec<u8> = vec![0u8; 100];
         let bytes = crate::options().serialize(&value).unwrap();
         let tight = Budget::default()
-            .with_max_alloc(99)
+            .with_max_alloc(bytes.len() as u64 + 99)
             .with_max_input(bytes.len() as u64);
         assert!(matches!(
             decode_bounded::<Vec<u8>>(&bytes, tight),
-            Err(DecodeError::Codec(Error::CollectionLimit { limit: 99 }))
+            Err(DecodeError::Budget(BudgetExceeded::Values { limit: 99 }))
         ));
         let exact = Budget::default()
-            .with_max_alloc(100)
+            .with_max_alloc(bytes.len() as u64 + 101)
             .with_max_input(bytes.len() as u64);
         assert!(decode_bounded::<Vec<u8>>(&bytes, exact).is_ok());
     }
@@ -1221,27 +1136,10 @@ mod tests {
         // A zero knob means no structural allocation: no per-element cap.
         let budget = budget.with_element_structure_bytes(0);
         let limits = derive_enforced_limits(budget, false, budget.element_structure_bytes());
-        assert_eq!(limits.collection_limit, limits.byte_limit);
-    }
-
-    #[test]
-    fn nested_collection_alloc_bounds_are_sound() {
-        // Vec<Vec<u8>>: structural = max(size_of::<Vec<u8>>(), 1) = 24,
-        // depth 2 -> per-element ceiling 48. The reported alloc_bound must
-        // cover the real allocation (outer buffer 24*2 + inner data).
-        let value: Vec<Vec<u8>> = vec![vec![1, 2], vec![3, 4, 5]];
-        let bytes = crate::options().serialize(&value).unwrap();
-        let decoded = decode_bounded::<Vec<Vec<u8>>>(&bytes, Budget::default()).unwrap();
-        let true_alloc = 2 * core::mem::size_of::<Vec<u8>>() + 5;
-        assert!(decoded.use_.alloc_bound as usize >= true_alloc);
-        assert_eq!(decoded.use_.depth_bound, 2);
-
-        // Vec<Box<u64>>: structural = max(size_of::<Box<u64>>(), size_of::<u64>()) = 8.
-        let boxed: Vec<Box<u64>> = vec![Box::new(1), Box::new(2)];
-        let bytes = crate::options().serialize(&boxed).unwrap();
-        let decoded = decode_bounded::<Vec<Box<u64>>>(&bytes, Budget::default()).unwrap();
-        let true_alloc = 2 * core::mem::size_of::<Box<u64>>() + 2 * core::mem::size_of::<u64>();
-        assert!(decoded.use_.alloc_bound as usize >= true_alloc);
+        assert_eq!(
+            limits.collection_limit,
+            limits.byte_limit.min(budget.max_collection())
+        );
     }
 
     #[test]

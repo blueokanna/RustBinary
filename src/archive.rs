@@ -1093,7 +1093,6 @@ where
         limit: limits.max_file_size(),
         actual: u64::MAX,
     })?;
-    // Compute the Merkle tree once; the root is the top of the level stack.
     let (levels, block_count) = merkle_levels(&payload, block_size);
     let root = levels[levels.len() - 1][0];
     let hash_section = serialize_hash_section(&levels);
@@ -1156,9 +1155,6 @@ where
     T::Archived: CheckBytes,
 {
     let (_, payload, _) = validate_archive::<T>(bytes, limits)?;
-    // SAFETY: `validate_archive` proved the relative-pointer graph, the
-    // Merkle root, and the envelope; the archived root is packed (alignment
-    // 1), so the cast is aligned and the bytes hold a valid `T::Archived`.
     Ok(unsafe { access_unchecked::<T::Archived>(&bytes[payload]) })
 }
 
@@ -1211,20 +1207,13 @@ where
     }
     let (payload, hash_section) = ranges_from_header(bytes.len(), header)?;
     let payload_bytes = &bytes[payload.clone()];
-    // The archived root is `#[repr(C)]` with alignment at most 8 (u64/i64/f64
-    // fields; strings and vecs are 4-aligned RelPtrs). Zero-copy access casts
-    // the payload base to `&T::Archived`, so the base must satisfy that
-    // alignment. In practice the envelope keeps the payload base at offset
-    // 128 on an aligned buffer, but a caller-supplied slice may not.
     let required_alignment = align_of::<T::Archived>();
     if (payload_bytes.as_ptr() as usize) % required_alignment != 0 {
         return Err(ArchiveError::Validation(
             "payload base does not satisfy archived root alignment".into(),
         ));
     }
-    // Verify the Merkle tree in one pass: recompute the levels from the
-    // payload and require the root, block count, and stored hash-section
-    // root to agree. This is O(n) and paid once by `open`/`build`/`access`.
+
     let (levels, recomputed_blocks) = merkle_levels(payload_bytes, header.block_size);
     let recomputed_root = levels[levels.len() - 1][0];
     if recomputed_root != header.root {
@@ -1250,8 +1239,6 @@ where
     if stored_root.len() as u64 != expected_hash_len {
         return Err(ArchiveError::Merkle("hash section length does not match"));
     }
-    // For a single-leaf tree there are no internal nodes and the section is
-    // empty; the recomputed leaf root already matched the header root above.
     if height > 0 {
         let section_root = read_section_hash(stored_root, 1u64 << height, height, height, 0);
         if section_root != header.root {
@@ -1259,8 +1246,6 @@ where
         }
     }
     let _ = levels;
-    // Structural validation of the relative-pointer graph, rooted at the
-    // archived root (payload offset 0).
     T::Archived::check_at(payload_bytes, 0).map_err(ArchiveError::Validation)?;
     Ok((header, payload, hash_section))
 }
@@ -1347,10 +1332,7 @@ fn parse_header(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveHeader, Ar
             "declared hash section length does not match",
         ));
     }
-    // The hash section must hold exactly the internal nodes of the padded
-    // tree: leaf_count - 1 hashes of 32 bytes. Validating this at envelope
-    // parse time keeps every later `read_section_hash` in bounds, including
-    // the header-only open path.
+
     let height = tree_height(block_count);
     let expected_hash_len = ((1u64 << height) - 1)
         .checked_mul(32)
@@ -1573,7 +1555,6 @@ mod tests {
     fn owned_archive_validates_and_borrows_relative_fields() {
         let archive = build(&value(), ArchiveLimits::new()).unwrap();
         let bytes = archive.as_bytes();
-        // Envelope format anchors (the format-stability contract).
         assert_eq!(&bytes[..8], b"RBARC004");
         assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 4);
         assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), FLAG_MERKLE);
@@ -1597,7 +1578,6 @@ mod tests {
         );
         assert_eq!(u64::from_le_bytes(bytes[100..108].try_into().unwrap()), 0);
         assert!(bytes[108..HEADER_LEN].iter().all(|&byte| byte == 0));
-        // The Merkle root is a deterministic function of the payload.
         let again = build(&value(), ArchiveLimits::new()).unwrap();
         assert_eq!(archive.root_digest(), again.root_digest());
         assert_eq!(archive.header(), again.header());
@@ -1679,8 +1659,6 @@ mod tests {
 
         let mut invalid_graph = AlignedBytes::<MAX_ARCHIVE_ALIGNMENT>::new();
         invalid_graph.extend_from_slice(archive.as_bytes());
-        // Rewrite both the payload and the hash section; the Merkle root in
-        // the header no longer matches the recomputed tree.
         invalid_graph[PAYLOAD_OFFSET..].fill(0xff);
         assert!(matches!(
             access::<Root>(&invalid_graph, ArchiveLimits::new()),
@@ -1694,8 +1672,6 @@ mod tests {
         let archive = build(&value(), ArchiveLimits::new()).unwrap();
         archive.write_new(&file.0).unwrap();
 
-        // SAFETY: This test owns the unique file path and never opens a writer
-        // while the map is alive. The cleanup guard removes it only after drop.
         let mapped = unsafe { MappedArchive::<Root>::open(&file.0, ArchiveLimits::new()) }.unwrap();
         let root = mapped.root();
         assert_eq!(root.name.as_str(), "mapped");
@@ -1728,7 +1704,6 @@ mod tests {
 
     #[test]
     fn merkle_proofs_verify_for_ranges_across_blocks() {
-        // 4 KiB of samples with 64-byte blocks -> 65 leaves, height 7.
         let limits = ArchiveLimits::new().with_merkle_block_size(64);
         let archive = build(&wide_value(), limits).unwrap();
         let payload = archive.payload();
@@ -1738,7 +1713,6 @@ mod tests {
             payload.len().div_ceil(64) as u64
         );
 
-        // A single-block range, a multi-block range, and the full payload.
         let ranges = [
             (0u64, 10u64),
             (64u64, 200u64),
@@ -1768,23 +1742,18 @@ mod tests {
         let proof = archive.proof_for(0, payload_len).unwrap();
         proof.verify().unwrap();
 
-        // Corrupt a block inside the proof's own data.
         let mut tampered = proof.clone();
         tampered.blocks[0][0] ^= 0x01;
         assert!(matches!(tampered.verify(), Err(ArchiveError::Merkle(_))));
 
-        // Truncate the covered range by a full block: the carried block list
-        // no longer matches the covered leaf count.
         let mut truncated = proof.clone();
         truncated.len -= 64;
         assert!(truncated.verify().is_err());
 
-        // Swap the root.
         let mut wrong_root = proof.clone();
         wrong_root.root[0] ^= 1;
         assert!(wrong_root.verify().is_err());
 
-        // Range past the payload.
         assert!(matches!(
             archive.proof_for(payload_len - 1, 2),
             Err(ArchiveError::Merkle("proof range exceeds the payload"))
@@ -1798,12 +1767,10 @@ mod tests {
         let archive = build(&wide_value(), limits).unwrap();
         archive.write_new(&file.0).unwrap();
 
-        // SAFETY: unique owned path, no concurrent writers.
         let header_only =
             unsafe { MappedArchive::<WideRoot>::open_header_only(&file.0, limits) }.unwrap();
         assert_eq!(header_only.root_digest(), archive.root_digest());
 
-        // Proofs are built from the stored hash section (O(log n) per range).
         let proof = header_only.proof_for(128, 400).unwrap();
         proof.verify().unwrap();
         let extracted = proof.extract().unwrap();
@@ -1813,15 +1780,10 @@ mod tests {
             "extracted range must match the original payload"
         );
 
-        // A corrupted payload is caught by proof verification even though
-        // header-only opening validated only the envelope. Write a file with
-        // one flipped payload byte and re-open header-only: the stored root
-        // (from the original build) can no longer authenticate the payload.
         let corrupted_file = TemporaryArchive::new();
         let mut corrupted_bytes = archive.as_bytes().to_vec();
         corrupted_bytes[PAYLOAD_OFFSET + 200] ^= 0xff;
         std::fs::write(&corrupted_file.0, &corrupted_bytes).unwrap();
-        // SAFETY: unique owned path, no concurrent writers.
         let corrupted_header_only =
             unsafe { MappedArchive::<WideRoot>::open_header_only(&corrupted_file.0, limits) }
                 .unwrap();
@@ -1837,14 +1799,12 @@ mod tests {
     fn merkle_block_size_is_encoded_and_honoured() {
         let archive = build(&value(), ArchiveLimits::new()).unwrap();
         let bytes = archive.as_bytes();
-        // Patch the header block size to a non-power-of-two and re-validate.
         let mut patched = bytes.to_vec();
         patched[48..52].copy_from_slice(&100u32.to_le_bytes());
         assert!(matches!(
             access::<Root>(&patched, ArchiveLimits::new()),
             Err(ArchiveError::InvalidHeader(_))
         ));
-        // Build rejects invalid block sizes up front.
         assert!(build(&value(), ArchiveLimits::new().with_merkle_block_size(100)).is_err());
         assert!(build(&value(), ArchiveLimits::new().with_merkle_block_size(16)).is_err());
     }

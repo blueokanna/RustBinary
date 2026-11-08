@@ -10,7 +10,6 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustbinary::ErrorCategory;
 
 fuzz_target!(|data: &[u8]| {
     let configs = [rustbinary::options(), rustbinary::legacy_options()];
@@ -23,5 +22,4 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    ErrorCategory::UserInput
 });

@@ -84,6 +84,8 @@ pub struct Config {
     pub(crate) limit: Option<u64>,
     pub(crate) collection_limit: Option<u64>,
     pub(crate) depth_limit: usize,
+    pub(crate) value_limit: Option<u64>,
+    pub(crate) decode_work_limit: Option<u64>,
 }
 
 impl Default for Config {
@@ -93,7 +95,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Creates the compact profile: variable integers, little endian, and strict trailing bytes.
+    /// Creates the self-describing profile with variable integers and strict trailing bytes.
     pub const fn standard() -> Self {
         Self {
             endian: Endian::Little,
@@ -102,6 +104,8 @@ impl Config {
             limit: Some(DEFAULT_SIZE_LIMIT),
             collection_limit: Some(DEFAULT_COLLECTION_LIMIT),
             depth_limit: MAX_DEPTH,
+            value_limit: Some(DEFAULT_COLLECTION_LIMIT),
+            decode_work_limit: Some(DEFAULT_SIZE_LIMIT),
         }
     }
     /// Creates the historical unbounded fixed-width RustBinary profile.
@@ -121,6 +125,8 @@ impl Config {
             limit: None,
             collection_limit: None,
             depth_limit: MAX_DEPTH,
+            value_limit: None,
+            decode_work_limit: None,
         }
     }
     /// Selects little endian.
@@ -161,12 +167,9 @@ impl Config {
     ///
     /// # Security
     ///
-    /// Without a byte limit the raw codec performs no size accounting, so this
-    /// mode is only for trusted, in-memory data. Decompression is an exception
-    /// that remains bounded: the compression wrapper ([`Config::with_compression`])
-    /// always caps the decompressed size at the crate-wide
-    /// [`DEFAULT_SIZE_LIMIT`] when no explicit limit is configured, so a
-    /// hostile frame cannot expand without bound.
+    /// Other parser limits remain enabled. The LZ compression wrapper retains
+    /// a [`DEFAULT_SIZE_LIMIT`] output cap; other profiles have their own
+    /// policies. Keep an explicit byte limit for untrusted inputs.
     pub const fn with_no_limit(mut self) -> Self {
         self.limit = None;
         self
@@ -180,6 +183,27 @@ impl Config {
     pub const fn with_no_collection_limit(mut self) -> Self {
         self.collection_limit = None;
         self
+    }
+    /// Caps tokens read across the entire self-describing decode, including
+    /// object keys, skipped fields and speculative retries. Terminators do not
+    /// count. This is independent of the per-collection limit and heap usage.
+    pub const fn with_value_limit(mut self, limit: u64) -> Self {
+        self.value_limit = Some(limit);
+        self
+    }
+    /// Caps bytes examined by the self-describing decoder, counting rereads
+    /// after backtracking again. Custom trait computation is outside this limit.
+    pub const fn with_decode_work_limit(mut self, limit: u64) -> Self {
+        self.decode_work_limit = Some(limit);
+        self
+    }
+    /// Returns the self-describing decoder's global token limit.
+    pub const fn value_limit(self) -> Option<u64> {
+        self.value_limit
+    }
+    /// Returns the self-describing decoder's cumulative byte-read limit.
+    pub const fn decode_work_limit(self) -> Option<u64> {
+        self.decode_work_limit
     }
     /// Caps the maximum container nesting depth for one encoded or decoded value.
     ///

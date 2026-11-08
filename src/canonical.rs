@@ -1,11 +1,8 @@
 //! Canonical little-endian marker-varint and ZigZag primitives.
 //!
-//! This module is the **single implementation** of the canonical integer
-//! encoding for the little-endian variable-integer profile. Both the encoder
-//! (`ser`) and the decoder (`decoder`) call these functions, so the two
-//! directions cannot drift apart, and the Kani verification harnesses in
-//! `kani_proofs.rs` prove the roundtrip, boundedness, and canonical-form
-//! properties against these exact functions.
+//! Shared integer primitives for little-endian variable encoding. Tests and
+//! Kani harnesses exercise these functions; harness source alone is not proof
+//! that a verification run completed.
 //!
 //! Marker-varint canonical form (little endian):
 //!

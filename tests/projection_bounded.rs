@@ -57,11 +57,10 @@ fn bounded_decode_returns_resource_evidence() {
     assert_eq!(decoded.use_.read as usize, bytes.len());
     assert!(decoded.use_.read <= budget.max_input());
     assert!(decoded.use_.read <= budget.max_work());
-    // dynamic allocation ceiling: read + structural cap <= max_input + max_alloc.
-    assert!(decoded.use_.alloc_bound <= budget.max_input() + budget.max_alloc());
+    assert!(decoded.use_.alloc_estimate <= budget.max_alloc());
     // static algebra: depth is derived (object + array).
     assert_eq!(<Packet as DecodeBounded>::MAX_DEPTH, 2);
-    assert_eq!(decoded.use_.depth_bound, 2);
+    assert_eq!(decoded.use_.depth_bound, budget.max_depth());
 
     // A budget too small for the input is rejected before decoding.
     let tight = budget.with_max_input((bytes.len() - 1) as u64);
@@ -139,17 +138,14 @@ fn allocation_budget_rejects_oversized_collections() {
         data: vec![0u8; 100],
     };
     let bytes = rustbinary::options().serialize(&value).unwrap();
-    // Blob is an object (level 1) containing a Vec<u8> (level 2): the
-    // per-element structural ceiling is size_of::<u8>() * depth = 1 * 2, so
-    // the derived collection limit is max_alloc / 2. 199 -> 99 elements
-    // (cannot hold 100), 200 -> 100 (exactly enough).
-    let tight = Budget::default().with_max_alloc(199);
+    // One object, one key, one array and 100 items are 103 global tokens.
+    let tight = Budget::default().with_max_alloc(bytes.len() as u64 + 102);
     assert!(matches!(
         decode_bounded::<Blob>(&bytes, tight),
-        Err(rustbinary::DecodeError::Codec(
-            rustbinary::Error::CollectionLimit { limit: 99 }
+        Err(rustbinary::DecodeError::Budget(
+            rustbinary::BudgetExceeded::Values { limit: 102 }
         ))
     ));
-    let exact = Budget::default().with_max_alloc(200);
+    let exact = Budget::default().with_max_alloc(bytes.len() as u64 + 103);
     assert!(decode_bounded::<Blob>(&bytes, exact).is_ok());
 }

@@ -1,19 +1,11 @@
 # RustBinary
 
-RustBinary 是一个基于 [nextjson](https://crates.io/crates/nextjson) 的有界二进制编解码库。
-类型直接用 nextjson 的 derive 描述，这个库负责把它们变成字节、再变回来。它只做一件窄事：
-把结构化数据搬上线或落进文件——对面可能是恶意的，内存可能很紧，而且你希望在解码器跑起来
-之前就知道它最多会吃掉多少资源。
+RustBinary 是基于 [nextjson](https://crates.io/crates/nextjson) 的二进制编解码库，
+提供自描述与 schema 引导的格式、解析限制、可选压缩、认证帧和 Merkle 证明。
+核心使用 `no_std` + `alloc`；默认启用的 `std` feature 提供 I/O 与平台能力。
+声明的最低 Rust 版本为 1.78，CI 配置包含相应验证任务。
 
-- **MSRV**：Rust 1.78（两个 crate 均硬性锁定，CI 在精确工具链上验证；依赖图锁定在仍能在
-  1.78 构建的版本）。
-- **`no_std` 优先**：crate 无条件 `#![no_std]` + `alloc`；`std` 是可选 feature，只额外提供
-  I/O 适配器与仅 std 的转换层。自描述核心与所有自研 feature（adaptive、entropy、reconcile、
-  evolution、projection、bounded、probe）均可不带 `std` 构建。
-
-这里每个特性都回答一个具体问题——"这个帧我拒得起吗？"、"轻客户端能不能不扫全记录就读
-一个字段？"、"这种类型最坏能把我的堆怎么样？"——下文先给答案，再说明代价。本库没有装饰
-性功能；凡是取舍而非纯赢的特性，README 都会直说。
+解析限制不等于进程内存沙箱。具体边界与升级说明见[安全契约](docs/security-contract.md)。
 
 ## 格式身份
 
@@ -48,29 +40,19 @@ bincode-next、postcard、rkyv、minicbor 对比，输在哪一行都写得清�
 
 ## 依赖策略
 
-这个库刻意**自包含**。流路径依赖 nextjson 与可选的派生 crate；其他 codec 会以第三方
-依赖引入的每个原语，这里都在库内实现：
+运行时依赖 nextjson 0.1.5，derive 支持另需过程宏依赖。工作区使用本地
+`rustbinary-derive`，确保测试覆盖正在修改的宏代码。nextjson 0.1.5 已移除 `std`
+feature 和标准库 `HashMap` 的直接实现；可迁移到 `BTreeMap`，或通过应用自己的
+newtype 实现 nextjson trait。
 
-| 原语              | 库内模块           | 替代        |
-| ----------------- | ------------------ | ----------- |
-| BLAKE3（Merkle + 投影证明） | `crate::hash` | `blake3`    |
-| XChaCha20-Poly1305 AEAD（RFC 8439） | `crate::aead` | `chacha20poly1305` |
-| OS CSPRNG + zeroize | `crate::entropy`  | `getrandom`、`zeroize` |
-| LZ77 无损压缩     | `crate::lz`        | `zstd`      |
-| 只读 mmap         | `crate::mmap`      | `memmap2`   |
-| 零拷贝归档编解码器 | `crate::archive_codec` | `rkyv`  |
+BLAKE3、XChaCha20-Poly1305、系统随机数、密钥擦除、LZ77 和 mmap 均由本仓库维护。
+减少依赖意味着本项目承担更多实现审查、平台验证和维护责任。库内 LZ77 是
+RustBinary 自有格式，与 Zstandard 不兼容，不承诺压缩率、速度、字典能力或生态等价。
 
-- **MSRV**：crate 钉死 Rust 1.78（`rustbinary` 与 `rustbinary-derive` 均为
-  `rust-version = "1.78"`），CI 矩阵在该精确工具链上验证每种 feature 组合。nextjson
-  钉到 `=0.1.4`——其序列化/反序列化路径**拒绝非有限浮点**（`NaN`/`±Inf` 是错误，
-  不是可往返的值）；RustBinary 继承并测试该契约。
-- **供应链**：运行时依赖图恰好是 `nextjson`（及其派生）与库内 `rustbinary-derive`，
-  不再链接任何其他 crate；dev-dependencies（proptest 做属性测试）钉在仍能在 1.78
-  构建的版本。
-- **密码实现**：每个原语都在库内实现并用官方向量校验——BLAKE3 对官方测试套件、
-  ChaCha20-Poly1305 对 RFC 8439 向量，AEAD framing 与旧 `chacha20poly1305` 管线
-  逐字节一致（golden-vector 测试锁定旧字节）。Merkle 树同样用库内 BLAKE3，整个
-  完整性路径零依赖。
+密码测试覆盖 RFC 8439 的 ChaCha20/Poly1305 示例、XChaCha20-Poly1305 草案向量，
+以及 BLAKE3 上游非密钥模式的 256 位输出向量。[安全契约](docs/security-contract.md#test-evidence)
+记录来源与范围。加密管线 golden fixture 只证明该固定样本仍可解码；历史生成器
+未被记录，不能据此宣称与旧第三方管线全面逐字节兼容。项目不宣称已完成独立实现级安全审计。
 
 ## 分层
 
@@ -99,7 +81,7 @@ bincode-next、postcard、rkyv、minicbor 对比，输在哪一行都写得清�
 | 位打包                  | 已实现     | `BitPacked` derive、宽度检查、规范零 padding                                |
 | Schema 指纹             | 已实现     | 结构哈希，包含编解码配置（FNV-1a，**非**密码学）                             |
 | 编译期内存上界          | 已实现     | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                  |
-| RFC 8949 CBOR           | 已实现     | 自研流式 CBOR 编解码（无值树）；可选 canonical map 排序                     |
+| RFC 8949 CBOR           | 已实现     | 自研流式 CBOR 编解码（无值树）；可选 稳定 map 排序                     |
 | Schema 演进             | 已实现     | 稳定字段 ID、版本、默认值、跳过未知字段                                     |
 | 压缩                    | 已实现     | 自适应 Zstandard；压缩后更大则保留原文                                      |
 | 加密                    | 已实现     | XChaCha20-Poly1305、随机 192-bit nonce、认证 header                         |
@@ -109,10 +91,10 @@ bincode-next、postcard、rkyv、minicbor 对比，输在哪一行都写得清�
 | IBLT 集合协调           | 已实现     | 自研可逆布隆查找表（Goodrich 与 Mitzenmacher）                              |
 | 信任演算                | 已实现     | 类型级认证状态机；未认证接收在类型层面不可表达                              |
 | Merkle 归档             | 已实现     | 库内 BLAKE3 树，O(log n) 证明，仅信封打开                                |
-| 可投影自认证记录        | 已实现     | 投影健全性、O(log n) 证明、schema 版本绑定、跳过未知字段                   |
-| 资源有界解码            | 已实现     | schema 派生 B/A/D/W 成本代数，预算强制的 `decode_bounded` 并带用量证据      |
+| 可投影自认证记录        | 已实现     | 可信根成员证明、精确查询检查、schema 版本绑定                   |
+| 资源有界解码            | 已实现     | 解析计数与 schema 估算，不提供堆分配硬上限      |
 | 可配置深度上限          | 已实现     | `Config::with_depth_limit` 在编码与解码两侧限制嵌套深度                     |
-| 形式化验证              | Kani 证明  | varint/ZigZag 核心 + 投影树几何 + 预算极限代数                              |
+| 形式化验证              | Kani harness | varint/ZigZag 核心 + 投影树几何 + 预算极限代数                              |
 | `no_std` 优先               | 已实现     | crate 无条件 `no_std` + `alloc`；`std` 是可选 feature                  |
 | `no_std` 各层              | 已实现     | compact、adaptive、entropy、reconcile、evolution、projection、bounded、probe、CBOR、trust 演算均可不带 `std` 构建 |
 
@@ -121,9 +103,9 @@ bincode-next、postcard、rkyv、minicbor 对比，输在哪一行都写得清�
 ```toml
 [dependencies]
 rustbinary = "0.1"
-# nextjson 钉到精确的 codec 目标：0.1.4 在编码与解码两侧拒绝非有限浮点，
+# nextjson 钉到精确的 codec 目标：0.1.5 在编码与解码两侧拒绝非有限浮点，
 # RustBinary 继承该契约。
-nextjson = { version = "=0.1.4", features = ["derive"] }
+nextjson = { version = "0.1.5", features = ["derive"] }
 ```
 
 按需启用：
@@ -251,7 +233,7 @@ assert_eq!(secure.deserialize::<Vec<u32>>(&frame)?, value);
 | `255`     | 保留     | 永不接受                 |
 
 解码器拒绝非最小形式、收窄溢出、畸形 UTF-8、非法标签、截断、越限与不允许的尾随
-字节。varint 与 ZigZag 机制只存在于一处（`canonical`），编解码两侧共用，Kani 证明其
+字节。varint 与 ZigZag 机制只存在于一处（`canonical`），编解码两侧共用，Kani harness 检查其
 往返、有界与规范唯一性（见验证一节）。
 
 ## 零分配与零复制
@@ -328,48 +310,13 @@ Numeral Systems；16 位重归一化；64 位状态），配以**由 `Reflect` s
 
 ### 不使用哈希如何检测损坏
 
-rANS 流不是自认证的。最终状态检查能拒绝截断和大部分替换，但对"字节变了但仍然能解码"
-的情况有非零漏检率。这个模块的第一版用帧内 SHA-256 摘要掩盖了这个问题；这一版把哈希
-整个去掉，换成精确的东西：
+rANS replay 检查的是：解码结果使用同一模型重新编码后，是否与收到的帧一致。
+它用于拒绝非规范表示。另一个合法码字可以解码成不同数据并通过 replay，因此不能
+把它解释成认证，也不能声称具有已量化的随机损坏检出率。
 
-**重放校验。** 解码器用同一组模型把解码结果重新编码，并要求结果与帧中存储的负载和
-最终状态逐字节一致。只有当帧是"它解码出的负载的规范编码"时才被接受——即
-`frame == encode(decode(frame))`。
-
-接受规则就是全部保证，失败模式如下：
-
-- 截断或状态/计数损坏会在消费与状态检查处失败。
-- 仍可解码的字节变更会产生**不同的**负载，而它的规范编码几乎不可能等于被损坏的帧，
-  因此重放不一致、帧被拒绝。
-- 残余缺口：被损坏的帧原则上可能是**另一个**负载的规范编码（`frame == encode(x)` 且
-  `x` 不同于原文），此时重放会带着错误内容接受它。任何无哈希方案都关不掉这个缺口。
-  注意：无密钥的帧摘要**能**捕获这类意外翻转——重放校验是用这点检测缺口换取零哈希。
-  无论重放还是摘要都挡不住能改写帧的攻击者；认证完整性属于 AEAD/信任层。
-- raw 回退帧存储字面输入、无冗余，因此只做长度校验。`without_raw_fallback()` 关闭该
-  回退，让每个帧都保持编码态、都可被重放校验。
-
-重放校验默认开启，代价是解码时多一次编码（基准表可见）。`without_replay_verification()`
-可在传输层已认证字节的场景下关闭。
-
-```rust
-use rustbinary::{Model, RansEncoder, RansDecoder};
-
-// 精确 5 符号表每个符号约 log2(5) = 2.32 位，而不是 3 位。
-let model = Model::from_uniform(5)?;
-let mut encoder = RansEncoder::new();
-for _ in 0..100 { encoder.put_symbol(&model, 3)?; }
-let (final_state, payload) = encoder.finish();
-let mut decoder = RansDecoder::new(final_state, &payload);
-let mut kinds = Vec::new();
-for _ in 0..100 { kinds.push(decoder.get_symbol(&model)?); }
-decoder.finish()?;
-kinds.reverse();
-# assert!(kinds.iter().all(|&k| k == 3));
-# Ok::<(), rustbinary::Error>(())
-```
-
-见 [entropy.rs](examples/entropy.rs) 的 schema 驱动流程与带偏斜先验的独立字节 codec
-（重复遥测数据 2 倍以上压缩，已在基准 crate 中实测）。
+raw fallback 只检查帧结构与长度；关闭 raw fallback 同样不能建立完整性边界。
+应按威胁模型选择可信摘要、MAC、AEAD 或认证传输。默认开启 replay 会增加一次编码；
+`without_replay_verification()` 中的 replay 指编码重放，不是协议防重放或消息新鲜性。
 
 ## 位打包
 
@@ -454,79 +401,51 @@ frame 以 magic `RBE1`、格式版本、flags、schema ID、schema 版本、字�
 
 ## 可投影自认证记录（投影健全性）
 
-`projection` 特性是一种**协议格式，不是紧凑 codec**：规范、自认证的记录，其字段可
-针对可信根**逐个**验证与解码，而无需扫描或反序列化记录的其余部分。保证是**投影健全性**：
+投影证明将披露字段的字节绑定到外部可信的 Merkle 根。
+`verify(proof, anchor, schema_version)` 验证证明自带字段的成员资格；新增的
+`verify_query(proof, anchor, schema_version, query)` 还要求返回字段与调用方查询完全一致，
+缺少或多出字段均拒绝。当前格式不提供字段不存在的证明。
+`verify_untrusted` 只检查内部一致性，发送者可以同时替换内容和根。
 
-```text
-Verify(P, π, q) = v   ⟹   v = Project_q(Decode(P))
-```
+论证依赖 BLAKE3 抗碰撞性、可信根来源与规范源记录，不能把哈希当成数学上的单射。
+部分证明既不读取，也不担保另一个文件中未披露字段的当前状态；不透明负载的语义和
+应用 schema 约束仍由应用验证。
 
-`P` 是记录，`q` 是投影查询（字段 ID 集合），`π` 是证明，`Decode(P)` 是唯一规范解码
-（唯一性来自格式的规范性：严格递增字段 ID、定宽头部、无重复）。`q` 之外的字段永不
-被读取，但其真实性仍被保证：每个字段都绑定进 Merkle 根，篡改或替换未读字段会改变根
-并使验证失败。
-
-- **构造**：字段为 `(field_id, payload_len, payload)` 三元组；根是
-  `BLAKE3(schema_version ‖ merkle_root)`，因此证明无法针对不同 schema 版本重放。
-  `RecordBuilder` 强制规范顺序；`prove` 提取批量证明（最小兄弟集）；`verify` 永不
-  触碰记录，并要求**可信锚点**（记录根，由认证来源承诺——区块头、带密钥的承诺、
-  签名的索引）。本模块绑定完整性；带密钥的认证是调用方的信任锚。`verify_untrusted`
-  只检查内部一致性，检测损坏而非替换。
-- **诚实的复杂度**：`prove` 为 O(n)；证明大小最坏 O(|q| · log(n/|q|))，单字段或连续
-  区间为 O(log n)；`verify` 做 O(|q| + log n) 次哈希运算。Merkle 开销意味着该格式面向
-  字段数适中的记录；对负载为主的记录，逐字段哈希成本可忽略。
-- **已验证**：Kani 证明 `small_tree_proof_agrees_with_root` 证明聚合/重算协议对任意
-  哈希与任意查询在代数上一致；`leaf_count_is_complete_and_bounded` 证明树完整且至多
-  翻倍。
+n 个字段中披露 k 个字段时，兄弟哈希数量为 O(k log(n/k) + k)。验证还需读取披露负载，
+并承担 BTreeMap 的对数级记账开销。当前证明构建会扫描记录并构建 O(n) 空间的树。
 
 ## 资源有界解码（成本代数）
 
-`bounded` 特性把 `StaticSize` 从“最坏输出字节数”推进到**可证明的资源语义**。
-`#[derive(DecodeBounded)]` 为每个类型生成镜像解析器的成本代数：
+`decode_bounded` 对输入字节、累计读取字节、全局 token 访问次数、单容器元素数量和
+嵌套深度执行运行时限制。全局计数包含对象键、未知字段和回溯重试，不能用深度乘以
+单容器上限推导全局元素数；深度二也能包含大量并列子容器。
 
-```text
-B(T)  一次解码 T 最多消费的输入字节数
-A(T)  一次解码 T 最多分配的堆字节数
-D(T)  最大解析器嵌套深度
-W(T)  最坏工作量（读字节 + 逐字段开销）
-```
+`Budget::with_max_values` 控制全局访问次数。`max_work` 计算解析器读取的字节，包含回溯
+重读，不计量任意 trait 代码的 CPU 时间。`ResourceUse` 返回 `read`、`work_read`、
+`values` 和实际配置的 `depth_bound`。
 
-`decode_bounded` 在 [`Budget`] 下运行解码并返回携带**证据**的 `Decoded<T>`
-（`ResourceUse`：精确读字节数，加上分配、深度、工作的可证明上界）。代数与解析器同构
-——derive 镜像编码器/解码器遍历的确切容器/键结构——因此对静态有界类型，常量是精确的：
-这样的解码按构造至多读 `B(T)` 字节、分配 `A(T)` 字节（通常为 0）、嵌套 `D(T)` 层、
-做 `W(T)` 工作。
+`max_alloc` 限制准入估算：动态类型计入输入字节与 token 权重，静态类型使用 schema
+估算。成功返回时 `alloc_estimate <= max_alloc`，这仍然不是实际堆分配上界。
+Vec 容量、扩容瞬时双缓冲、Box、分配器元数据和自定义反序列化均不受原公式约束。
+`DecodeBounded` 常量是可信实现提供的 schema 估算，derive 也必须结合 nextjson 属性与
+字段实现审查。严格内存硬上限需要应用在分配器或进程层实现隔离。
 
-动态类型（`Vec`、`String`、`&str`）对内容相关的资源报告 `usize::MAX`，由运行时预算
-强制执行调用方的上限。分配上限是保守且对 derive 覆盖的类型精确的：
-
-- **数据**：输入中物化到堆的每一字节（字符串与字节缓冲本体）都被字节上限约束，因此
-  `数据 ≤ 读取`。
-- **结构**：集合后备缓冲与 Box 超出其线数据之外的部分。derive 计算
-  `MAX_STRUCTURAL_ELEMENT`——类型中所有集合里最坏的单元素结构分配（`Vec<T>`/`Box<T>`
-  为 `size_of::<T>()`，`String` 为 0）。一次解码至多有 `D(T)` 层嵌套集合，每层受集合
-  上限约束，因此
-  `分配 ≤ 读取 + MAX_STRUCTURAL_ELEMENT · D(T) · collection_limit ≤ max_input + max_alloc`。
-  报告的 `alloc_bound` 即该上界。未声明 `MAX_STRUCTURAL_ELEMENT` 的手写 `DecodeBounded`
-  实现回退到预算的 `element_structure_bytes` 旋钮（默认 `ELEMENT_STRUCTURE_BYTES` = 64，
-  覆盖标准集合形态；宽元组或大内联元素布局应调高）。
-
-每次失败都会报告超出的是哪个维度（`BudgetExceeded`）。这是 DoS 敏感消费者的入口：
-区块链节点、enclave、网关从策略或 `Budget::from_type::<T>()`（由代数派生紧致默认值）
-选择 `Budget`，并拿到本次解码消耗的证据。`Config::with_depth_limit` 把容器嵌套上限
-压到库级 128 之下，并做了钳制，恶意上限不会导致越界索引。
+升级时将 `alloc_bound` 改为 `alloc_estimate`，将 `work_bound` 改为 `work_read`；
+不能继续把前者用于内存安全保证。Config 新增 `with_value_limit` 和
+`with_decode_work_limit`，这两个限制仅作用于自描述解码与预检，不覆盖 compact、CBOR、
+归档或压缩内部。
 
 ## CBOR、压缩与加密
 
-pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR 递归排序规范 map 键。压缩
+pipeline 显式有序：序列化、可选压缩、再加密。CBOR 排序选项递归排序 map 键，不满足 RFC 8949 第 4.2 节的完整确定性要求。压缩
 只在超过大小阈值时运行，且仅当库内 LZ77 输出严格更小时才存储。加密把完整 frame 头
 （算法、nonce、长度）作为 AEAD 关联数据认证，每次使用全新 192-bit nonce，因此密文
 刻意不确定。
 
 - CBOR 是 crate 自有的流式 RFC 8949 编解码器（`src/cbor_codec.rs`）：值直接在 `T` 与
-  字节之间编码/解码，没有中间值树、没有 JSON 文本往返，解码值的内存峰值就是解码值
-  本身。支持定长/不定长容器、bignum tag 2/3、半精度浮点与原生字节串；字节与集合上限
-  在解码过程中内联强制。确定性 canonical map 排序是唯一的显式例外，需要物化值树来
+  字节之间编码/解码，没有中间值树、没有 JSON 文本往返，但容器容量、临时分配和自定义 trait 仍影响
+  内存峰值。支持定长/不定长容器、bignum tag 2/3、半精度浮点与原生字节串；字节与集合上限
+  在解码过程中内联强制。稳定 map 排序是唯一的显式例外，需要物化值树来
   排序键（opt-in）。
 - 压缩使用 magic `RBZ1`、记录 raw 与 stored 长度的 24 字节头；解码器拒绝未知 flags、
   不一致长度、解压长度不匹配、截断与越限。即使未配置上限，解压始终有界。
@@ -552,6 +471,10 @@ pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR �
 一次性结构校验器（`CheckBytes`）与两阶段写入器；任何零拷贝访问前，每个偏移、长度、
 区间都被边界检查。`bool` 字段被 derive 拒绝（并非每个字节模式都是合法 `bool`）；
 支持的字段面在派生 crate 中说明。
+
+归档视图只能原地借用，不实现 `Copy` 或 `Clone`。手写 `CheckBytes` 是需要
+`unsafe impl` 的安全契约。归档校验限制、小端要求、序列化 API 变更和旧数据迁移
+见[安全与迁移说明](docs/security-contract.md#migration)。
 
 两种访问模式：
 
@@ -642,37 +565,25 @@ pipeline 显式有序：序列化、可选压缩、再加密。确定性 CBOR �
 
 ### 机器证明（Kani）
 
-`src/canonical.rs` 是规范小端 varint 与 ZigZag 的单一实现，编解码器共用。
-`src/kani_proofs.rs` 中的 Kani harness 在完整 `u128`/`i128` 域上符号化证明：
+`src/kani_proofs.rs` 包含 varint/ZigZag 算术、小规模 Merkle 聚合和预算换算的 harness。
+存在 harness 源码不等于已经成功执行证明；它们不覆盖哈希抗碰撞性、实际堆分配、
+任意 schema 或完整解码器。应在支持 Kani 的环境中另行运行并保留结果。
 
-- 往返：对所有 `u128` 有 `decode(encode(v)) == v`；ZigZag 双向往返。
-- 有界：编码形式至多 17 字节且使用规范（最小）宽度。
-- 规范唯一：往返加上 `decode` 的确定性蕴含任意两个不同值不会共享同一编码。
+### 测试证据
 
-```text
-cargo kani -p rustbinary --harness canonical::varint_roundtrip
-cargo kani -p rustbinary --harness canonical::zigzag_roundtrip
-cargo kani -p rustbinary --harness canonical::zigzag_injective
-cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
-```
-
-归档的 BLAKE3 用库内实现（`crate::hash`），并按官方 BLAKE3 测试向量逐字节校验，覆盖
-单块、块组边界与多块组长度。测试向量只校验正确性；实现级的每次改动由同一测试套件把关。
-
-### 属性测试（proptest）
-
-`tests/entropy_roundtrip.rs` 与 `tests/canonical_proptest.rs` 对公开 API 做随机化：
-字节与均匀符号表往返、逐字节损坏性质（报错，或**不同的**负载——绝不可能是原始负载）、
-截断拒绝、非规范形式拒绝、整数往返。
+单元测试与属性测试覆盖往返、恶意输入、解析预算边界、投影成员资格和查询匹配，
+不构成“没有 bug”的证明。[安全契约](docs/security-contract.md#test-evidence)记录密码
+向量的来源和范围。格式 golden fixture、独立已知答案、模糊测试与形式化 harness
+验证的对象不同，不能互相替代。
 
 ### 模糊测试（cargo-fuzz）
 
-`fuzz/` crate（独立，非 workspace 成员）向紧凑与 legacy 解码器喂任意字节（不得 panic、
-每个错误都可分类），并对结构化随机记录做往返。
+五个目标覆盖自描述、compact、CBOR 解码、结构化往返以及熵编码和投影帧。
+Windows、Linux CI 执行 ASan 冒烟测试。[运行说明](fuzz/README.md)包含 Windows
+原生环境配置、限额、日志和失败输入的复现方法。
 
-```text
-cargo +nightly fuzz run decode_arbitrary_bytes
-cargo +nightly fuzz run decode_structured_roundtrip
+```powershell
+./scripts/fuzz.ps1 -Seconds 120
 ```
 
 ### 基准测试

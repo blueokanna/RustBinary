@@ -14,7 +14,7 @@ rustbinary = { path = "..", features = [
     "entropy",
     "schema-evolution",
 ] }
-nextjson = { version = "0.1.4", features = ["derive"] }
+nextjson = { version = "0.1.5", features = ["derive"] }
 
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

@@ -1,35 +1,7 @@
-//! Exact structural probe for one self-describing value, without materializing it.
-//!
-//! # The idea
-//!
-//! A normal decode materializes the value; a skip discards it. This module
-//! occupies the space in between: it walks the wire format (tags, marker
-//! varints, container framing) and reports the **exact** byte length, container
-//! count, element count, and maximum nesting depth of the *next value* — with
-//! zero allocation and without ever building a value.
-//!
-//! That makes it a schema-agnostic **preflight probe**: a gateway can decide
-//! "should I decode this frame?" from its exact shape before spending any
-//! memory on it, route by shape, or hand off a frame whose exact length it
-//! already knows.
-//!
-//! # Consistency contract
-//!
-//! The probe is deliberately a **byte-exact mirror** of the decoder:
-//!
-//! - It reads with the same `take` semantics (checked arithmetic, the same
-//!   byte limit, the same `UnexpectedEnd` boundary).
-//! - Lengths follow the same `IntEncoding` (marker varint under `Variable`,
-//!   fixed `u64` under `Fixed`).
-//! - It rejects everything the decoder rejects: invalid tags, non-canonical
-//!   varints, container terminators in value position, byte/collection/depth
-//!   limit violations, and (per `TrailingBytes`) trailing data.
-//! - A value accepted by `probe` decodes with the same byte count; a value
-//!   rejected by `probe` is rejected by `deserialize` for the same reason.
-//!
-//! The drift-guard tests pin this by asserting, over a broad value sweep,
-//! that `probe`'s byte count equals the encoder's output length and that
-//! acceptance matches `deserialize`.
+//! Allocation-free structural inspection using the self-describing decoder's parser.
+//! Reports consumed bytes, containers, elements and maximum depth, with the same
+//! wire validation and limits as decoding. Target-type compatibility and work
+//! spent on speculative deserialization still require a full decode.
 //!
 //! # Example
 //!
@@ -44,13 +16,8 @@
 //! # Ok::<(), rustbinary::Error>(())
 //! ```
 
-use crate::canonical::decode_varint_le;
-use crate::config::{Config, IntEncoding, TrailingBytes};
-use crate::error::{Error, Result};
-use crate::tags::{
-    MARKER_U128, MARKER_U16, MARKER_U32, MARKER_U64, TAG_ARRAY, TAG_END, TAG_F32, TAG_F64,
-    TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TRUE, TAG_U128, TAG_U64,
-};
+use crate::config::Config;
+use crate::error::Result;
 
 /// Exact structural footprint of one self-describing value.
 ///
@@ -62,9 +29,33 @@ pub struct Probe {
     containers: u64,
     elements: u64,
     depth: usize,
+    values: u64,
+    max_collection_len: u64,
 }
 
 impl Probe {
+    pub(crate) const fn new(
+        bytes: usize,
+        containers: u64,
+        elements: u64,
+        depth: usize,
+        values: u64,
+        max_collection_len: u64,
+    ) -> Self {
+        Self {
+            bytes,
+            containers,
+            elements,
+            depth,
+            values,
+            max_collection_len,
+        }
+    }
+    /// Tokens including keys and container starts; terminators are excluded.
+    pub const fn values(self) -> u64 {
+        self.values
+    }
+
     /// Exact number of bytes the value occupies in the input.
     pub const fn bytes(self) -> usize {
         self.bytes
@@ -82,6 +73,11 @@ impl Probe {
         self.elements
     }
 
+    /// Largest entry count of any single array or object.
+    pub const fn max_collection_len(self) -> u64 {
+        self.max_collection_len
+    }
+
     /// Maximum container nesting depth (0 for a scalar value).
     pub const fn depth(self) -> usize {
         self.depth
@@ -97,17 +93,18 @@ impl Probe {
         self.depth <= max_depth
     }
 
-    /// Whether the value fits a [`crate::bounded::Budget`]'s input, work, and
-    /// depth limits.
+    /// Checks input, minimum read work, depth, visits and per-collection limits.
     ///
     /// The probe knows the exact byte count and shape; the budget supplies the
-    /// policy. Allocation cannot be decided here (it needs the type's
-    /// [`crate::DecodeBounded`] algebra), but input/work/depth are exact.
+    /// policy. Allocation and custom trait work cannot be decided here. This checks
+    /// necessary parser conditions, not whether typed decoding will succeed.
     #[cfg(feature = "bounded")]
     pub const fn fits_budget(self, budget: crate::bounded::Budget) -> bool {
         (self.bytes as u64) <= budget.max_input()
             && (self.bytes as u64) <= budget.max_work()
             && self.depth <= budget.max_depth()
+            && self.values <= budget.max_values()
+            && self.max_collection_len <= budget.max_collection()
     }
 }
 
@@ -116,187 +113,7 @@ impl Probe {
 /// Allocation-free and side-effect free: the walker holds only the input
 /// borrow, a cursor, and counters.
 pub fn probe(config: Config, input: &[u8]) -> Result<Probe> {
-    let mut walker = Walker {
-        input,
-        cursor: 0,
-        config,
-        containers: 0,
-        elements: 0,
-        depth: 0,
-        max_depth: 0,
-    };
-    walker.value()?;
-    if config.trailing == TrailingBytes::Reject && walker.cursor != input.len() {
-        return Err(Error::TrailingBytes {
-            remaining: input.len() - walker.cursor,
-        });
-    }
-    Ok(Probe {
-        bytes: walker.cursor,
-        containers: walker.containers,
-        elements: walker.elements,
-        depth: walker.max_depth,
-    })
-}
-
-struct Walker<'a> {
-    input: &'a [u8],
-    cursor: usize,
-    config: Config,
-    containers: u64,
-    elements: u64,
-    depth: usize,
-    max_depth: usize,
-}
-
-impl<'a> Walker<'a> {
-    /// Advances `len` bytes with the decoder's exact boundary semantics:
-    /// checked arithmetic, the byte limit, and the input boundary.
-    fn take(&mut self, len: usize) -> Result<()> {
-        let end = self.cursor.checked_add(len).ok_or(Error::UnexpectedEnd)?;
-        if let Some(limit) = self.config.limit {
-            if end as u64 > limit {
-                return Err(Error::SizeLimit { limit });
-            }
-        }
-        if end > self.input.len() {
-            return Err(Error::UnexpectedEnd);
-        }
-        self.cursor = end;
-        Ok(())
-    }
-
-    fn byte(&mut self) -> Result<u8> {
-        self.take(1)?;
-        Ok(self.input[self.cursor - 1])
-    }
-
-    fn peek(&self) -> Result<u8> {
-        self.input
-            .get(self.cursor)
-            .copied()
-            .ok_or(Error::UnexpectedEnd)
-    }
-
-    /// Reads one marker varint (canonical little-endian), validating the
-    /// marker and canonical width exactly like the decoder's LE path.
-    fn varint(&mut self) -> Result<u128> {
-        let marker = self.byte()?;
-        if marker <= 250 {
-            return Ok(marker as u128);
-        }
-        let payload_len = match marker {
-            MARKER_U16 => 2,
-            MARKER_U32 => 4,
-            MARKER_U64 => 8,
-            MARKER_U128 => 16,
-            other => return Err(Error::InvalidVarintMarker(other)),
-        };
-        let end = self
-            .cursor
-            .checked_add(payload_len)
-            .ok_or(Error::UnexpectedEnd)?;
-        if let Some(limit) = self.config.limit {
-            if end as u64 > limit {
-                return Err(Error::SizeLimit { limit });
-            }
-        }
-        let bytes = self
-            .input
-            .get(self.cursor..end)
-            .ok_or(Error::UnexpectedEnd)?;
-        self.cursor = end;
-        match decode_varint_le(marker, bytes) {
-            Some(value) => Ok(value),
-            None => Err(Error::NonCanonicalVarint),
-        }
-    }
-
-    /// Reads a numeric payload following `IntEncoding`, mirroring
-    /// `Decoder::unsigned`. Endianness does not affect the byte width, so the
-    /// probe only needs the width, never the value.
-    fn number(&mut self, fixed_bytes: usize) -> Result<()> {
-        if self.config.integers == IntEncoding::Variable && fixed_bytes > 1 {
-            self.varint().map(|_| ())
-        } else {
-            self.take(fixed_bytes)
-        }
-    }
-
-    /// Reads a length prefix following `IntEncoding`, mirroring
-    /// `Decoder::length` (strings are bounded by the byte limit; the
-    /// collection limit applies to element counts, not string bytes).
-    fn length(&mut self) -> Result<u64> {
-        if self.config.integers == IntEncoding::Variable {
-            u64::try_from(self.varint()?).map_err(|_| Error::IntegerOverflow { target: "u64" })
-        } else {
-            self.take(8)?;
-            Ok(0)
-        }
-    }
-
-    /// Walks one complete value.
-    fn value(&mut self) -> Result<()> {
-        let tag = self.byte()?;
-        match tag {
-            TAG_NULL | TAG_FALSE | TAG_TRUE => Ok(()),
-            TAG_U64 | TAG_I64 => self.number(8),
-            TAG_U128 | TAG_I128 => self.number(16),
-            TAG_F64 => self.take(8),
-            TAG_F32 => self.take(4),
-            TAG_STRING => {
-                let len = usize::try_from(self.length()?)
-                    .map_err(|_| Error::IntegerOverflow { target: "usize" })?;
-                self.take(len)
-            }
-            TAG_ARRAY => self.container(false),
-            TAG_OBJECT => self.container(true),
-            TAG_END => Err(Error::Custom(
-                "unexpected end-of-container terminator".into(),
-            )),
-            _ => Err(Error::Custom("invalid value tag".into())),
-        }
-    }
-
-    /// Walks one container (array or object) and its entries.
-    fn container(&mut self, is_object: bool) -> Result<()> {
-        self.containers += 1;
-        if self.depth >= self.config.depth_limit {
-            return Err(Error::Custom("decoder nesting depth limit exceeded".into()));
-        }
-        self.depth += 1;
-        if self.depth > self.max_depth {
-            self.max_depth = self.depth;
-        }
-        let mut count = 0u64;
-        loop {
-            let tag = self.peek()?;
-            if tag == TAG_END {
-                // Consume the terminator exactly like `exit_container`.
-                self.take(1)?;
-                break;
-            }
-            count += 1;
-            if let Some(limit) = self.config.collection_limit {
-                if count > limit {
-                    return Err(Error::CollectionLimit { limit });
-                }
-            }
-            if is_object {
-                let key_tag = self.byte()?;
-                if key_tag != TAG_STRING {
-                    return Err(Error::Custom("invalid object key".into()));
-                }
-                let key_len = usize::try_from(self.length()?)
-                    .map_err(|_| Error::IntegerOverflow { target: "usize" })?;
-                self.take(key_len)?;
-            }
-            self.value()?;
-        }
-        self.elements += count;
-        self.depth -= 1;
-        Ok(())
-    }
+    crate::decoder::probe(input, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +123,8 @@ impl<'a> Walker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tags::{MARKER_U16, TAG_END, TAG_STRING, TAG_U64};
+    use crate::Error;
     use alloc::borrow::ToOwned;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -421,7 +240,6 @@ mod tests {
         ));
         // Terminator in value position.
         assert!(matches!(probe(config, &[TAG_END]), Err(Error::Custom(_))));
-        // Truncated string.
         assert!(matches!(
             probe(config, &[TAG_STRING, 5, b'a']),
             Err(Error::UnexpectedEnd)

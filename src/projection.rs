@@ -1,63 +1,22 @@
-//! Projectable self-authenticating binary records.
+//! Merkle membership proofs for projectable binary records.
 //!
-//! # Problem model
+//! `verify` binds the proof's disclosed fields to a trusted external anchor.
+//! `verify_query` also requires exactly the caller's field IDs; missing fields
+//! are rejected, not proven absent. `verify_untrusted` checks consistency only.
 //!
-//! A *self-authenticating record* `P` is a canonical byte string that encodes
-//! a set of named fields, each a `(field_id, payload)` pair. A *projection
-//! query* `q` selects a subset of fields. A *projection proof* `π` lets a
-//! verifier learn the values of **exactly** the fields in `q`, tied to a
-//! trusted root, without scanning or decoding the rest of the record.
+//! Security assumes BLAKE3 collision resistance, a trusted anchor, and a
+//! canonical source record. Hashes are not mathematical injective functions.
+//! Omitted payloads and their current storage contents are not inspected by a
+//! partial verifier. Payload semantics remain the application's responsibility.
 //!
-//! The guarantee this module provides is **projection soundness**:
+//! Field framing is `field_id: u32 LE`, `length: u32 LE`, then opaque bytes,
+//! with strictly increasing IDs. Domain-separated leaf and parent hashes bind
+//! the fields; a domain-separated outer hash binds the schema version.
 //!
-//! ```text
-//! Verify(P, π, q) = v   ⟹   v = Project_q(Decode(P))
-//! ```
-//!
-//! where `Decode(P)` is the unique canonical decoding of `P` (uniqueness
-//! follows from the format's canonicality: strictly increasing `field_id`s,
-//! fixed-width headers, no duplicate fields), and `Project_q` extracts the
-//! fields selected by `q`. Fields outside `q` are never read, yet their
-//! authenticity is still guaranteed: each is bound into the Merkle root by its
-//! leaf hash, so a tampered or substituted unread field changes the root and
-//! fails verification.
-//!
-//! # Construction
-//!
-//! - **Canonical field framing**: `field_id` (u32 LE) + `payload_len` (u32 LE)
-//!   + `payload`. Records require strictly increasing `field_id`s, so every
-//!   record has exactly one valid encoding and `Decode` is a function.
-//! - **Leaf hashes**: `H(LEAF_DOMAIN ‖ field_id‖ payload_len ‖ payload)`.
-//! - **Schema binding**: the record root is `H(SCHEMA_DOMAIN ‖ schema_version
-//!   ‖ merkle_root)`, so a proof cannot be replayed against a different schema
-//!   version.
-//! - **Merkle tree**: complete binary tree over the leaf hashes (padded to a
-//!   power of two with zero hashes). `prove` extracts a *batch* proof: for the
-//!   queried leaves, the minimal set of sibling hashes that reconstructs the
-//!   root.
-//!
-//! # The verification contract
-//!
-//! `verify` never touches the record. It recomputes the root from the proof's
-//! queried leaves and siblings, and requires the result to equal the caller's
-//! **trusted anchor** (the record root as committed by an authenticated
-//! source, e.g. a block header). The anchor is the trust base: this module
-//! provides integrity binding, not keyed authentication. `verify_untrusted`
-//! only checks internal consistency and detects corruption, not
-//! authenticity — never use it where authenticity is required.
-//!
-//! # Honest complexity
-//!
-//! - `prove`: O(n) time (the record is read once), O(n) memory for the tree.
-//! - Proof size: O(|q| · log(n/|q|)) sibling hashes worst case; O(log n) for a
-//!   single field or a contiguous field range.
-//! - `verify`: O(|q|) payload bytes read plus O(|q| · log(n/|q|)) hashes;
-//!   O(|q| + log n) hash operations with the batch aggregation.
-//!
-//! The Merkle construction means the format targets records with moderate
-//! field counts (tens of thousands at most); for payload-heavy records the
-//! per-field hash cost is negligible, for tiny records the fixed 32-byte root
-//! dominates.
+//! For n fields and k disclosed fields, proofs contain O(k log(n/k) + k)
+//! sibling hashes. Verification also reads the disclosed payload and uses
+//! BTreeMap bookkeeping. Proof construction scans the record and builds an
+//! O(n)-space tree; these are not constant-memory or sublinear construction APIs.
 
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
@@ -67,8 +26,6 @@ use core::fmt;
 use crate::canonical::{decode_varint_le, encode_varint_le, zigzag_decode, zigzag_encode};
 use crate::hash;
 
-/// The in-tree BLAKE3 implementation is the only hash primitive used by this
-/// module (byte-for-byte compatible with the official crate).
 fn blake3(input: &[u8]) -> [u8; 32] {
     hash::blake3(input)
 }
@@ -80,22 +37,13 @@ fn blake3(input: &[u8]) -> [u8; 32] {
 /// only enforces record-local canonical ordering.
 pub type FieldId = u32;
 
-/// Four-byte magic: `RBPJ` (RustBinary Projection).
 const MAGIC: [u8; 4] = *b"RBPJ";
-/// Current wire format version.
 const FORMAT_VERSION: u16 = 1;
-/// Format flag: the record carries a Merkle-authenticated root.
 const FLAG_MERKLE: u16 = 0x0001;
-/// Fixed header size: magic(4) + version(2) + flags(2) + field_count(4) +
-/// schema_version(4).
 const HEADER_LEN: usize = 16;
-/// Size of the trailing authenticated root.
 const AUTH_LEN: usize = 32;
-/// Domain tag for leaf hashes over a `(field_id, payload_len, payload)` triple.
 const LEAF_DOMAIN: u8 = 0x00;
-/// Domain tag for the schema-binding root.
 const SCHEMA_DOMAIN: u8 = 0x01;
-/// Domain tag for Merkle internal node hashes.
 const NODE_DOMAIN: u8 = 0x02;
 
 /// Default maximum number of fields in one record.
@@ -140,7 +88,7 @@ pub enum ProjectionError {
     },
     /// The query is empty or selects no field present in the record.
     InvalidQuery,
-    /// The proof is missing a sibling hash needed to reconstruct the root.
+    /// The proof has missing, duplicate or unused sibling hashes.
     IncompleteProof,
     /// The recomputed root does not match the claimed root or the anchor.
     ///
@@ -167,7 +115,7 @@ impl fmt::Display for ProjectionError {
             Self::PayloadLimit { limit } => write!(f, "field payload exceeds limit {limit}"),
             Self::RecordLimit { limit } => write!(f, "record length exceeds limit {limit}"),
             Self::InvalidQuery => write!(f, "projection query cannot produce a proof"),
-            Self::IncompleteProof => write!(f, "projection proof is missing sibling hashes"),
+            Self::IncompleteProof => write!(f, "projection proof has an invalid sibling set"),
             Self::RootMismatch => write!(
                 f,
                 "projection root mismatch (tampered record, substituted proof, or wrong anchor)"
@@ -610,7 +558,7 @@ impl<'a> Record<'a> {
             merkle_leaves(self.fields.iter().map(|f| (f.field_id, f.payload)));
         let tree = build_tree(&leaves);
         let mut selected = BTreeSet::new();
-        let mut proof_leaves = Vec::with_capacity(query.len());
+        let mut proof_leaves = Vec::with_capacity(query.len().min(self.fields.len()));
         for (index, field) in self.fields.iter().enumerate() {
             if query.contains(field.field_id) {
                 selected.insert(index as u32);
@@ -625,7 +573,7 @@ impl<'a> Record<'a> {
             return Err(ProjectionError::InvalidQuery);
         }
         let siblings = aggregate_siblings(&tree, leaf_count, &selected);
-        let merkle = merkle_root(&leaves);
+        let merkle = tree[1];
         let root = schema_root(self.schema_version, &merkle);
         Ok(ProjectionProof {
             schema_version: self.schema_version,
@@ -653,13 +601,10 @@ pub fn prove(
 
 /// Verifies a proof against a trusted anchor and returns the queried fields.
 ///
-/// # Soundness
-///
-/// If this returns `Ok(v)`, then `v` equals the projection of the unique
-/// canonical record whose root is `anchor`, restricted to `query`. The record
-/// itself is never read. `expected_schema_version` must match the schema
-/// version bound into the anchor; a mismatch is rejected before any payload
-/// is returned.
+/// Under collision resistance and a canonical trusted source record, success
+/// binds the disclosed field bytes to the anchor and expected schema version.
+/// This API does not receive the caller's query; use [`verify_query`] to reject
+/// omissions and extra fields. It does not validate omitted payloads.
 ///
 /// # Trust
 ///
@@ -687,12 +632,33 @@ pub fn verify<'a>(
         .collect())
 }
 
+/// Verifies membership against a trusted anchor and requires exactly the
+/// caller's requested field IDs. A missing field is rejected: this format
+/// carries membership proofs, not authenticated absence proofs.
+pub fn verify_query<'a>(
+    proof: &'a ProjectionProof,
+    anchor: &[u8; 32],
+    expected_schema_version: u32,
+    query: &Projection,
+) -> Result<Vec<VerifiedField<'a>>, ProjectionError> {
+    if query.is_empty()
+        || !proof
+            .leaves
+            .iter()
+            .map(|leaf| leaf.field_id)
+            .eq(query.fields().iter().copied())
+    {
+        return Err(ProjectionError::InvalidQuery);
+    }
+    verify(proof, anchor, expected_schema_version)
+}
+
 /// Verifies a proof for internal consistency only.
 ///
 /// Checks that the proof's leaves and siblings reconstruct a root equal to the
-/// claimed root. This detects corruption and inconsistent proofs but **not**
+/// claimed root. This rejects inconsistent proofs but does not guarantee detection of
 /// substitution by an attacker (an attacker can forge a self-consistent
-/// proof). Only use where corruption detection, not authenticity, is required.
+/// proof). Use only for structural consistency checks.
 pub fn verify_untrusted(
     proof: &ProjectionProof,
 ) -> Result<Vec<VerifiedField<'_>>, ProjectionError> {
@@ -710,18 +676,9 @@ pub fn verify_untrusted(
         .collect())
 }
 
-/// Reconstructs the root from a proof's leaves and siblings.
-///
-/// Also enforces the proof's internal canonicality (sorted positions, sorted
-/// field ids, positions within the field count) so that a malformed proof is
-/// rejected before any hash is combined.
 fn recompute_proof_root(proof: &ProjectionProof) -> Result<[u8; 32], ProjectionError> {
     let field_count = proof.field_count as u64;
     let leaf_count = leaf_count(field_count);
-    // The heap-layout tree size (`2 * leaf_count`) must fit `usize` so the
-    // index arithmetic below cannot overflow. Proofs always come from real
-    // records (bounded by `ProjectionLimits`), so this only guards malformed
-    // proof values.
     let leaf_count = usize::try_from(leaf_count).map_err(|_| ProjectionError::TreeGeometry)?;
     let tree_size = leaf_count
         .checked_mul(2)
@@ -731,6 +688,9 @@ fn recompute_proof_root(proof: &ProjectionProof) -> Result<[u8; 32], ProjectionE
     let mut prev_index: Option<u32> = None;
     let mut prev_id: Option<FieldId> = None;
     for leaf in &proof.leaves {
+        if leaf.payload.len() > u32::MAX as usize {
+            return Err(ProjectionError::InvalidPayload);
+        }
         if (leaf.index as u64) >= field_count {
             return Err(ProjectionError::TreeGeometry);
         }
@@ -747,10 +707,16 @@ fn recompute_proof_root(proof: &ProjectionProof) -> Result<[u8; 32], ProjectionE
         prev_index = Some(leaf.index);
         prev_id = Some(leaf.field_id);
     }
+    if proof
+        .siblings
+        .iter()
+        .any(|sibling| sibling.index <= 1 || sibling.index >= tree_size)
+    {
+        return Err(ProjectionError::TreeGeometry);
+    }
     let siblings: BTreeMap<usize, [u8; 32]> =
         proof.siblings.iter().map(|s| (s.index, s.hash)).collect();
     if siblings.len() != proof.siblings.len() {
-        // Duplicate sibling indices: the proof is malformed.
         return Err(ProjectionError::IncompleteProof);
     }
     let mut frontier: BTreeMap<usize, [u8; 32]> = BTreeMap::new();
@@ -763,26 +729,16 @@ fn recompute_proof_root(proof: &ProjectionProof) -> Result<[u8; 32], ProjectionE
         }
         let hash = leaf_hash(leaf.field_id, &leaf.payload);
         if frontier.insert(node, hash).is_some() {
-            // Two leaves claim the same position: malformed proof.
             return Err(ProjectionError::TreeGeometry);
         }
     }
     if frontier.is_empty() {
-        // A proof without leaves cannot reconstruct any root.
         return Err(ProjectionError::IncompleteProof);
     }
     let merkle = combine_frontier(&frontier, &siblings, node_hash)?;
     Ok(schema_root(proof.schema_version, &merkle))
 }
 
-/// Reconstructs the Merkle root from a set of leaf hashes and the sibling
-/// hashes that cover the remaining leaves.
-///
-/// This is the algebraic core of proof verification, isolated from I/O so the
-/// Kani harnesses can prove the tree geometry sound for any hash function and
-/// any hash values: given the leaves of a subset `S` of a complete binary tree
-/// in heap layout and the minimal sibling set covering `T \ S`, it reproduces
-/// the root `tree[1]` if and only if every sibling was provided.
 pub(crate) fn combine_frontier<H>(
     frontier: &BTreeMap<usize, [u8; 32]>,
     siblings: &BTreeMap<usize, [u8; 32]>,
@@ -791,49 +747,39 @@ pub(crate) fn combine_frontier<H>(
 where
     H: Fn(&[u8; 32], &[u8; 32]) -> [u8; 32],
 {
-    if frontier.is_empty() {
-        // An empty frontier can never converge to the root; reject instead of
-        // looping forever.
+    if frontier.is_empty() || frontier.contains_key(&0) {
         return Err(ProjectionError::IncompleteProof);
     }
     let mut frontier = frontier.clone();
+    let mut siblings = siblings.clone();
     while !(frontier.len() == 1 && frontier.contains_key(&1)) {
-        let keys: Vec<usize> = frontier.keys().copied().collect();
-        let mut next: BTreeMap<usize, [u8; 32]> = BTreeMap::new();
-        let mut k = 0;
-        while k < keys.len() {
-            let i = keys[k];
-            let j = i ^ 1;
-            if let Some(&hj) = frontier.get(&j) {
-                // Both children present; `i` is the left (even) child.
-                let left = frontier[&i];
-                let parent = node_hash(&left, &hj);
-                next.insert(i / 2, parent);
-                k += 1; // skip the sibling; it is handled by this pair.
-            } else {
-                let sh = siblings
-                    .get(&j)
-                    .copied()
-                    .ok_or(ProjectionError::IncompleteProof)?;
-                let parent = if i % 2 == 0 {
-                    node_hash(&frontier[&i], &sh)
-                } else {
-                    node_hash(&sh, &frontier[&i])
-                };
-                next.insert(i / 2, parent);
+        let mut next = BTreeMap::new();
+        while let Some((index, value)) = frontier.pop_first() {
+            if index <= 1 {
+                return Err(ProjectionError::TreeGeometry);
             }
-            k += 1;
+            let sibling_index = index ^ 1;
+            let sibling = frontier
+                .remove(&sibling_index)
+                .or_else(|| siblings.remove(&sibling_index))
+                .ok_or(ProjectionError::IncompleteProof)?;
+            let parent = if index % 2 == 0 {
+                node_hash(&value, &sibling)
+            } else {
+                node_hash(&sibling, &value)
+            };
+            if next.insert(index / 2, parent).is_some() {
+                return Err(ProjectionError::TreeGeometry);
+            }
         }
         frontier = next;
     }
-    let merkle = *frontier
-        .values()
-        .next()
-        .ok_or(ProjectionError::IncompleteProof)?;
-    Ok(merkle)
+    if !siblings.is_empty() {
+        return Err(ProjectionError::IncompleteProof);
+    }
+    frontier.remove(&1).ok_or(ProjectionError::IncompleteProof)
 }
 
-/// Decodes a canonical marker-varint payload, requiring full consumption.
 pub(crate) fn decode_canonical_varint(bytes: &[u8]) -> Result<u128, ProjectionError> {
     let (&marker, rest) = bytes.split_first().ok_or(ProjectionError::InvalidPayload)?;
     let expected_len = varint_len(marker).ok_or(ProjectionError::InvalidPayload)?;
@@ -843,7 +789,6 @@ pub(crate) fn decode_canonical_varint(bytes: &[u8]) -> Result<u128, ProjectionEr
     decode_varint_le(marker, rest).ok_or(ProjectionError::InvalidPayload)
 }
 
-/// Encoded byte length of a canonical varint marker (marker byte included).
 const fn varint_len(marker: u8) -> Option<usize> {
     match marker {
         0..=250 => Some(1),
@@ -865,27 +810,18 @@ pub(crate) const fn leaf_count(field_count: u64) -> u64 {
     }
 }
 
-/// Computes the leaf hashes of a field list in canonical order.
 fn merkle_leaves<'a, I>(fields: I) -> Vec<[u8; 32]>
 where
     I: IntoIterator<Item = (FieldId, &'a [u8])>,
 {
-    let collected: Vec<(FieldId, &'a [u8])> = fields.into_iter().collect();
-    let leaf_count = leaf_count(collected.len() as u64) as usize;
-    let mut leaves = Vec::with_capacity(leaf_count);
-    leaves.extend(
-        collected
-            .into_iter()
-            .map(|(id, payload)| leaf_hash(id, payload)),
-    );
-    leaves.resize(leaf_count, [0u8; 32]);
+    let mut leaves: Vec<_> = fields
+        .into_iter()
+        .map(|(id, payload)| leaf_hash(id, payload))
+        .collect();
+    leaves.resize(leaf_count(leaves.len() as u64) as usize, [0u8; 32]);
     leaves
 }
 
-/// Builds the complete Merkle tree (1-based heap layout) from the leaves.
-///
-/// `tree[0]` is unused; leaves occupy `tree[L..2L]`, internal nodes
-/// `tree[1..L]`, root at `tree[1]`.
 pub(crate) fn build_tree(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     let l = leaves.len();
     let mut tree = alloc::vec![
@@ -899,7 +835,6 @@ pub(crate) fn build_tree(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     tree
 }
 
-/// Computes the Merkle root from a complete leaf set.
 fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     let l = leaves.len();
     debug_assert!(l.is_power_of_two());
@@ -908,17 +843,15 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     }
     let mut level = leaves.to_vec();
     while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks_exact(2) {
-            next.push(node_hash(&pair[0], &pair[1]));
+        let parents = level.len() / 2;
+        for index in 0..parents {
+            level[index] = node_hash(&level[2 * index], &level[2 * index + 1]);
         }
-        level = next;
+        level.truncate(parents);
     }
     level[0]
 }
 
-/// Collects the minimal sibling set that reconstructs the root from the
-/// queried leaves, using the standard batch aggregation over a heap layout.
 pub(crate) fn aggregate_siblings(
     tree: &[[u8; 32]],
     leaf_count: usize,
@@ -946,22 +879,15 @@ pub(crate) fn aggregate_siblings(
     siblings
 }
 
-/// Leaf hash over a `(field_id, payload_len, payload)` triple.
-///
-/// The payload length field is bounded to `u32::MAX` defensively; the full
-/// payload bytes are always hashed, so a length that cannot fit `u32` cannot
-/// produce a hash collision (both sides compute the identical hash).
 fn leaf_hash(field_id: FieldId, payload: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(9 + payload.len());
-    input.push(LEAF_DOMAIN);
-    input.extend_from_slice(&field_id.to_le_bytes());
-    let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-    input.extend_from_slice(&len.to_le_bytes());
-    input.extend_from_slice(payload);
-    blake3(&input)
+    let mut hasher = hash::Hasher::new();
+    hasher.update(&[LEAF_DOMAIN]);
+    hasher.update(&field_id.to_le_bytes());
+    hasher.update(&(payload.len() as u32).to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize()
 }
 
-/// Merkle internal node hash.
 fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut input = [0u8; 65];
     input[0] = NODE_DOMAIN;
@@ -979,14 +905,12 @@ pub fn schema_root(schema_version: u32, merkle: &[u8; 32]) -> [u8; 32] {
     blake3(&input)
 }
 
-/// Internal parse result with an owned view into the input.
 struct ParsedRecord<'a> {
     schema_version: u32,
     fields: Vec<ParsedField<'a>>,
     root: [u8; 32],
 }
 
-/// Bounds-checked record parser. Never panics on hostile input.
 fn parse_record<'a>(
     input: &'a [u8],
     limits: &ProjectionLimits,
@@ -1017,6 +941,9 @@ fn parse_record<'a>(
         return Err(ProjectionError::FieldLimit {
             limit: limits.max_fields,
         });
+    }
+    if field_count as u64 > ((input.len() - HEADER_LEN - AUTH_LEN) / 8) as u64 {
+        return Err(ProjectionError::UnexpectedEnd);
     }
     let mut cursor = HEADER_LEN;
     let mut fields: Vec<ParsedField<'a>> = Vec::new();
@@ -1067,9 +994,6 @@ fn parse_record<'a>(
     })
 }
 
-/// Reads a little-endian `u32`, advancing `cursor`.
-///
-/// Uses checked arithmetic so a malformed length cannot wrap `cursor`.
 fn read_u32(input: &[u8], cursor: &mut usize) -> Result<u32, ProjectionError> {
     let end = cursor
         .checked_add(4)
@@ -1413,11 +1337,8 @@ mod tests {
     #[test]
     fn proof_rejects_malformed_structure() {
         let (record, anchor, version) = build_fixture();
-        // Fields 1 (index 0) and 5 (index 4) are non-adjacent, so the proof
-        // genuinely needs sibling hashes.
         let proof = prove(&record, &query(&[1, 5]), &ProjectionLimits::new()).unwrap();
         assert!(proof.sibling_count() > 0);
-        // A proof with an out-of-order field id fails canonicality.
         let mut bad = proof.clone();
         bad.leaves.reverse();
         assert!(matches!(
@@ -1455,12 +1376,9 @@ mod tests {
             verify_untrusted(&corrupt),
             Err(ProjectionError::RootMismatch)
         ));
-        // A fully forged, self-consistent proof (root recomputed over forged
-        // leaves) passes untrusted verification ...
         let mut forged = corrupt;
         forged.claimed_root = recompute_proof_root(&forged).unwrap();
         assert!(verify_untrusted(&forged).is_ok());
-        // ... but is rejected against the original record's anchor.
         assert!(matches!(
             verify(&forged, &anchor, version),
             Err(ProjectionError::RootMismatch)
@@ -1531,8 +1449,6 @@ mod tests {
     fn every_header_or_field_byte_tamper_is_detected_by_verify() {
         let (record, anchor, version) = build_fixture();
         let query = query(&[1, 2, 3, 4, 5, 9]);
-        // The trailing 32 bytes are the stored root (metadata, not trust);
-        // tampering them is covered by `stored_root_is_metadata_not_trust`.
         let body_len = record.len() - AUTH_LEN;
         for pos in 0..body_len {
             let mut tampered = record.clone();
@@ -1562,8 +1478,6 @@ mod tests {
             parsed.verify_root(),
             Err(ProjectionError::RootMismatch)
         ));
-        // ... but proofs recompute the root from the fields, so the trusted
-        // anchor (not the stored root) remains the trust base.
         let proof = parsed.prove(&query(&[2])).unwrap();
         assert!(verify(&proof, &anchor, version).is_ok());
     }
@@ -1571,7 +1485,6 @@ mod tests {
     #[test]
     fn verify_root_detects_field_corruption() {
         let (mut record, _, _) = build_fixture();
-        // Field 9's payload starts at offset 69 in the fixture.
         record[69] ^= 0xff;
         let parsed = Record::parse(&record, &ProjectionLimits::new()).unwrap();
         assert!(matches!(
@@ -1644,21 +1557,29 @@ mod tests {
     }
 
     #[test]
-    fn proof_extra_unused_sibling_is_harmless() {
+    fn proof_extra_unused_or_out_of_range_siblings_are_rejected() {
         let (record, anchor, version) = build_fixture();
         let proof = prove(&record, &query(&[1, 5]), &ProjectionLimits::new()).unwrap();
-        // Append a sibling whose index is never consulted by this proof's
-        // frontier path (the proof uses nodes 9, 13, 5, 7).
         let mut padded = proof.clone();
         padded.siblings.push(ProofSibling {
             index: 2,
             hash: [0xab; 32],
         });
-        padded.siblings.push(ProofSibling {
-            index: usize::MAX,
-            hash: [0; 32],
-        });
-        assert!(verify(&padded, &anchor, version).is_ok());
+        assert_eq!(
+            verify(&padded, &anchor, version).unwrap_err(),
+            ProjectionError::IncompleteProof
+        );
+        for index in [0, 1, usize::MAX] {
+            let mut invalid = proof.clone();
+            invalid.siblings.push(ProofSibling {
+                index,
+                hash: [0; 32],
+            });
+            assert_eq!(
+                verify(&invalid, &anchor, version).unwrap_err(),
+                ProjectionError::TreeGeometry
+            );
+        }
     }
 
     #[test]

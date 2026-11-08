@@ -152,13 +152,11 @@ mod projection {
     pub fn small_tree_proof_agrees_with_root() {
         const L: usize = 4;
         let leaves: [[u8; 32]; L] = kani::any();
-        // Build the complete tree with the mock hash (symbolic-friendly).
         let mut tree = alloc::vec![[0u8; 32]; 2 * L];
         tree[L..].copy_from_slice(&leaves);
         for i in (1..L).rev() {
             tree[i] = mock_hash(&tree[2 * i], &tree[2 * i + 1]);
         }
-        // Any non-empty subset of leaves as the query.
         let mask: u8 = kani::any();
         kani::assume(mask != 0);
         kani::assume(mask < (1 << L));
@@ -189,9 +187,9 @@ mod bounded {
     use crate::bounded::{derive_enforced_limits, Budget};
 
     /// The derived enforced limits respect the budget: the byte limit never
-    /// exceeds `max_input` or `max_work`, the collection cap never exceeds
-    /// `max_alloc` per structural unit, and the documented allocation ceiling
-    /// (`byte_limit + per_element_ceiling * collection_limit <= max_input +
+    /// exceeds `max_input` or `max_work`, the global token cap never exceeds
+    /// `max_alloc` per structural unit, and the weighted-token admission inequality
+    /// (`byte_limit + per_element_ceiling * value_limit <= max_input +
     /// max_alloc`) holds for dynamic types with a non-zero structural
     /// ceiling.
     #[kani::proof]
@@ -214,17 +212,33 @@ mod bounded {
         );
         if !statically_bounded && per_element_ceiling > 0 {
             kani::assert(
-                limits.collection_limit <= budget.max_alloc() / per_element_ceiling,
-                "collection cap never exceeds the structural alloc budget",
+                limits.value_limit <= budget.max_alloc() / per_element_ceiling,
+                "global token cap never exceeds the structural alloc budget",
             );
-            let alloc_bound = limits
+            let admission_estimate = limits
                 .byte_limit
-                .saturating_add(limits.collection_limit.saturating_mul(per_element_ceiling));
+                .saturating_add(limits.value_limit.saturating_mul(per_element_ceiling));
             kani::assert(
-                alloc_bound <= budget.max_input().saturating_add(budget.max_alloc()),
-                "documented allocation ceiling holds",
+                admission_estimate <= budget.max_input().saturating_add(budget.max_alloc()),
+                "weighted-token admission inequality holds",
             );
         }
+    }
+
+    #[kani::proof]
+    pub fn dynamic_estimate_includes_reserved_input() {
+        let budget = Budget::new(kani::any(), kani::any(), kani::any(), kani::any());
+        let input: u64 = kani::any();
+        let weight: u64 = kani::any();
+        kani::assume(input <= budget.max_input());
+        kani::assume(input <= budget.max_alloc());
+        let remaining = budget.with_max_alloc(budget.max_alloc() - input);
+        let limits = derive_enforced_limits(remaining, false, weight);
+        let estimate = input.saturating_add(limits.value_limit.saturating_mul(weight));
+        kani::assert(
+            estimate <= budget.max_alloc(),
+            "input and token weights share one budget",
+        );
     }
 
     /// `depth_plus_one` increments finite depths and preserves `usize::MAX`.

@@ -11,7 +11,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustbinary::{CompactBinary, ErrorCategory};
+use rustbinary::CompactBinary;
 
 // A representative schema with every primitive family the compact profile
 // supports: scalars, byte strings, float arrays, options, and nesting.
@@ -45,5 +45,7 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     let _ = config.deserialize::<FuzzEvent>(data);
-    let _ = ErrorCategory::UserInput;
+    let _ = config.deserialize::<Vec<f32>>(data);
+    let _ = config.deserialize::<Vec<i8>>(data);
+    let _ = config.deserialize::<[String; 4]>(data);
 });

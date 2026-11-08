@@ -233,6 +233,8 @@ fn pipeline_parallel_vector_is_stable() {
 fn pipeline_encryption_decoder_vector_is_stable() {
     let key = rustbinary::EncryptionKey::new([0x42; 32]);
     let config = rustbinary::options().with_encryption(key);
+    // Historical fixed-frame fixture; original producer was not recorded.
+    // Checks this sample's decoding compatibility, not full cross-library equivalence.
     // Plaintext is the self-describing encoding of 7u8: [3, 7].
     let golden = [
         82, 66, 88, 49, 1, 0, 1, 0, 164, 151, 179, 104, 196, 1, 210, 153, 150, 34, 206, 174, 95,

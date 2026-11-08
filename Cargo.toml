@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "rustbinary"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 authors = ["blueokanna", "HyphenTeam"]
 keywords = ["binary", "serialization", "rust", "networking", "middleware"]
@@ -29,7 +29,7 @@ opt-level = 3
 
 [features]
 default = ["std", "compact"]
-std = ["nextjson/std"]
+std = []
 protocol = [
     "adaptive",
     "bit-packing",
@@ -131,9 +131,9 @@ name = "trust_session"
 required-features = ["trust", "std"]
 
 [dependencies]
-nextjson = { version = "0.1.4", default-features = false }
-rustbinary-derive = { version = "0.1.5", optional = true }
+nextjson = { version = "0.1.5", default-features = false }
+rustbinary-derive = { version = "0.1.5", path = "rustbinary-derive", optional = true }
 
 [dev-dependencies]
-nextjson = { version = "0.1.4" }
+nextjson = { version = "0.1.5" }
 proptest = "1.8.0"

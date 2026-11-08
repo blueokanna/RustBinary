@@ -35,8 +35,8 @@ CBOR、压缩、加密或 Schema 演进时，应把它们和 nextjson derive 组
 
 ```toml
 [dependencies]
-# 钉到精确的 runtime 目标（0.1.4 拒绝非有限浮点）。
-nextjson = { version = "=0.1.4", features = ["derive"] }
+# 与运行时的 nextjson API 版本一致。
+nextjson = { version = "0.1.5", features = ["derive"] }
 rustbinary = { version = "0.1.8", features = [
     "derive",
     "fingerprint",
@@ -334,10 +334,12 @@ struct Reading {
 }
 ```
 
-- `Archive` 生成 `ArchivedReading` 镜像类型（`#[repr(C)]`，派生 `Clone` + `Copy`）、
+- `Archive` 生成 `ArchivedReading` 镜像类型（`#[repr(C)]`，原地借用，不实现 `Clone` 或 `Copy`）、
   `rustbinary::archive_codec::Archive` impl、`ArchivedValue` 标记（使归档 struct
   可以放进 `ArchivedVec` 元素切片）以及 `CheckBytes` 结构校验器。校验器复刻
-  C-ABI 字段偏移，并在一次遍历中边界检查每个相对指针、长度与区间。
+  C-ABI 字段偏移，并检查每个相对指针、长度、完整骨架和实际内存对齐。
+  手写 `CheckBytes` 需要 `unsafe impl`；生成的校验器限制递归深度和总访问次数。
+  含相对指针的视图必须留在原地址，不能复制到其他位置。
 - `Serialize` 生成两阶段 `ArchiveWrite` 序列化器：骨架阶段写出定长镜像（与 C ABI
   相同的对齐填充）并记录占位符位置；body 阶段写出字符串/向量数据并回填占位符。
   `Vec<T>`（T 为嵌套归档 struct）先把全部元素镜像连续写出，再写它们的 body，

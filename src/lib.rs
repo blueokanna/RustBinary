@@ -246,9 +246,10 @@ pub use parallel::ParallelConfig;
 pub use probe::{probe, Probe};
 #[cfg(feature = "projection")]
 pub use projection::{
-    prove, schema_root, verify, verify_untrusted, Projection, ProjectionError, ProjectionLimits,
-    ProjectionProof, ProofLeaf, ProofSibling, Record as ProjectedRecord, RecordBuilder,
-    VerifiedField, DEFAULT_MAX_FIELDS, DEFAULT_MAX_PAYLOAD_LEN, DEFAULT_MAX_RECORD_LEN,
+    prove, schema_root, verify, verify_query, verify_untrusted, Projection, ProjectionError,
+    ProjectionLimits, ProjectionProof, ProofLeaf, ProofSibling, Record as ProjectedRecord,
+    RecordBuilder, VerifiedField, DEFAULT_MAX_FIELDS, DEFAULT_MAX_PAYLOAD_LEN,
+    DEFAULT_MAX_RECORD_LEN,
 };
 #[cfg(feature = "entropy")]
 pub use rans::{EntropyConfig, FieldModel, Model, RansDecoder, RansEncoder, SchemaModel, RANS_M};
@@ -375,9 +376,6 @@ mod tests {
         collections::BTreeMap,
         io::{self, Cursor, Write},
     };
-
-    #[cfg(feature = "cbor")]
-    use std::collections::HashMap;
 
     use super::*;
 
@@ -1249,8 +1247,8 @@ mod tests {
             [0x9f, 0x01, 0x02, 0x03, 0xff]
         );
 
-        let first = HashMap::from([("aa", 1u8), ("b", 2)]);
-        let second = HashMap::from([("b", 2u8), ("aa", 1)]);
+        let first = BTreeMap::from([("aa", 1u8), ("b", 2)]);
+        let second = BTreeMap::from([("b", 2u8), ("aa", 1)]);
         let deterministic = options().with_cbor_format().with_deterministic_encoding();
         let encoded = deterministic.serialize(&first).unwrap();
         assert_eq!(encoded, deterministic.serialize(&second).unwrap());
@@ -1260,19 +1258,19 @@ mod tests {
         );
         assert_eq!(
             deterministic
-                .deserialize::<HashMap<String, u8>>(&encoded)
+                .deserialize::<BTreeMap<String, u8>>(&encoded)
                 .unwrap(),
-            HashMap::from([("aa".into(), 1), ("b".into(), 2)])
+            BTreeMap::from([("aa".into(), 1), ("b".into(), 2)])
         );
 
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(matches!(
-            deterministic.deserialize::<HashMap<String, u8>>(&trailing),
+            deterministic.deserialize::<BTreeMap<String, u8>>(&trailing),
             Err(Error::TrailingBytes { .. })
         ));
         assert!(matches!(
-            deterministic.deserialize_from::<_, HashMap<String, u8>>(Cursor::new(&trailing)),
+            deterministic.deserialize_from::<_, BTreeMap<String, u8>>(Cursor::new(&trailing)),
             Err(Error::TrailingBytes { .. })
         ));
         assert_eq!(

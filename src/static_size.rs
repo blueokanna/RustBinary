@@ -76,7 +76,8 @@ impl<T: StaticSize, const N: usize> StaticSize for [T; N] {
 }
 
 impl<T> StaticSize for PhantomData<T> {
-    const MAX_SIZE: usize = 0;
+    // nextjson encodes PhantomData as unit (the null tag).
+    const MAX_SIZE: usize = 1;
     const PACKED_MAX_BITS: usize = 0;
     const PACKED_MAX_SIZE: usize = 0;
 }

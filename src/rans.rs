@@ -20,8 +20,8 @@
 //!
 //! [`crate::SchemaModel::from_reflect`] walks a `Reflect` shape and produces one
 //! static model per field. Because the schema is compiled into both sides,
-//! no frequency table ever crosses the wire. The coder therefore always codes
-//! at the information-theoretic rate of the model: an enum with 3 variants
+//! no frequency table crosses the wire. For long streams, the coding rate
+//! approaches the model rate, subject to quantized frequencies and frame overhead: an enum with 3 variants
 //! costs `log2(3) ≈ 1.585` bits per symbol instead of rounding up to 2.
 //!
 //! # Determinism and verification
@@ -33,25 +33,14 @@
 //! payload and final state byte-for-byte. A frame is accepted only when it is
 //! the canonical encoding of the payload it decodes to.
 //!
-//! This makes the guarantees exact rather than probabilistic:
+//! This is a representation check, not authentication or a checksum. Replacing
+//! a codeword with another valid codeword can change the decoded data and pass
+//! replay. No accidental-corruption detection probability is claimed. Raw
+//! fallback has only framing/length checks; forcing coded frames does not
+//! establish an integrity boundary. Use a trusted digest, MAC or AEAD as needed.
 //!
-//! - **Truncation** fails the state and consumption checks.
-//! - **Substitution** (any byte change that leaves the frame decodable)
-//!   changes the decoded payload, so the replay differs and the frame is
-//!   rejected — unless the corrupted frame happens to be the canonical
-//!   encoding of a *different* payload, which no non-authenticated scheme can
-//!   distinguish (a hash cannot either: it would simply authenticate the
-//!   replaced payload).
-//! - **Raw fallback frames** store the literal input bytes and carry no
-//!   redundancy, so they are verified only for length consistency; they are
-//!   the explicit anti-expansion path and are not suitable as an integrity
-//!   boundary.
-//!
-//! Replay verification is on by default and can be disabled with
-//! [`crate::EntropyConfig::without_replay_verification`] for throughput
-//! when the transport is authenticated elsewhere. See
-//! `tests/entropy_roundtrip.rs` for exhaustive roundtrips and corruption
-//! rejection.
+//! Replay is enabled by default and adds an encoding pass. The option
+//! `without_replay_verification` disables only this canonicality check.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -143,8 +132,6 @@ impl Model {
         for slot in &mut freq {
             *slot = (*slot).max(1);
         }
-        // If the floors pushed the sum above M, reduce the largest quotas
-        // (ties: lowest index first) but never below one.
         let mut sum: u32 = freq.iter().sum();
         if sum > RANS_M {
             let mut excess = sum - RANS_M;
@@ -162,8 +149,6 @@ impl Model {
             debug_assert_eq!(excess, 0);
             sum = freq.iter().sum();
         }
-        // Distribute the remaining mass to the largest fractional remainders,
-        // ties broken by declaration order.
         let deficit = RANS_M - sum;
         let mut order: Vec<usize> = (0..symbols).collect();
         order.sort_by(|&a, &b| {
@@ -285,8 +270,6 @@ impl RansEncoder {
             return Err(Error::Entropy("symbol outside the model alphabet"));
         }
         let cum = model.cum(symbol);
-        // Renormalize: flush 16-bit words while the state is too large for
-        // the encoded result to stay below 2^47.
         while self.state >= u64::from(freq) << RANS_EMIT_SHIFT {
             self.bytes
                 .extend_from_slice(&(self.state as u16).to_le_bytes());
@@ -449,8 +432,9 @@ type UnwrappedFrame<'a> = (u64, u64, bool, &'a [u8]);
 
 /// rANS entropy profile wrapping a [`Config`].
 ///
-/// `EntropyConfig` keeps the resource policies of its base configuration and
-/// adds framed, deterministic static-model entropy coding. The frame magic is
+/// Byte limits cover both frames and decoded storage; collection limits cover
+/// symbol counts. Parser depth, token and read-work policies do not apply.
+/// This profile adds framed, deterministic static-model coding. The frame magic is
 /// `RBAN`. Verification is hash-free: the decoder re-encodes the decoded
 /// symbols and requires the frame to be canonical (see the module docs), with
 /// replay verification on by default.
@@ -477,10 +461,8 @@ impl EntropyConfig {
 
     /// Disables replay verification.
     ///
-    /// Without it, decoding still rejects truncated frames (final-state and
-    /// consumption checks) but accepts any frame whose corrupted bytes happen
-    /// to decode; substitution corruption is no longer detected. Only disable
-    /// this when the transport authenticates bytes elsewhere (AEAD, TLS).
+    /// State and consumption checks remain. Neither setting authenticates the
+    /// decoded data or guarantees detection of substitutions.
     pub const fn without_replay_verification(mut self) -> Self {
         self.replay_verification = false;
         self
@@ -493,11 +475,8 @@ impl EntropyConfig {
 
     /// Disables the raw (uncompressed) fallback in [`Self::compress`].
     ///
-    /// Raw frames store the literal input and therefore carry no substitution
-    /// detection — replay verification has nothing to re-encode. For an
-    /// integrity boundary, disable the fallback so every frame is coded and
-    /// replay-verified, at the cost of never storing the incompressible input
-    /// as-is.
+    /// Forces coded frames even for incompressible input. This can increase
+    /// output size; it adds no authentication or quantified corruption detection.
     pub const fn without_raw_fallback(mut self) -> Self {
         self.raw_fallback = false;
         self
@@ -517,6 +496,7 @@ impl EntropyConfig {
         if models.len() != symbols.len() {
             return Err(Error::Entropy("models and symbols length mismatch"));
         }
+        self.check_decoded_size(symbols.len() as u64, 4)?;
         let mut encoder = RansEncoder::new();
         for (model, &symbol) in models.iter().zip(symbols) {
             encoder.put_symbol(model, symbol)?;
@@ -532,8 +512,7 @@ impl EntropyConfig {
     /// decoded symbols reproduces the stored payload and final state.
     pub fn decode_sequence(&self, models: &[&Model], input: &[u8]) -> Result<Vec<u32>> {
         let (count, final_state, raw, payload) = self.unwrap(input)?;
-        let count = usize::try_from(count)
-            .map_err(|_| Error::Entropy("entropy frame symbol count does not fit usize"))?;
+        let count = self.check_decoded_size(count, 4)?;
         if count != models.len() {
             return Err(Error::Entropy("entropy frame symbol count mismatch"));
         }
@@ -553,8 +532,6 @@ impl EntropyConfig {
             return Ok(symbols);
         }
         let mut decoder = RansDecoder::new(final_state, payload);
-        // rANS decodes in the reverse of encode order, so the models must be
-        // replayed in reverse and the output must be reversed back.
         let mut symbols = Vec::with_capacity(count);
         for model in models.iter().rev() {
             symbols.push(decoder.get_symbol(model)?);
@@ -575,14 +552,12 @@ impl EntropyConfig {
     /// Entropy-codes a byte buffer with one model, choosing raw storage when
     /// the coded form is not smaller.
     pub fn compress(&self, input: &[u8], model: &Model) -> Result<Vec<u8>> {
+        self.check_decoded_size(input.len() as u64, 1)?;
         let mut encoder = RansEncoder::new();
         for &byte in input {
             encoder.put_symbol(model, u32::from(byte))?;
         }
         let (final_state, coded) = encoder.finish();
-        // The raw fallback stores the original bytes, not the coded form. It
-        // is disabled by `without_raw_fallback` so every frame stays
-        // replay-verifiable.
         let raw = self.raw_fallback && coded.len() >= input.len();
         let payload = if raw { input.to_vec() } else { coded };
         self.wrap(final_state, input.len() as u64, payload, raw)
@@ -591,8 +566,7 @@ impl EntropyConfig {
     /// Decompresses a frame produced by [`Self::compress`].
     pub fn decompress(&self, input: &[u8], model: &Model) -> Result<Vec<u8>> {
         let (count, final_state, raw, payload) = self.unwrap(input)?;
-        let count = usize::try_from(count)
-            .map_err(|_| Error::Entropy("entropy frame length does not fit usize"))?;
+        let count = self.check_decoded_size(count, 1)?;
         if raw {
             if payload.len() != count {
                 return Err(Error::Entropy("raw entropy frame length mismatch"));
@@ -600,8 +574,6 @@ impl EntropyConfig {
             return Ok(payload.to_vec());
         }
         let mut decoder = RansDecoder::new(final_state, payload);
-        // rANS decodes in reverse order, so reverse the output back to the
-        // original byte order.
         let mut output = Vec::with_capacity(count);
         for _ in 0..count {
             let symbol = decoder.get_symbol(model)?;
@@ -631,8 +603,6 @@ impl EntropyConfig {
             .checked_add(payload.len())
             .ok_or(Error::SizeLimit { limit: u64::MAX })?;
         self.enforce_byte_limit(total)?;
-        // Raw frames carry a zero state so `unwrap` can reject a raw frame
-        // with a non-zero state (a corruption marker).
         let stored_state = if raw { 0 } else { final_state };
         let mut output = Vec::with_capacity(total);
         output.extend_from_slice(&MAGIC);
@@ -679,6 +649,24 @@ impl EntropyConfig {
         }
         Ok(())
     }
+
+    fn check_decoded_size(&self, count: u64, width: usize) -> Result<usize> {
+        if let Some(limit) = self.base.collection_limit {
+            if count > limit {
+                return Err(Error::CollectionLimit { limit });
+            }
+        }
+        let count =
+            usize::try_from(count).map_err(|_| Error::IntegerOverflow { target: "usize" })?;
+        let bytes = count
+            .checked_mul(width)
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or(Error::SizeLimit {
+                limit: self.base.limit.unwrap_or(isize::MAX as u64),
+            })?;
+        self.enforce_byte_limit(bytes)?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -708,13 +696,11 @@ mod tests {
 
     #[test]
     fn non_power_of_two_alphabet_beats_ceil_bits() {
-        // A 3-symbol alphabet costs log2(3) ~= 1.585 bits/symbol.
         let model = Model::from_uniform(3).unwrap();
         let config = EntropyConfig::new(Config::standard());
         let symbols = [0u32, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
         let models: Vec<&Model> = core::iter::repeat(&model).take(symbols.len()).collect();
         let frame = config.encode_sequence(&models, &symbols).unwrap();
-        // 12 symbols * 1.585 bits = 19.02 bits -> 3 bytes + 24-byte header.
         assert!(frame.len() < 24 + 12, "frame too large: {}", frame.len());
         assert_eq!(config.decode_sequence(&models, &frame).unwrap(), symbols);
     }
@@ -741,7 +727,6 @@ mod tests {
         let frame = config.compress(&input, &model).unwrap();
         let decoded = config.decompress(&frame, &model).unwrap();
         assert_eq!(decoded, input);
-        // 256 zero bytes at p=255/256 need ~8 bits total; the header dominates.
         assert!(frame.len() < 24 + 16, "frame too large: {}", frame.len());
     }
 
@@ -749,13 +734,11 @@ mod tests {
     fn compress_falls_back_to_raw_when_not_smaller() {
         let model = Model::from_uniform(256).unwrap();
         let config = EntropyConfig::new(Config::standard());
-        // Pseudo-random byte data cannot be compressed by a uniform model.
         let input: Vec<u8> = (0..4096)
             .map(|index| ((index * 37) ^ (index >> 3)) as u8)
             .collect();
         let frame = config.compress(&input, &model).unwrap();
         assert!(frame.len() <= HEADER_LEN + input.len());
-        // The raw flag must be set exactly when the frame stores raw bytes.
         let flags = u16::from_le_bytes([frame[6], frame[7]]);
         assert_eq!(
             flags & FLAG_RAW != 0,
@@ -803,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_verification_catches_substitution() {
+    fn mutation_samples_reject_or_change_payload() {
         // Compressible data -> a coded frame.
         let mut weights = vec![1u32; 256];
         weights[b'x' as usize] = 1000;
@@ -814,8 +797,8 @@ mod tests {
         assert!(frame.len() < HEADER_LEN + input.len(), "frame is not coded");
         assert_eq!(verified.decompress(&frame, &model).unwrap(), input);
 
-        // A substitution that leaves the frame decodable is caught by the
-        // hash-free replay: the decoded payload re-encodes differently.
+        // Mutation samples may be rejected or decode to different data.
+        // The latter outcome is accepted corruption, not detection.
         for offset in HEADER_LEN..frame.len() {
             let mut tampered = frame.clone();
             tampered[offset] ^= 0x40;
@@ -840,21 +823,13 @@ mod tests {
     fn without_raw_fallback_keeps_every_frame_coded() {
         let model = Model::from_uniform(256).unwrap();
         let verified = EntropyConfig::new(Config::standard()).without_raw_fallback();
-        // Pseudo-random data is incompressible under a uniform model; with the
-        // fallback disabled the frame is coded anyway (never stored raw), so
-        // it remains replay-verifiable and any substitution is caught.
         let input: Vec<u8> = (0..4096).map(|i| ((i * 37) ^ (i >> 3)) as u8).collect();
         let frame = verified.compress(&input, &model).unwrap();
         let flags = u16::from_le_bytes([frame[6], frame[7]]);
         assert_eq!(flags & FLAG_RAW, 0, "raw fallback must be off");
-        // The coded form is never replaced by raw bytes, so the frame is
-        // always replay-verifiable (coded frames are the verified path).
         assert!(frame.len() >= HEADER_LEN + input.len());
         assert_eq!(verified.decompress(&frame, &model).unwrap(), input);
 
-        // A payload corruption is always caught: either rejected outright, or
-        // the decoded payload differs from the original (a corrupted frame can
-        // never replay to the original bytes).
         let mut tampered = frame.clone();
         tampered[HEADER_LEN] ^= 0x80;
         match verified.decompress(&tampered, &model) {

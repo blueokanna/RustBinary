@@ -1,13 +1,5 @@
-//! Property tests for resource-bounded decoding.
-//!
-//! These randomize values and budgets through the public API and assert the
-//! documented guarantees:
-//!
-//! - `decode_bounded` with a sufficient budget agrees with the plain codec on
-//!   the decoded value and on the exact bytes read.
-//! - For statically bounded types the measured `read`, `alloc`, `depth`, and
-//!   `work` never exceed the compile-time algebra.
-//! - The reported allocation bound always covers the bytes read.
+//! Property tests for parser budgets and schema admission estimates.
+//! These tests do not measure allocations or prove heap ceilings.
 
 #![cfg(feature = "bounded")]
 
@@ -27,7 +19,7 @@ struct Packet {
     label: String,
 }
 
-/// A statically bounded record: every constant is finite and exact.
+/// A statically bounded record: every constant is finite schema estimates.
 #[derive(
     Debug, PartialEq, nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::DecodeBounded,
 )]
@@ -40,7 +32,7 @@ struct StaticP {
 
 proptest! {
     /// A dynamic decode under a generous budget equals the plain codec and
-    /// reports the exact bytes read plus a sound allocation ceiling.
+    /// reports the exact bytes read plus a structural estimate.
     #[test]
     fn dynamic_decode_matches_plain_codec(
         id in any::<u64>(),
@@ -60,14 +52,12 @@ proptest! {
         prop_assert_eq!(decoded.use_.read, len);
         prop_assert!(decoded.use_.read <= budget.max_input());
         prop_assert!(decoded.use_.read <= budget.max_work());
-        // Allocation ceiling is sound: it covers the bytes read, and stays
-        // within the documented max_input + max_alloc.
-        prop_assert!(decoded.use_.alloc_bound >= len);
-        prop_assert!(decoded.use_.alloc_bound <= budget.max_input() + budget.max_alloc());
-        // Depth equals the type's derived constant.
-        prop_assert_eq!(decoded.use_.depth_bound, Packet::MAX_DEPTH);
+        prop_assert!(decoded.use_.alloc_estimate >= len);
+        prop_assert!(decoded.use_.alloc_estimate <= budget.max_alloc());
+        // The parser enforces the configured depth ceiling.
+        prop_assert_eq!(decoded.use_.depth_bound, budget.max_depth());
         // Work for dynamic types is the consumed byte count.
-        prop_assert_eq!(decoded.use_.work_bound, len);
+        prop_assert_eq!(decoded.use_.work_read, len);
     }
 
     /// A statically bounded decode never exceeds its compile-time algebra.
@@ -84,9 +74,9 @@ proptest! {
         let decoded = decode_bounded::<StaticP>(&bytes, Budget::from_type::<StaticP>()).unwrap();
         prop_assert_eq!(decoded.value, value);
         prop_assert!(decoded.use_.read as usize <= StaticP::MAX_INPUT);
-        prop_assert_eq!(decoded.use_.alloc_bound, 0);
+        prop_assert_eq!(decoded.use_.alloc_estimate, 0);
         prop_assert_eq!(decoded.use_.depth_bound, StaticP::MAX_DEPTH);
-        prop_assert!(decoded.use_.work_bound as usize <= StaticP::MAX_WORK);
+        prop_assert!(decoded.use_.work_read as usize <= StaticP::MAX_WORK);
     }
 
     /// An input budget that is one byte short always fails, while the exact

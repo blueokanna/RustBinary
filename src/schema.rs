@@ -46,7 +46,9 @@ pub trait Fingerprint {
     /// Hash of names, types, declaration order, and enum variant order.
     const TYPE_FINGERPRINT: u64;
 
-    /// Combines the type identity with every active codec configuration field.
+    /// Combines type identity with the historical wire-profile fingerprint.
+    /// Depth, global visits and byte-read limits are local admission policies
+    /// and are not included in this compatibility identifier.
     fn fingerprint(config: Config) -> u64 {
         config_fingerprint(Self::TYPE_FINGERPRINT, config)
     }

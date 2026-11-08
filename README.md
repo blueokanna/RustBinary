@@ -1,27 +1,13 @@
 # RustBinary
 
-RustBinary is a bounded binary codec built on [nextjson](https://crates.io/crates/nextjson).
-Your types are described with the normal nextjson derives; this crate turns
-those into bytes and back. It exists for a narrow job: moving structured data
-across a wire or into a file, where the other side might be hostile, where
-memory is scarce, and where you want to know exactly what a decoder will
-consume before it runs.
+RustBinary is a binary codec built on [nextjson](https://crates.io/crates/nextjson),
+with self-describing and schema-guided profiles, parser limits, optional
+compression, authenticated frames and Merkle proofs. It uses `no_std` + `alloc`;
+the default `std` feature adds I/O and platform facilities. The declared MSRV
+is Rust 1.78; the CI configuration includes an MSRV job.
 
-- **MSRV**: Rust 1.78 (hard-pinned in both crates and verified by CI on the
-  exact toolchain; the dependency graph is locked to versions that still
-  build on 1.78).
-- **`no_std` first**: the crate is unconditionally `#![no_std]` + `alloc`;
-  `std` is an opt-in feature that only adds the I/O adapters and the std-only
-  transform layers. The self-describing core and every self-implemented
-  feature (adaptive, entropy, reconcile, evolution, projection, bounded,
-  probe) build without `std`.
-
-Every feature in here answers a concrete question — "can I afford to reject
-this frame?", "can a light client read one field without scanning the whole
-record?", "what is the worst case this type can do to my heap?" — and the
-sections below state the answers together with what each one costs. Nothing in
-this crate is decoration, and the README says plainly when a feature is a
-trade-off rather than a win.
+Parser limits are not a process-memory sandbox. The precise guarantees and
+migration notes are in [the security contract](docs/security-contract.md).
 
 ## Format identity
 
@@ -67,35 +53,24 @@ features are on.
 
 ## Dependency policy
 
-This crate is deliberately **self-contained**. The stream path depends on
-nextjson and, optionally, the derive crate; every primitive that other codecs
-would pull in as a third-party dependency is implemented in-tree:
+The runtime depends on nextjson 0.1.5; derive support adds proc-macro dependencies.
+The workspace uses the local `rustbinary-derive` so tests exercise the code being
+edited. nextjson 0.1.5 has no `std` feature and no direct `std::collections::HashMap`
+implementation: use `BTreeMap` or an application newtype implementing nextjson's traits.
 
-| Primitive            | In-tree module        | Replaces        |
-| -------------------- | --------------------- | --------------- |
-| BLAKE3 (Merkle + projection proofs) | `crate::hash`   | `blake3`        |
-| XChaCha20-Poly1305 AEAD (RFC 8439)  | `crate::aead`   | `chacha20poly1305` |
-| OS CSPRNG + zeroize  | `crate::entropy`      | `getrandom`, `zeroize` |
-| LZ77 lossless compression | `crate::lz`    | `zstd`          |
-| Read-only mmap       | `crate::mmap`         | `memmap2`       |
-| Zero-copy archive codec | `crate::archive_codec` | `rkyv`        |
+BLAKE3, XChaCha20-Poly1305, OS randomness, key erasure, LZ77 and mmap support
+are maintained in this repository. Fewer dependencies transfer maintenance,
+platform testing and security review to this project; they do not remove those duties.
+The LZ77 codec is a proprietary RustBinary format, not Zstandard-compatible;
+no equivalent compression ratio, speed, dictionaries or interoperability is claimed.
 
-- **MSRV**: the crate is pinned to Rust 1.78 (`rust-version = "1.78"` in both
-  `rustbinary` and `rustbinary-derive`), and the CI matrix verifies every
-  feature combination on that exact toolchain. nextjson is pinned to `=0.1.4`,
-  whose serialize/deserialize path **rejects non-finite floats** (`NaN`/`±Inf`
-  are errors, not round-trippable values); RustBinary inherits and tests that
-  contract.
-- **Supply chain**: the runtime dependency graph is exactly `nextjson` (+ its
-  derive) and the in-tree `rustbinary-derive`. No other crate is linked at
-  runtime; the dev-dependencies (proptest for property tests) are pinned to
-  versions that still build on 1.78.
-- **Crypto implementation**: every primitive is implemented in-tree and
-  validated against official vectors — BLAKE3 against the RFC test suite,
-  ChaCha20-Poly1305 against the RFC 8439 vectors, and the AEAD framing
-  byte-for-byte against the previous `chacha20poly1305`-based pipeline (a
-  golden-vector test holds the old bytes). The Merkle tree also uses the
-  in-tree BLAKE3, so the whole integrity path is dependency-free.
+Crypto checks cover RFC 8439 ChaCha20/Poly1305 examples, the XChaCha20-Poly1305
+Internet-Draft vector, and the upstream BLAKE3 unkeyed 256-bit vectors.
+See [vector provenance and coverage](docs/security-contract.md#test-evidence).
+The pipeline golden fixture checks decoding compatibility for that fixture;
+its historical producer was not recorded, so it is not evidence of comprehensive
+compatibility with an earlier third-party implementation. No independent
+implementation-level security audit is claimed.
 
 ## Layers
 
@@ -118,14 +93,14 @@ would pull in as a third-party dependency is implemented in-tree:
 | Compact profile             | Implemented    | schema-guided `CompactBinary` derive: no tags/field names, length-prefixed containers, byte/float fast paths |
 | Adaptive integers/strings   | Implemented    | per-value width selection, ZigZag signed values, ASCII7 packing                             |
 | Adaptive `i64` collections  | Implemented    | raw / delta / run-length frames                                                             |
-| rANS entropy coding         | Implemented    | from-scratch static-model coder; hash-free replay verification                              |
+| rANS entropy coding         | Implemented    | from-scratch static-model coder; canonical replay checks                              |
 | SIMD                        | Hot scans only | runtime AVX2/SSE2/NEON with scalar fallback; AVX-512/SVE/SME detected but unused            |
 | Zero-allocation codec paths | Implemented    | exact-size output and caller-owned buffers                                                  |
 | Borrowed zero-copy decoding | Implemented    | nested `&str` fields point into the input frame                                             |
 | Bit packing                 | Implemented    | `BitPacked` derive, checked widths, canonical zero padding                                  |
 | Schema fingerprinting       | Implemented    | structural hash including codec configuration (FNV-1a, **not** cryptographic)               |
 | Compile-time bounds         | Implemented    | `StaticSize::{MAX_SIZE, PACKED_MAX_BITS, PACKED_MAX_SIZE}`                                  |
-| RFC 8949 CBOR               | Implemented    | crate-owned streaming CBOR codec (no value tree); optional canonical map ordering           |
+| RFC 8949 CBOR               | Implemented    | crate-owned streaming CBOR codec (no value tree); optional stable map ordering           |
 | Schema evolution            | Implemented    | stable field IDs, versions, defaults, unknown-field skipping                                |
 | Compression                 | Implemented    | in-tree LZ77 (hash-chained matches); raw data is kept when it is smaller  |
 | Encryption                  | Implemented    | XChaCha20-Poly1305, random 192-bit nonce, authenticated header                              |
@@ -135,9 +110,9 @@ would pull in as a third-party dependency is implemented in-tree:
 | IBLT set reconciliation     | Implemented    | from-scratch invertible Bloom lookup tables (Goodrich and Mitzenmacher)                     |
 | Trust calculus              | Implemented    | type-level authentication state machine; unauthenticated receive is unrepresentable         |
 | Merkle archives             | Implemented    | in-tree BLAKE3 tree, O(log n) proofs, header-only open                                      |
-| Projectable self-auth. records | Implemented | projection soundness, O(log n) proofs, schema-version binding, unknown-field skipping      |
-| Resource-bounded decoding   | Implemented    | schema-derived B/A/D/W cost algebra, budget-enforced `decode_bounded` with evidence          |
-| Exact frame probing         | Implemented    | allocation-free `Config::probe`: exact bytes/containers/elements/depth of one value, honors every limit |
+| Projectable self-auth. records | Implemented | trusted-anchor membership, exact query checks, schema-version binding      |
+| Resource-bounded decoding   | Implemented    | parser counters and schema estimates; no hard heap ceiling          |
+| Exact frame probing         | Implemented    | allocation-free `Config::probe`: exact bytes/containers/elements/depth of one value, checks parser limits |
 | Configurable depth limit    | Implemented    | `Config::with_depth_limit` caps nesting on encode and decode                              |
 | Formal verification         | Kani harnesses | varint/ZigZag core + projection tree geometry + budget-limit algebra                        |
 | `no_std` first               | Implemented    | the crate is unconditionally `no_std` + `alloc`; `std` is an opt-in feature                  |
@@ -148,9 +123,8 @@ would pull in as a third-party dependency is implemented in-tree:
 ```toml
 [dependencies]
 rustbinary = "0.1"
-# nextjson is pinned to the exact codec target: 0.1.4 rejects non-finite
-# floats on both encode and decode, and RustBinary inherits that contract.
-nextjson = { version = "=0.1.4", features = ["derive"] }
+# Match the nextjson API used by this release.
+nextjson = { version = "0.1.5", features = ["derive"] }
 ```
 
 Enable only the systems you use:
@@ -287,7 +261,7 @@ profile:
 The decoder rejects non-minimal forms, narrowing overflow, malformed UTF-8,
 invalid tags, truncation, limit violations, and disallowed trailing bytes.
 The varint and ZigZag machinery lives in one place, `canonical`, shared by
-both directions, and Kani proves its roundtrip, boundedness, and canonical
+both directions, and Kani harnesses check roundtrip, boundedness, and canonical
 uniqueness (see Verification).
 
 ## Zero allocation and zero copy
@@ -398,59 +372,15 @@ The model is derived without transmitting anything:
 
 ### How corruption is detected, without a hash
 
-A rANS stream is not self-authenticating. The final state check rejects
-truncation and most substitution, but it has a nonzero miss rate for byte
-changes that still decode. The first version of this module papered over that
-with a SHA-256 digest in the frame; this version removes the hash entirely and
-replaces it with something exact:
+Replay checks whether decoding and re-encoding with the same model reproduces
+the frame. This rejects noncanonical representations. Another valid codeword
+can decode to different data and pass replay: there is no quantified accidental
+corruption detection rate and no authentication guarantee. Raw fallback checks
+framing and length only. Disabling raw fallback does not create an integrity boundary.
+Use a trusted digest, MAC, AEAD or authenticated transport according to the threat model.
 
-**Replay verification.** The decoder re-encodes the decoded symbols with the
-same models and requires the result to match the frame's stored payload and
-final state byte-for-byte. A frame is accepted only when it is the canonical
-encoding of the payload it decodes to — i.e., `frame == encode(decode(frame))`.
-
-That acceptance rule is the entire guarantee; the failure modes are:
-
-- Truncation or a corrupt state/count fails the consumption and state checks.
-- A byte change that still decodes yields a *different* payload, whose
-  canonical encoding almost never equals the corrupted frame, so the replay
-  differs and the frame is rejected.
-- The residual gap: a corrupted frame can in principle be the canonical
-  encoding of a *different* payload (`frame == encode(x)` with `x` different
-  from the original). Replay then accepts it with the wrong content; no
-  hash-free scheme can close that gap. Note that an unkeyed frame digest
-  *would* catch every accidental flip of this kind — replay verification
-  trades that small detection gap for zero hashing. Neither replay nor a
-  digest resists an attacker who can rewrite the frame; authenticated
-  integrity belongs to the AEAD/trust layer.
-- Raw-fallback frames store the literal input and carry no redundancy, so
-  they are only length-checked. `EntropyConfig::without_raw_fallback()`
-  disables that fallback, keeping every frame coded and replay-verified.
-
-Replay verification is on by default and costs one extra encode pass on
-decode (visible in the benchmark table). `without_replay_verification()`
-drops it for transports that authenticate bytes elsewhere.
-
-```rust
-use rustbinary::{Model, RansEncoder, RansDecoder};
-
-// An exact 5-symbol alphabet costs log2(5) ~= 2.32 bits/symbol instead of 3.
-let model = Model::from_uniform(5)?;
-let mut encoder = RansEncoder::new();
-for _ in 0..100 { encoder.put_symbol(&model, 3)?; }
-let (final_state, payload) = encoder.finish();
-let mut decoder = RansDecoder::new(final_state, &payload);
-let mut kinds = Vec::new();
-for _ in 0..100 { kinds.push(decoder.get_symbol(&model)?); }
-decoder.finish()?;
-kinds.reverse();
-# assert!(kinds.iter().all(|&k| k == 3));
-# Ok::<(), rustbinary::Error>(())
-```
-
-See [entropy.rs](examples/entropy.rs) for the schema-driven flow and the
-standalone byte codec with a skewed prior (2x+ on repetitive telemetry,
-measured in the benchmark crate).
+Replay is enabled by default and adds an encoding pass. The API name
+`without_replay_verification()` refers to this canonicality check, not message freshness.
 
 ## Bit packing
 
@@ -550,128 +480,51 @@ inspect unknown fields when forwarding or preservation is required.
 
 ## Projectable self-authenticating records (projection soundness)
 
-The `projection` feature is a **protocol format, not a compact codec**: a
-canonical, self-authenticating record whose fields can be verified and
-decoded *individually* against a trusted root, without scanning or decoding
-the rest of the record. The guarantee is **projection soundness**:
+Projection proofs bind disclosed field bytes to an externally trusted Merkle root.
+`verify(proof, anchor, schema_version)` verifies membership of the fields supplied
+by the proof. `verify_query(proof, anchor, schema_version, query)` additionally
+requires exactly the caller's requested IDs; missing and extra fields are rejected.
+The format provides no absence proof. `verify_untrusted` checks internal consistency
+only: a sender can replace both content and root.
 
-```text
-Verify(P, π, q) = v   ⟹   v = Project_q(Decode(P))
-```
+The argument assumes collision resistance of BLAKE3, an authenticated anchor
+and a canonical source record. Hashing is not mathematical injectivity. A valid
+partial proof neither reads nor certifies the current contents of an omitted
+field in a separate file. It also does not establish the semantic validity of
+opaque field payloads or application schema rules.
 
-`P` is the record, `q` a projection query (a set of field ids), `π` the
-proof, and `Decode(P)` the unique canonical decoding (uniqueness follows from
-the format's canonicality: strictly increasing field ids, fixed-width
-headers, no duplicates). Fields outside `q` are never read, yet their
-authenticity is still guaranteed: every field is bound into the Merkle root,
-so a tampered or substituted unread field changes the root and fails
-verification.
-
-- **Construction**: fields are `(field_id, payload_len, payload)` triples;
-  the root is `BLAKE3(schema_version ‖ merkle_root)`, so a proof cannot be
-  replayed against a different schema version. `RecordBuilder` enforces
-  canonical order; `prove` extracts a batch proof (minimal sibling set);
-  `verify` never touches the record and requires a **trusted anchor** (the
-  record root as committed by an authenticated source — a block header, a
-  keyed commitment, a signed index). The module binds integrity; keyed
-  authentication is the caller's trust anchor. `verify_untrusted` checks
-  internal consistency only and detects corruption, not substitution.
-- **Honest complexity**: `prove` is O(n); proof size is O(|q| · log(n/|q|))
-  worst case and O(log n) for a single field or a contiguous range; `verify`
-  does O(|q| + log n) hash operations. The Merkle overhead means the format
-  targets records with moderate field counts; for payload-heavy records the
-  per-field hash cost is negligible.
-- **Verified**: the Kani harness `small_tree_proof_agrees_with_root` proves
-  the aggregation/recomputation protocol is algebraically consistent for any
-  hash and any query; `leaf_count_is_complete_and_bounded` proves the tree is
-  complete and never more than doubles.
-
-```rust
-let mut builder = rustbinary::RecordBuilder::new(7); // schema version 7
-builder.insert_str(1, "alpha").unwrap();
-builder.insert_varint(2, 42).unwrap();
-builder.insert_bytes(3, b"\x00\x01").unwrap();
-let record = builder.finish().unwrap();
-
-// The trusted anchor comes from an authenticated source (e.g. a block header).
-let parsed = rustbinary::ProjectedRecord::parse(&record, &rustbinary::ProjectionLimits::new())?;
-let anchor = *parsed.root();
-
-let query = rustbinary::Projection::new([2]);
-let proof = rustbinary::prove(&record, &query, &rustbinary::ProjectionLimits::new())?;
-let verified = rustbinary::verify(&proof, &anchor, 7)?; // schema version bound
-assert_eq!(verified[0].field_id, 2);
-assert_eq!(verified[0].as_varint()?, 42);
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
+For n fields and k disclosed fields, sibling count is O(k log(n/k) + k).
+Verification hashes the disclosed payload bytes and the required tree nodes;
+its BTreeMap bookkeeping adds logarithmic factors. Building a proof currently
+scans the record and builds a tree in O(n) space, plus payload processing.
 
 ## Resource-bounded decoding (cost algebra)
 
-The `bounded` feature advances `StaticSize` from "worst-case output bytes" to
-**provable resource semantics**. For each type the `#[derive(DecodeBounded)]`
-macro generates a cost algebra that mirrors the parser exactly:
+`decode_bounded` enforces parser limits for consumed bytes, cumulative byte
+reads, global token visits, per-container entries and nesting depth. Global
+visits include object keys, skipped fields and speculative retries. Depth alone
+cannot constrain breadth: a depth-two collection can contain arbitrarily many
+sibling collections, up to the separate input and element policies.
 
-```text
-B(T)  maximum input bytes one decode of T can consume
-A(T)  maximum heap bytes one decode of T can allocate
-D(T)  maximum parser nesting depth
-W(T)  worst-case work (bytes read + per-field overhead)
-```
+`Budget::with_max_values` controls global visits. `max_work` counts parser byte
+reads, including backtracking; it does not meter arbitrary trait code or CPU time.
+`ResourceUse` reports `read`, `work_read`, `values` and the enforced `depth_bound`.
 
-`decode_bounded` runs the decode under a [`Budget`] and returns a `Decoded<T>`
-carrying **evidence** (`ResourceUse`: exact bytes read plus provable bounds
-for allocation, depth, and work). The algebra is isomorphic to the parser —
-the derive mirrors the exact container/key structure the encoder and decoder
-walk — so for statically bounded types the constants are exact: such a decode
-reads at most `B(T)` bytes, allocates at most `A(T)` (usually 0), nests at
-most `D(T)` levels, and does at most `W(T)` work, by construction.
+`max_alloc` caps the admission estimate: dynamic types charge input bytes plus
+weighted token visits; static types use their schema estimate. A successful
+decode reports `alloc_estimate <= max_alloc`. This is not an allocation bound. Collection capacity,
+reallocation peaks, boxes, custom deserializers and allocator overhead invalidate
+the old depth-times-collection-limit formula. `DecodeBounded` constants are
+schema estimates supplied by trusted implementations, not proofs of allocations.
+Even derived metadata must be considered alongside nextjson attributes and
+custom field implementations. Applications needing a hard memory ceiling must
+supply allocator or process isolation.
 
-Dynamic types (`Vec`, `String`, `&str`) report `usize::MAX` for
-content-dependent resources, and the *runtime* budget enforces the caller's
-limits. The allocation ceiling is conservative and exact for the types the
-derive covers:
-
-- **Data**: every byte materialized on the heap from the input (string and
-  byte-buffer bodies) is bounded by the byte limit, so `data ≤ read`.
-- **Structure**: collection backing buffers and boxes beyond their wire data.
-  The derive computes `MAX_STRUCTURAL_ELEMENT` — the worst per-element
-  structural allocation across the type's collections (`size_of::<T>()` for
-  `Vec<T>`/`Box<T>`, `0` for `String`). A decode has at most `D(T)` nested
-  collection levels, each capped at the collection limit, so
-  `allocation ≤ read + MAX_STRUCTURAL_ELEMENT · D(T) · collection_limit ≤
-  max_input + max_alloc`. The reported `alloc_bound` is that ceiling.
-  Manual `DecodeBounded` implementations that do not declare
-  `MAX_STRUCTURAL_ELEMENT` fall back to the budget's
-  `element_structure_bytes` knob (default [`ELEMENT_STRUCTURE_BYTES`] = 64,
-  which covers the standard collection shapes; raise it for wide-tuple or
-  large-inline-element layouts).
-
-Every failure reports which dimension was exceeded (`BudgetExceeded`). This
-is the entry point for DoS-sensitive consumers: blockchain nodes, enclaves,
-and gateways pick a `Budget` — from policy or from `Budget::from_type::<T>()`,
-which derives tight defaults from the algebra — and receive evidence of what
-the decode consumed.
-
-```rust
-#[derive(nextjson::NsonSerialize, nextjson::NsonDeserialize, rustbinary::DecodeBounded)]
-struct Packet {
-    sequence: u64,
-    payload: Vec<u8>,
-}
-
-let bytes = rustbinary::options().serialize(&Packet { sequence: 1, payload: vec![0; 64] })?;
-let budget = rustbinary::Budget::from_type::<Packet>()
-    .with_max_alloc(1 << 16);
-let decoded = rustbinary::decode_bounded::<Packet>(&bytes, budget)?;
-assert_eq!(decoded.value.sequence, 1);
-assert!(decoded.use_.read as usize <= bytes.len());
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-The `bounded` module's budget derivation and the projection tree geometry are
-Kani-proven (see Verification). `Config::with_depth_limit` (always available)
-caps container nesting on encode and decode below the crate-wide 128 ceiling
-and is clamped so a hostile limit cannot cause out-of-bounds indexing.
+This changes the public metrics: migrate `alloc_bound` to `alloc_estimate`
+and `work_bound` to `work_read`, and do not use the former as a security assertion.
+The self-describing Config also exposes `with_value_limit` and
+`with_decode_work_limit`; these two policies do not apply to compact, CBOR,
+archive or compression internals.
 
 ## Frame probing (exact preflight)
 
@@ -681,12 +534,12 @@ occupies the space in between: it walks the wire format and reports the
 count, element count, and maximum nesting depth — with zero allocation and
 without ever building a value.
 
-The probe is a byte-exact mirror of the decoder: it reads with the same
+The probe shares the decoder's token reader: it reads with the same
 boundary semantics, honors the same byte/collection/depth limits, and rejects
 the same malformed input (invalid tags, non-canonical varints, truncation,
-trailing bytes). A value accepted by `probe` decodes with the same byte count;
-a value rejected by `probe` is rejected by `deserialize` for the same reason.
-The drift-guard tests pin this against the encoder.
+trailing bytes). A successful probe validates wire structure, not whether an
+arbitrary target type accepts it. Typed decoding may also backtrack and consume
+more work. Probe metrics are tested against encoded fixtures.
 
 ```rust
 let frame = rustbinary::options().serialize(&vec![1u32, 2, 3])?;
@@ -712,7 +565,7 @@ parsing values; a stream hand-off already knows the exact frame length.
 ## CBOR, compression, and encryption
 
 The pipeline is explicit and ordered: serialize, optionally compress, then
-encrypt. Deterministic CBOR recursively sorts canonical map keys. Compression
+encrypt. The CBOR ordering option sorts map keys; it does not implement RFC 8949 section 4.2 deterministic encoding. Compression
 runs only above a size threshold and stores the in-tree LZ77 output only when
 it is strictly smaller. Encryption authenticates the full frame header
 (algorithm, nonce, lengths) as AEAD associated data and uses a fresh 192-bit
@@ -720,11 +573,11 @@ nonce each time, so ciphertext is intentionally nondeterministic.
 
 - CBOR is the crate's own streaming RFC 8949 codec (`src/cbor_codec.rs`):
   values encode and decode directly between `T` and the bytes with no
-  intermediate value tree and no JSON text round-trip, so the memory peak of
-  a decoded value is the decoded value itself. Definite- and
+  intermediate value tree and no JSON text round-trip. Collection capacity,
+  transient allocations and custom traits still affect peak memory. Definite- and
   indefinite-length containers, bignum tags 2/3, half-precision floats, and
   native byte strings are supported; byte and collection limits are enforced
-  inline. Deterministic canonical map ordering is the one explicit exception
+  inline. Stable map ordering is the one explicit exception
   and materializes a value tree to sort keys (opt-in).
 - Compression uses the magic `RBZ1` and a 24-byte header recording raw and
   stored lengths; decoders reject unknown flags, inconsistent lengths,
@@ -762,6 +615,11 @@ two-phase writer; every offset, length, and range is bounds-checked before
 any zero-copy access. `bool` fields are rejected by the derive (not every
 byte pattern is a valid `bool`), and the supported field surface is
 documented in the derive crate.
+
+Archived views are borrowed in place and do not implement `Copy` or `Clone`.
+Manual `CheckBytes` implementations are unsafe contracts. See the
+[security and migration notes](docs/security-contract.md#migration) for archive
+validation limits, little-endian requirements and serializer API changes.
 
 Two access modes:
 
@@ -882,66 +740,30 @@ strings are bounded by the byte limit.
 
 ### Machine proofs (Kani)
 
-`src/canonical.rs` is the single implementation of canonical little-endian
-varints and ZigZag, shared by the encoder and decoder. The Kani harnesses in
-`src/kani_proofs.rs` prove symbolically over the full `u128`/`i128` domain:
+`src/kani_proofs.rs` contains harnesses for varint/ZigZag arithmetic, small
+Merkle-tree aggregation and budget-limit arithmetic. Harness source is not a
+record of a successful proof run. These harnesses do not verify BLAKE3 collision
+resistance, real heap allocations, arbitrary schemas or the complete decoder.
+Run Kani separately in a supported environment and retain its results.
 
-- Roundtrip: `decode(encode(v)) == v` for every `u128`; ZigZag in both
-  directions.
-- Boundedness: the encoded form is at most 17 bytes and uses the canonical
-  (minimal) width.
-- Canonical uniqueness: the roundtrip plus determinism of `decode` imply no
-  two distinct values share one encoding.
+### Test evidence
 
-```text
-cargo kani -p rustbinary --harness canonical::varint_roundtrip
-cargo kani -p rustbinary --harness canonical::zigzag_roundtrip
-cargo kani -p rustbinary --harness canonical::zigzag_injective
-cargo kani -p rustbinary --harness canonical::varint_bounded_and_minimal
-cargo kani -p rustbinary --features projection --harness projection::leaf_count_is_complete_and_bounded
-cargo kani -p rustbinary --features projection --harness projection::small_tree_proof_agrees_with_root
-cargo kani -p rustbinary --features bounded --harness bounded::enforced_limits_respect_budget
-cargo kani -p rustbinary --features bounded --harness bounded::depth_algebra_preserves_max
-```
-
-The projection harnesses prove the Merkle aggregation/recomputation protocol
-is algebraically consistent for *any* hash values and any query subset, and
-that `leaf_count` yields a complete tree that never more than doubles. The
-bounded harnesses prove the derived enforced limits never exceed the budget
-and that the documented allocation ceiling holds.
-
-The archive hashes with the in-tree BLAKE3 implementation (`crate::hash`),
-which is validated byte-for-byte against the official BLAKE3 test vectors.
-Correctness of the Merkle *geometry* (domain separation, sibling extraction,
-root recomputation) is this crate's responsibility and is covered by the
-archive tests and the projection Kani harness for tree aggregation.
-
-### Property tests (proptest)
-
-`tests/entropy_roundtrip.rs` and `tests/canonical_proptest.rs` randomize the
-public API: byte and uniform-alphabet roundtrips, per-byte corruption
-properties (error, or a *different* payload — never the original), truncation
-rejection, non-canonical-form rejection, and integer roundtrips.
-
-`tests/projection_proptest.rs` randomizes the projection format's *shape*
-(arbitrary field counts, payloads, and queries): every proof returns exactly
-the queried projection with authentic bytes, any single header/field byte
-tamper is detected against the trusted anchor, arbitrary bytes never panic,
-and the stored root always matches the recomputed root.
-`tests/bounded_proptest.rs` randomizes values through `decode_bounded`: the
-result agrees with the plain codec, the bytes read are exact, the reported
-allocation bound is sound, static types never exceed their compile-time
-algebra, and the input-budget boundary is exact.
+Unit and property tests exercise roundtrips, malformed inputs, exact parser
+boundaries, projection membership and query matching. They do not prove absence
+of bugs. The crypto corpus and its coverage are documented in
+[the security contract](docs/security-contract.md#test-evidence); local format
+golden vectors, independent known-answer vectors, fuzzing and formal harnesses
+serve different purposes and are not interchangeable.
 
 ### Fuzzing (cargo-fuzz)
 
-The `fuzz/` crate (standalone, not a workspace member) feeds arbitrary bytes
-to both the compact and legacy decoders (must not panic, must classify every
-error) and roundtrips structured random records.
+Five targets cover self-describing, compact and CBOR decoders, structured
+roundtrips, and entropy/projection frames. Windows and Linux CI run ASan smoke
+campaigns. The [runner and setup instructions](fuzz/README.md) explain native
+Windows support, limits, logs and failure reproduction.
 
-```text
-cargo +nightly fuzz run decode_arbitrary_bytes
-cargo +nightly fuzz run decode_structured_roundtrip
+```powershell
+./scripts/fuzz.ps1 -Seconds 120
 ```
 
 ### Benchmarks

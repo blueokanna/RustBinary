@@ -28,7 +28,6 @@ use crate::{
 
 type NextjsonResult<T> = core::result::Result<T, NextjsonError>;
 
-/// Decodes one value that may borrow from `input`.
 pub(crate) fn from_slice<'de, T: nextjson::NsonDeserialize<'de>>(
     input: &'de [u8],
     config: Config,
@@ -42,21 +41,19 @@ pub(crate) fn from_slice<'de, T: nextjson::NsonDeserialize<'de>>(
     Ok(value)
 }
 
-/// Decodes one value, returning it together with the number of consumed bytes.
 pub(crate) fn from_slice_with_consumed<'de, T: nextjson::NsonDeserialize<'de>>(
     input: &'de [u8],
     config: Config,
 ) -> Result<(T, usize)> {
-    let mut decoder = Decoder {
-        input,
-        cursor: 0,
-        config,
-        depth: 0,
-        counts: [0; MAX_DEPTH],
-        lookahead: None,
-        wire_error: None,
-        expecting: None,
-    };
+    let (value, consumed, _, _) = from_slice_with_resources(input, config)?;
+    Ok((value, consumed))
+}
+
+pub(crate) fn from_slice_with_resources<'de, T: nextjson::NsonDeserialize<'de>>(
+    input: &'de [u8],
+    config: Config,
+) -> Result<(T, usize, u64, u64)> {
+    let mut decoder = Decoder::new(input, config);
     let value = T::nextdecode(&mut decoder).map_err(|error| {
         decoder
             .wire_error
@@ -68,10 +65,37 @@ pub(crate) fn from_slice_with_consumed<'de, T: nextjson::NsonDeserialize<'de>>(
             "decoder finished inside an unclosed container".into(),
         ));
     }
-    Ok((value, decoder.cursor))
+    // A speculative decoder must not swallow a resource failure and return
+    // success after restoring a checkpoint.
+    if let Some(error) = decoder.wire_error {
+        return Err(error);
+    }
+    Ok((value, decoder.cursor, decoder.work, decoder.values))
 }
 
-/// Self-describing binary decoder driven by nextjson's event contract.
+pub(crate) fn probe(input: &[u8], config: Config) -> Result<crate::probe::Probe> {
+    let mut decoder = Decoder::new(input, config);
+    decoder.skip_value_inner().map_err(|error| {
+        decoder
+            .wire_error
+            .take()
+            .unwrap_or_else(|| Error::from_nextjson(error))
+    })?;
+    if config.trailing == TrailingBytes::Reject && decoder.cursor != input.len() {
+        return Err(Error::TrailingBytes {
+            remaining: input.len() - decoder.cursor,
+        });
+    }
+    Ok(crate::probe::Probe::new(
+        decoder.cursor,
+        decoder.containers,
+        decoder.elements,
+        decoder.peak_depth,
+        decoder.values,
+        decoder.max_collection_len,
+    ))
+}
+
 struct Decoder<'de> {
     input: &'de [u8],
     cursor: usize,
@@ -85,21 +109,46 @@ struct Decoder<'de> {
     /// [`nextjson::NsonDeserialize::expecting`], so container type-mismatch
     /// errors can name the type the caller actually tried to decode.
     expecting: Option<&'static str>,
+    work: u64,
+    values: u64,
+    lookahead_start: usize,
+    containers: u64,
+    elements: u64,
+    peak_depth: usize,
+    max_collection_len: u64,
 }
 
 impl<'de> Decoder<'de> {
-    /// Records the precise RustBinary error and returns a nextjson error for
-    /// the `FormatDecoder` boundary. The original is recovered by the public
-    /// API in [`from_slice_with_consumed`].
+    fn new(input: &'de [u8], config: Config) -> Self {
+        Self {
+            input,
+            cursor: 0,
+            config,
+            depth: 0,
+            counts: [0; MAX_DEPTH],
+            lookahead: None,
+            wire_error: None,
+            expecting: None,
+            work: 0,
+            values: 0,
+            lookahead_start: 0,
+            containers: 0,
+            elements: 0,
+            peak_depth: 0,
+            max_collection_len: 0,
+        }
+    }
+
     fn fail(&mut self, error: Error) -> NextjsonError {
-        self.wire_error = Some(error);
+        if !matches!(
+            self.wire_error,
+            Some(Error::ValueLimit { .. } | Error::WorkLimit { .. })
+        ) {
+            self.wire_error = Some(error);
+        }
         NextjsonError::custom("rustbinary wire error")
     }
 
-    /// Builds a type-mismatch error, preferring the type description installed
-    /// by `set_expecting` for container expectations (matching nextjson 0.1.3's
-    /// richer diagnostics). Scalar expectations stay descriptive because they
-    /// are already meaningful without the surrounding type.
     fn invalid_type(&self, expected: &'static str, found: &Token<'_>) -> NextjsonError {
         let expected = match (self.expecting, expected) {
             (Some(expecting), "an object" | "an array") => expecting,
@@ -109,6 +158,16 @@ impl<'de> Decoder<'de> {
     }
 
     fn take(&mut self, len: usize) -> Result<&'de [u8]> {
+        let work = self
+            .work
+            .checked_add(len as u64)
+            .ok_or(Error::WorkLimit { limit: u64::MAX })?;
+        if let Some(limit) = self.config.decode_work_limit {
+            if work > limit {
+                return Err(Error::WorkLimit { limit });
+            }
+        }
+        self.work = work;
         let end = self.cursor.checked_add(len).ok_or(Error::UnexpectedEnd)?;
         if let Some(limit) = self.config.limit {
             if end as u64 > limit {
@@ -127,7 +186,6 @@ impl<'de> Decoder<'de> {
         Ok(self.take(1)?[0])
     }
 
-    /// Returns the next byte without advancing the cursor.
     fn peek_byte(&self) -> Result<u8> {
         self.input
             .get(self.cursor)
@@ -291,8 +349,6 @@ impl<'de> Decoder<'de> {
         })
     }
 
-    /// Reads a length payload. Strings are bounded by the byte limit; the
-    /// collection limit applies to sequence/map element counts (`container_sep`).
     fn length(&mut self) -> NextjsonResult<u64> {
         let value = self.unsigned(8, u64::MAX as u128)?;
         Ok(value as u64)
@@ -306,8 +362,17 @@ impl<'de> Decoder<'de> {
         Ok(Cow::Borrowed(value))
     }
 
-    /// Reads and returns the next full token (tag plus any payload).
     fn read_token(&mut self) -> NextjsonResult<Token<'de>> {
+        let values = self
+            .values
+            .checked_add(1)
+            .ok_or_else(|| self.fail(Error::ValueLimit { limit: u64::MAX }))?;
+        if let Some(limit) = self.config.value_limit {
+            if values > limit {
+                return Err(self.fail(Error::ValueLimit { limit }));
+            }
+        }
+        self.values = values;
         let tag = self.byte().map_err(|error| self.fail(error))?;
         match tag {
             TAG_NULL => Ok(Token::Null),
@@ -329,15 +394,14 @@ impl<'de> Decoder<'de> {
         }
     }
 
-    /// Returns the next token without consuming it.
     fn peek_token_inner(&mut self) -> NextjsonResult<Token<'de>> {
         if self.lookahead.is_none() {
+            self.lookahead_start = self.cursor;
             self.lookahead = Some(self.read_token()?);
         }
         Ok(self.lookahead.clone().expect("lookahead initialized"))
     }
 
-    /// Consumes and returns the next token, honoring any pending lookahead.
     fn take_token(&mut self) -> NextjsonResult<Token<'de>> {
         match self.lookahead.take() {
             Some(token) => Ok(token),
@@ -345,7 +409,6 @@ impl<'de> Decoder<'de> {
         }
     }
 
-    /// Whether the next byte is the container terminator (not consumed).
     fn peek_end(&mut self) -> NextjsonResult<bool> {
         if self.lookahead.is_some() {
             return Ok(false);
@@ -358,6 +421,8 @@ impl<'de> Decoder<'de> {
             return Err(self.fail(Error::Custom("decoder nesting depth limit exceeded".into())));
         }
         self.depth += 1;
+        self.containers += 1;
+        self.peak_depth = self.peak_depth.max(self.depth);
         Ok(())
     }
 
@@ -381,13 +446,6 @@ impl<'de> Decoder<'de> {
         Ok(())
     }
 
-    /// Probes the entry separator: `true` if more entries follow, `false` at
-    /// the container end (the terminator is left for `end_array` / `end_object`).
-    ///
-    /// The element is counted before the pending-lookahead shortcut so the
-    /// collection limit is enforced on every reachable path. A pending
-    /// lookahead token always implies at least one more element, so the
-    /// boolean result is `true` either way.
     fn container_sep(&mut self) -> NextjsonResult<bool> {
         let index = self.depth.checked_sub(1).ok_or_else(|| {
             self.fail(Error::Custom(
@@ -403,31 +461,47 @@ impl<'de> Decoder<'de> {
             }
         }
         self.counts[index] = count;
-        if self.lookahead.is_some() {
-            return Ok(true);
+        self.max_collection_len = self.max_collection_len.max(count);
+        self.elements += 1;
+        let more = !self.peek_end()?;
+        if more {
+            self.check_next_element()?;
         }
-        Ok(self.peek_byte().map_err(|error| self.fail(error))? != TAG_END)
+        Ok(more)
     }
 
-    /// Skips one complete value (used for unknown object fields).
+    fn check_next_element(&mut self) -> NextjsonResult<()> {
+        if let (Some(index), Some(limit)) =
+            (self.depth.checked_sub(1), self.config.collection_limit)
+        {
+            if self.counts[index] >= limit {
+                return Err(self.fail(Error::CollectionLimit { limit }));
+            }
+        }
+        Ok(())
+    }
+
     fn skip_value_inner(&mut self) -> NextjsonResult<()> {
         match self.take_token()? {
-            Token::BeginArray | Token::BeginObject => {
-                let mut nested = 1usize;
-                loop {
-                    if self.peek_byte().map_err(|error| self.fail(error))? == TAG_END {
-                        self.cursor += 1;
-                        nested -= 1;
-                        if nested == 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    if matches!(self.read_token()?, Token::BeginArray | Token::BeginObject) {
-                        nested += 1;
+            Token::BeginArray => {
+                self.push_frame()?;
+                while self.array_has_more()? {
+                    self.skip_value_inner()?;
+                    if !self.container_sep()? {
+                        break;
                     }
                 }
-                Ok(())
+                self.exit_container()
+            }
+            Token::BeginObject => {
+                self.push_frame()?;
+                while self.object_key()?.is_some() {
+                    self.skip_value_inner()?;
+                    if !self.container_sep()? {
+                        break;
+                    }
+                }
+                self.exit_container()
             }
             _ => Ok(()),
         }
@@ -485,6 +559,7 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
         if self.peek_end()? {
             return Ok(None);
         }
+        self.check_next_element()?;
         match self.take_token()? {
             Token::Str(key) => Ok(Some(key)),
             other => Err(self.invalid_type("an object key string", &other)),
@@ -508,7 +583,11 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     }
 
     fn array_has_more(&mut self) -> NextjsonResult<bool> {
-        self.peek_end().map(|end| !end)
+        let more = !self.peek_end()?;
+        if more {
+            self.check_next_element()?;
+        }
+        Ok(more)
     }
 
     fn array_entry_sep(&mut self) -> NextjsonResult<bool> {
@@ -569,18 +648,29 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
     }
 
     fn save(&self) -> Mark {
-        Mark::new(self.cursor, self.depth as u32)
+        let cursor = if self.lookahead.is_some() {
+            self.lookahead_start
+        } else {
+            self.cursor
+        };
+        Mark::new(cursor, self.depth as u32)
     }
 
     fn restore(&mut self, mark: Mark) {
         let depth = (mark.depth() as usize).min(self.counts.len());
-        self.cursor = mark.pos();
+        self.cursor = mark.pos().min(self.input.len());
         self.depth = depth;
         for slot in &mut self.counts[depth..] {
             *slot = 0;
         }
         self.lookahead = None;
-        self.wire_error = None;
+        // Resource errors are sticky; retries cannot reset the global budget.
+        if !matches!(
+            self.wire_error,
+            Some(Error::ValueLimit { .. } | Error::WorkLimit { .. })
+        ) {
+            self.wire_error = None;
+        }
     }
 
     fn set_expecting(&mut self, expecting: &'static str) -> Option<&'static str> {

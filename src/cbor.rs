@@ -1,18 +1,10 @@
-//! RFC 8949 CBOR configuration on top of the crate's own streaming CBOR
-//! codec (the private `cbor_codec` module).
+//! CBOR configuration over the native streaming codec.
+//! Supports the JSON-compatible RFC 8949 subset, native byte strings and bignums.
+//! Byte, per-collection and configured depth limits apply; trailing bytes are
+//! rejected by default. Custom trait allocations are outside these limits.
 //!
-//! Values encode and decode directly between `T` and the CBOR bytes with no
-//! intermediate value tree and no JSON text round-trip: the memory peak of a
-//! decoded value is the decoded value itself. The wire profile is the
-//! JSON-compatible RFC 8949 subset plus native byte strings and bignum tags,
-//! so payloads interoperate with any standards-compliant CBOR library.
-//! Resource limits from the base [`Config`] are enforced inline during
-//! encoding and decoding; trailing bytes are rejected by default.
-//!
-//! Deterministic mode (`with_deterministic_encoding`) is the one explicit
-//! exception to the streaming design: sorting arbitrary map keys requires
-//! retaining them, so that mode materializes a normalized value tree before
-//! encoding. It is opt-in and its cost is documented on the method itself.
+//! Stable map ordering materializes an intermediate value tree and is not
+//! RFC 8949 deterministic encoding; see `with_deterministic_encoding`.
 
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
@@ -49,7 +41,12 @@ impl CborConfig {
         }
     }
 
-    /// Enables RFC 8949 deterministic map ordering and preferred encoding.
+    /// Enables stable recursive map ordering by encoded-key length and bytes.
+    ///
+    /// This is not RFC 8949 section 4.2 deterministic encoding: containers
+    /// remain indefinite-length and floats are not reduced to shortest width.
+    /// This mode materializes a value tree before encoding; byte limits do not
+    /// bound that intermediate allocation.
     pub const fn with_deterministic_encoding(mut self) -> Self {
         self.deterministic = true;
         self

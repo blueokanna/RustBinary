@@ -64,6 +64,12 @@ pub enum Error {
     CollectionLimit {
         limit: u64,
     },
+    ValueLimit {
+        limit: u64,
+    },
+    WorkLimit {
+        limit: u64,
+    },
     BufferTooSmall {
         required: usize,
         available: usize,
@@ -121,6 +127,8 @@ impl Error {
             Self::Io(_) => ErrorCategory::Configuration,
             Self::SizeLimit { .. }
             | Self::CollectionLimit { .. }
+            | Self::ValueLimit { .. }
+            | Self::WorkLimit { .. }
             | Self::BufferTooSmall { .. }
             | Self::SequenceMustHaveLength
             | Self::Unsupported(_) => ErrorCategory::Configuration,
@@ -171,6 +179,8 @@ impl fmt::Display for Error {
             Self::CollectionLimit { limit } => {
                 write!(f, "collection element limit of {limit} exceeded")
             }
+            Self::ValueLimit { limit } => write!(f, "global token limit of {limit} exceeded"),
+            Self::WorkLimit { limit } => write!(f, "decode byte-read limit of {limit} exceeded"),
             Self::BufferTooSmall {
                 required,
                 available,

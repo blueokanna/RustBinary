@@ -41,8 +41,8 @@ macros:
 
 ```toml
 [dependencies]
-# Pin to the exact runtime target (0.1.4 rejects non-finite floats).
-nextjson = { version = "=0.1.4", features = ["derive"] }
+# Match the runtime nextjson API.
+nextjson = { version = "0.1.5", features = ["derive"] }
 rustbinary = { version = "0.1.8", features = [
     "derive",
     "fingerprint",
@@ -378,12 +378,14 @@ struct Reading {
 }
 ```
 
-- `Archive` generates the `ArchivedReading` mirror type (`#[repr(C)]`, derived
-  `Clone` + `Copy`), the `rustbinary::archive_codec::Archive` impl, the
+- `Archive` generates the `ArchivedReading` mirror type (`#[repr(C)]`, borrowed
+  in place without `Clone` or `Copy`), the `rustbinary::archive_codec::Archive` impl, the
   `ArchivedValue` marker (so archived structs can sit inside `ArchivedVec`
   element slices), and the `CheckBytes` structural validator. The validator
   reproduces the C-ABI field offsets and bounds-checks every relative pointer,
-  length, and range in one pass.
+  length, full skeleton, and actual memory alignment. Manual `CheckBytes`
+  implementations require `unsafe impl`; generated validators enforce depth
+  and visit limits. Relative-pointer views must remain at their original address.
 - `Serialize` generates the two-phase `ArchiveWrite` serializer: a skeleton
   pass writes the fixed-size mirror (with the same alignment padding the C
   ABI inserts) and records placeholder positions; a bodies pass writes the

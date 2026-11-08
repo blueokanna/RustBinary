@@ -1,27 +1,10 @@
-//! BLAKE3 hash — a from-scratch implementation of the BLAKE3 algorithm
-//! (draft-irtf-cfrg-blake3).
-//!
-//! This crate ships no third-party dependencies, so the archive Merkle tree
-//! and the projection proofs hash with this in-tree implementation. The
-//! implementation follows the published reference algorithm: BLAKE2s-style
-//! 7-round compression, 1024-byte chunks, a lazy left-balanced binary tree,
-//! and domain-separated chaining values. It is `no_std` + `alloc` and
-//! byte-for-byte compatible with the official `blake3` crate (verified below
-//! against the published test vectors).
-//!
-//! ## Security posture
-//!
-//! This is a correctness-focused implementation of a published, formally
-//! analyzed hash function. It has not been through an independent
-//! implementation-level security audit and does not claim constant-time
-//! behavior (BLAKE3 is not secret-dependent in the ways that matter here:
-//! the archive hashes public payload bytes). The tree geometry and domain
-//! separation are owned by the calling module, not by this primitive.
+//! Unkeyed BLAKE3 with 256-bit output, checked against the upstream vector corpus.
+//! Keyed hashing, key derivation and XOF are not exposed. Domain separation
+//! belongs to the caller; this implementation has not been independently audited.
 
 use alloc::vec::Vec;
 use core::cmp;
 
-/// BLAKE3 initial state (same IV as BLAKE2s).
 const IV: [u32; 8] = [
     0x6A09_E667,
     0xBB67_AE85,
@@ -33,27 +16,17 @@ const IV: [u32; 8] = [
     0x5BE0_CD19,
 ];
 
-/// Number of bytes per chunk (leaf subtree).
 const CHUNK_LEN: usize = 1024;
-/// Number of bytes per compression block.
 const BLOCK_LEN: usize = 64;
-/// Digest length in bytes.
 const OUT_LEN: usize = 32;
 
-/// Flag: this block is the first block of a chunk.
 const CHUNK_START: u32 = 1 << 0;
-/// Flag: this block is the last block of a chunk.
 const CHUNK_END: u32 = 1 << 1;
-/// Flag: this compression operates on a parent (tree) block.
 const PARENT: u32 = 1 << 2;
-/// Flag: this is the root compression of the tree.
 const ROOT: u32 = 1 << 3;
 
-/// BLAKE3 message schedule: the fixed 16-word permutation applied between
-/// rounds.
 const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
-/// The BLAKE3 mixing function `G`.
 #[inline(always)]
 fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
     state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
@@ -66,7 +39,6 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
-/// One BLAKE3 round: column step followed by diagonal step.
 #[inline(always)]
 fn round(state: &mut [u32; 16], message: &[u32; 16]) {
     g(state, 0, 4, 8, 12, message[0], message[1]);
@@ -79,7 +51,6 @@ fn round(state: &mut [u32; 16], message: &[u32; 16]) {
     g(state, 3, 4, 9, 14, message[14], message[15]);
 }
 
-/// Permutes a 16-word message block using the BLAKE3 schedule.
 #[inline(always)]
 fn permute(message: &mut [u32; 16]) {
     let mut permuted = [0_u32; 16];
@@ -89,10 +60,6 @@ fn permute(message: &mut [u32; 16]) {
     *message = permuted;
 }
 
-/// The BLAKE3 compression function.
-///
-/// Returns the full 16-word output. The first 8 words form the chaining
-/// value; the full output is used for extended (XOF) root output.
 fn compress(
     chaining_value: &[u32; 8],
     block_words: &[u32; 16],
@@ -132,7 +99,6 @@ fn compress(
     state
 }
 
-/// Reads a little-endian `u32` word from a byte slice.
 #[inline(always)]
 fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
@@ -143,7 +109,6 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// Converts a byte slice to 16 little-endian words (padded with zeros).
 fn words_from_bytes(bytes: &[u8]) -> [u32; 16] {
     let mut words = [0_u32; 16];
     for (i, word) in words.iter_mut().enumerate() {
@@ -160,8 +125,6 @@ fn words_from_bytes(bytes: &[u8]) -> [u32; 16] {
     words
 }
 
-/// Captures the state just prior to choosing between a chaining value and a
-/// root digest, exactly as in the BLAKE3 reference implementation.
 #[derive(Clone, Copy)]
 struct Output {
     input_chaining_value: [u32; 8],
@@ -172,7 +135,6 @@ struct Output {
 }
 
 impl Output {
-    /// The 8-word chaining value of this node (compression without `ROOT`).
     fn chaining_value(&self) -> [u32; 8] {
         let output = compress(
             &self.input_chaining_value,
@@ -184,7 +146,6 @@ impl Output {
         output[0..8].try_into().expect("8-word chaining value")
     }
 
-    /// The 32-byte digest of this node (compression with `ROOT`).
     fn root_hash(&self) -> [u8; 32] {
         debug_assert_eq!(self.counter, 0);
         let output = compress(
@@ -202,7 +163,6 @@ impl Output {
     }
 }
 
-/// A parent node output: `left_cv || right_cv` with `PARENT` semantics.
 fn parent_output(left_child_cv: [u32; 8], right_child_cv: [u32; 8]) -> Output {
     let mut block_words = [0_u32; 16];
     block_words[..8].copy_from_slice(&left_child_cv);
@@ -216,7 +176,6 @@ fn parent_output(left_child_cv: [u32; 8], right_child_cv: [u32; 8]) -> Output {
     }
 }
 
-/// State for the chunk currently being absorbed.
 struct ChunkState {
     /// Chaining value accumulated from already-compressed blocks.
     chaining_value: [u32; 8],
@@ -241,12 +200,10 @@ impl ChunkState {
         }
     }
 
-    /// Total number of input bytes absorbed by this chunk so far.
     fn len(&self) -> usize {
         BLOCK_LEN * self.blocks_compressed as usize + self.block_len as usize
     }
 
-    /// `CHUNK_START` is set only on the first block of the chunk.
     fn start_flag(&self) -> u32 {
         if self.blocks_compressed == 0 {
             CHUNK_START
@@ -255,7 +212,6 @@ impl ChunkState {
         }
     }
 
-    /// Absorbs input bytes, compressing full blocks as they arrive.
     fn update(&mut self, mut input: &[u8]) {
         while !input.is_empty() {
             // The block buffer is full: compress it into the chaining value.
@@ -282,7 +238,6 @@ impl ChunkState {
         }
     }
 
-    /// The `Output` of this chunk: compress the final block with `CHUNK_END`.
     fn output(&self) -> Output {
         let block_words = words_from_bytes(&self.block);
         Output {
@@ -314,8 +269,6 @@ impl Hasher {
     /// Absorbs `input` into the hash.
     pub fn update(&mut self, mut input: &[u8]) {
         while !input.is_empty() {
-            // The current chunk is full: finalize it, merge into the tree, and
-            // start the next chunk.
             if self.chunk_state.len() == CHUNK_LEN {
                 let chunk_cv = self.chunk_state.output().chaining_value();
                 let total_chunks = self.chunk_state.chunk_counter + 1;
@@ -329,11 +282,7 @@ impl Hasher {
         }
     }
 
-    /// Merges a completed chunk's chaining value into the lazy left-balanced
-    /// tree. `total_chunks` is the count of chunks finalized so far.
     fn add_chunk_chaining_value(&mut self, mut new_cv: [u32; 8], mut total_chunks: u64) {
-        // While the total chunk count is even, the new CV pairs with the most
-        // recent subtree root; merge them and continue up the tree.
         while total_chunks & 1 == 0 {
             let left = self.cv_stack.pop().expect("BLAKE3 tree stack underflow");
             new_cv = parent_output(left, new_cv).chaining_value();
@@ -344,9 +293,6 @@ impl Hasher {
 
     /// Finalizes the hash and returns the 32-byte digest.
     pub fn finalize(&self) -> [u8; 32] {
-        // Start with the current chunk's Output, then merge up the right edge
-        // of the tree through every completed subtree on the stack (from the
-        // top of the stack, i.e. the newest subtree, down to the root).
         let mut output = self.chunk_state.output();
         let mut remaining = self.cv_stack.len();
         while remaining > 0 {
@@ -364,9 +310,6 @@ impl Default for Hasher {
 }
 
 /// One-shot BLAKE3 digest of `input`.
-///
-/// This is the single hash entry point used by the archive Merkle tree and
-/// the projection proofs.
 pub fn blake3(input: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(input);
@@ -378,12 +321,43 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    /// Converts a hex string to bytes (test helper).
     fn hex(encoded: &str) -> Vec<u8> {
         (0..encoded.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).expect("valid hex"))
             .collect()
+    }
+
+    #[test]
+    fn upstream_unkeyed_256_bit_vectors() {
+        #[derive(nextjson::NsonDeserialize)]
+        struct Case {
+            input_len: usize,
+            hash: alloc::string::String,
+        }
+        #[derive(nextjson::NsonDeserialize)]
+        struct Vectors {
+            cases: Vec<Case>,
+        }
+        let vectors: Vectors =
+            nextjson::from_str(include_str!("../tests/vectors/blake3.json")).unwrap();
+        for case in vectors.cases {
+            let input: Vec<u8> = (0..case.input_len).map(|i| (i % 251) as u8).collect();
+            let expected = hex(&case.hash[..64]);
+            assert_eq!(blake3(&input)[..], expected, "length {}", case.input_len);
+            for stride in [1, 63, 64, 65, 1023, 1024, 1025] {
+                let mut hasher = Hasher::new();
+                for chunk in input.chunks(stride) {
+                    hasher.update(chunk);
+                }
+                assert_eq!(
+                    hasher.finalize()[..],
+                    expected,
+                    "length {}, stride {stride}",
+                    case.input_len
+                );
+            }
+        }
     }
 
     #[test]
@@ -395,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn official_abc_vector() {
+    fn regression_abc_vector() {
         assert_eq!(
             blake3(b"abc"),
             hex("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85")[..]
@@ -403,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn official_digits_vector() {
+    fn regression_digits_vector() {
         assert_eq!(
             blake3(b"0123456789"),
             hex("53b63a6fc8605d0c0ce559317a00177d72adb24d669235e4c914f443a8831ca1")[..]
@@ -442,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn official_fox_vector() {
+    fn regression_fox_vector() {
         assert_eq!(
             blake3(b"The quick brown fox jumps over the lazy dog"),
             hex("2f1514181aadccd913abd94cfa592701a5686ab23f8df1dff1b74710febc6d4a")[..]

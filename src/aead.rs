@@ -1,16 +1,14 @@
 //! ChaCha20-Poly1305 AEAD — a from-scratch implementation of the
-//! RFC 8439 `ChaCha20-Poly1305` construction and the IETF `XChaCha20`
-//! extension (192-bit nonce).
+//! RFC 8439 `ChaCha20-Poly1305` construction and `draft-irtf-cfrg-xchacha-03`
+//! (an Internet-Draft, not an RFC) extension (192-bit nonce).
 //!
-//! This crate ships no third-party dependencies, so the authenticated
-//! encryption layer (the `encryption` feature) uses this in-tree primitive.
-//! The implementation follows the published specifications exactly:
+//! The encryption feature uses this in-tree primitive. Relevant specifications:
 //!
 //! - **ChaCha20** (RFC 8439 §2.4): 20-round quarter-round block cipher with
 //!   a 256-bit key, 96-bit nonce and 32-bit block counter.
 //! - **Poly1305** (RFC 8439 §2.5): one-time authenticator over the padded
-//!   message and AAD, with the 16-byte one-time key `r || s`.
-//! - **XChaCha20** (IETF draft): a 24-byte nonce is converted to a 16-byte
+//!   message and AAD, with the 32-byte one-time key `r || s`.
+//! - **XChaCha20** (IETF draft): a 24-byte nonce is converted to a 32-byte
 //!   subkey via HChaCha20, then ChaCha20 runs with a 12-byte nonce of
 //!   `[0, 0, 0, 0, nonce[16..24]]` and a block counter starting at 0.
 //!
@@ -62,6 +60,8 @@ impl XChaCha20Poly1305 {
     /// Encrypts `payload.msg` under the key, authenticating `payload.aad`,
     /// and returns `ciphertext || tag` (tag is the final 16 bytes).
     pub fn encrypt(&self, nonce: &XNonce, payload: Payload<'_>) -> Result<Vec<u8>, AeadError> {
+        check_message_len(payload.msg.len())?;
+        payload.msg.len().checked_add(TAG_LEN).ok_or(AeadError)?;
         let ciphertext = xchacha20_encrypt(&self.key, nonce, payload.msg);
         let tag = poly1305_tag(&self.key, nonce, &ciphertext, payload.aad);
         let mut output = Vec::with_capacity(ciphertext.len() + TAG_LEN);
@@ -79,6 +79,7 @@ impl XChaCha20Poly1305 {
         }
         let split = payload.msg.len() - TAG_LEN;
         let (ciphertext, tag) = payload.msg.split_at(split);
+        check_message_len(ciphertext.len())?;
         let expected = poly1305_tag(&self.key, nonce, ciphertext, payload.aad);
         if !constant_time_eq(&expected, tag) {
             return Err(AeadError);
@@ -89,6 +90,15 @@ impl XChaCha20Poly1305 {
 
 /// 16-byte Poly1305 tag.
 const TAG_LEN: usize = 16;
+
+// Counter zero derives the MAC key; payload blocks use 1..=u32::MAX.
+fn check_message_len(len: usize) -> Result<(), AeadError> {
+    if len as u128 > u32::MAX as u128 * 64 {
+        Err(AeadError)
+    } else {
+        Ok(())
+    }
+}
 
 /// ChaCha20 block function: generates a 64-byte keystream block.
 ///
@@ -447,6 +457,59 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).expect("valid hex"))
             .collect()
+    }
+
+    /// draft-irtf-cfrg-xchacha-03, Appendix A.3.1 (not an RFC).
+    #[test]
+    fn draft_xchacha20_poly1305_vector() {
+        let key: Key = hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+            .try_into()
+            .unwrap();
+        let nonce: XNonce = hex("404142434445464748494a4b4c4d4e4f5051525354555657")
+            .try_into()
+            .unwrap();
+        let aad = hex("50515253c0c1c2c3c4c5c6c7");
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected = hex(concat!(
+            "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb",
+            "731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452",
+            "2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9",
+            "21f9664c97637da9768812f615c68b13b52e",
+            "c0875924c1c7987947deafd8780acf49"
+        ));
+        let cipher = XChaCha20Poly1305::new(&key);
+        assert_eq!(
+            cipher
+                .encrypt(
+                    &nonce,
+                    Payload {
+                        msg: plaintext,
+                        aad: &aad
+                    }
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: &expected,
+                        aad: &aad
+                    }
+                )
+                .unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn counter_limit_is_checked_without_allocating() {
+        let maximum = u32::MAX as usize * 64;
+        assert!(check_message_len(maximum).is_ok());
+        assert!(check_message_len(maximum + 1).is_err());
     }
 
     /// RFC 8439 §2.3.2 ChaCha20 block function test vector.

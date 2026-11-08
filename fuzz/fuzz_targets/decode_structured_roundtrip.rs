@@ -24,6 +24,9 @@ struct Record<'a> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Keep generated values within the policy below; arbitrary-wire rejection
+    // is exercised by the separate decoder targets.
+    let data = &data[..data.len().min(4096)];
     let config = Config::standard()
         .with_collection_limit(4096)
         .with_limit(1 << 20);
@@ -39,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
             .chunks(8)
             .map(|chunk| {
                 let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(chunk);
+                bytes[..chunk.len()].copy_from_slice(chunk);
                 i64::from_le_bytes(bytes)
             })
             .collect(),
