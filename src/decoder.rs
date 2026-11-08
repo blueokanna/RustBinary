@@ -140,10 +140,11 @@ impl<'de> Decoder<'de> {
     }
 
     fn fail(&mut self, error: Error) -> NextjsonError {
-        if !matches!(
-            self.wire_error,
-            Some(Error::ValueLimit { .. } | Error::WorkLimit { .. })
-        ) {
+        if !self
+            .wire_error
+            .as_ref()
+            .is_some_and(Error::is_resource_limit)
+        {
             self.wire_error = Some(error);
         }
         NextjsonError::custom("rustbinary wire error")
@@ -418,7 +419,9 @@ impl<'de> Decoder<'de> {
 
     fn push_frame(&mut self) -> NextjsonResult<()> {
         if self.depth >= self.config.depth_limit {
-            return Err(self.fail(Error::Custom("decoder nesting depth limit exceeded".into())));
+            return Err(self.fail(Error::DepthLimit {
+                limit: self.config.depth_limit,
+            }));
         }
         self.depth += 1;
         self.containers += 1;
@@ -665,10 +668,11 @@ impl<'de> FormatDecoder<'de> for Decoder<'de> {
         }
         self.lookahead = None;
         // Resource errors are sticky; retries cannot reset the global budget.
-        if !matches!(
-            self.wire_error,
-            Some(Error::ValueLimit { .. } | Error::WorkLimit { .. })
-        ) {
+        if !self
+            .wire_error
+            .as_ref()
+            .is_some_and(Error::is_resource_limit)
+        {
             self.wire_error = None;
         }
     }

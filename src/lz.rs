@@ -44,6 +44,10 @@ pub enum LzError {
     InvalidDistance,
     /// The decompressed length differs from the declared frame length.
     LengthMismatch,
+    /// Extra bytes or nonzero final padding follow the declared output.
+    TrailingData,
+    /// The decoded buffer could not be reserved.
+    AllocationFailed,
 }
 
 impl core::fmt::Display for LzError {
@@ -52,6 +56,8 @@ impl core::fmt::Display for LzError {
             Self::UnexpectedEnd => f.write_str("LZ77 stream ended unexpectedly"),
             Self::InvalidDistance => f.write_str("LZ77 match distance out of range"),
             Self::LengthMismatch => f.write_str("LZ77 decompressed length mismatch"),
+            Self::TrailingData => f.write_str("LZ77 trailing data or nonzero padding"),
+            Self::AllocationFailed => f.write_str("LZ77 output allocation failed"),
         }
     }
 }
@@ -65,8 +71,6 @@ fn hash3(bytes: &[u8]) -> usize {
     let a = bytes[0] as usize;
     let b = bytes[1] as usize;
     let c = bytes[2] as usize;
-    // 16-bit FNV-1a over three bytes; good enough to spread matches and
-    // cheap enough to run per position.
     let mut hash = 0x811c_9dc5usize;
     hash ^= a;
     hash = hash.wrapping_mul(0x0100_0193);
@@ -78,25 +82,26 @@ fn hash3(bytes: &[u8]) -> usize {
 }
 
 /// Compresses `input` with LZ77 matching. Returns an empty `Vec` if the
-/// packed stream is not smaller than the input (the caller then stores the
-/// raw payload), or the packed frame otherwise.
+/// input is too small to match or exceeds the u32 frame length. The caller
+/// compares the packed frame with the raw input before choosing its format.
 ///
 /// `level` is a 1..=22 hint controlling search effort; values outside the
 /// range are clamped. Higher levels yield marginally better ratios on
 /// repetitive data at proportionally higher CPU cost.
 pub fn compress(input: &[u8], level: i32) -> Vec<u8> {
-    if input.len() < MIN_MATCH {
+    if input.len() < MIN_MATCH || u32::try_from(input.len()).is_err() {
         return Vec::new();
     }
-    // Clamp level; chain budget grows with level (1 -> 4, 22 -> 96).
+    // Clamp level; chain budget grows with level (1 -> 8, 22 -> 92).
     let level = level.clamp(1, 22);
     let max_chain = (4 + (level as usize) * 4).min(96);
 
     // Hash-chain bookkeeping. `prev[i]` holds the previous position with the
-    // same 3-byte hash as `i` (or `u32::MAX` when none), stored as absolute
-    // positions. The window is enforced during search, not by truncation.
+    // same 3-byte hash (or `u32::MAX` when none), stored as absolute positions
+    // in a window-sized ring. Reject expired candidates before reading their
+    // ring slots: those slots may already describe newer positions.
     let mut head = vec![u32::MAX; HASH_BUCKETS];
-    let mut prev = vec![u32::MAX; input.len()];
+    let mut prev = vec![u32::MAX; input.len().min(WINDOW_SIZE)];
 
     let mut output = BitWriter::new();
     // Frame body: u32 LE uncompressed length.
@@ -121,7 +126,7 @@ pub fn compress(input: &[u8], level: i32) -> Vec<u8> {
                 // Only consider candidates within the 15-bit distance field.
                 let dist = pos - c;
                 if dist > WINDOW_SIZE {
-                    candidate = prev[c];
+                    candidate = prev[c % WINDOW_SIZE];
                     chain += 1;
                     continue;
                 }
@@ -139,7 +144,7 @@ pub fn compress(input: &[u8], level: i32) -> Vec<u8> {
                         }
                     }
                 }
-                candidate = prev[c];
+                candidate = prev[c % WINDOW_SIZE];
                 chain += 1;
             }
         }
@@ -155,7 +160,7 @@ pub fn compress(input: &[u8], level: i32) -> Vec<u8> {
             for i in pos..end {
                 if i + MIN_MATCH <= input.len() {
                     let h = hash3(&input[i..]);
-                    prev[i] = head[h];
+                    prev[i % WINDOW_SIZE] = head[h];
                     head[h] = i as u32;
                 }
             }
@@ -166,7 +171,7 @@ pub fn compress(input: &[u8], level: i32) -> Vec<u8> {
             output.write_bits(input[pos] as u32, 8);
             if pos + MIN_MATCH <= input.len() {
                 let h = hash3(&input[pos..]);
-                prev[pos] = head[h];
+                prev[pos % WINDOW_SIZE] = head[h];
                 head[h] = pos as u32;
             }
             pos += 1;
@@ -186,7 +191,7 @@ pub fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, LzError> {
     if declared > expected {
         return Err(LzError::LengthMismatch);
     }
-    let mut output = Vec::with_capacity(declared);
+    let mut output = Vec::new();
     while output.len() < declared {
         let is_match = reader.read_bit().ok_or(LzError::UnexpectedEnd)?;
         if is_match {
@@ -195,6 +200,10 @@ pub fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, LzError> {
             if distance > output.len() {
                 return Err(LzError::InvalidDistance);
             }
+            if length > declared - output.len() {
+                return Err(LzError::LengthMismatch);
+            }
+            reserve_output(&mut output, length, declared)?;
             let start = output.len();
             for i in 0..length {
                 let src = output[start + i - distance];
@@ -202,16 +211,39 @@ pub fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, LzError> {
             }
         } else {
             let byte = reader.read_bits(8).ok_or(LzError::UnexpectedEnd)? as u8;
+            reserve_output(&mut output, 1, declared)?;
             output.push(byte);
         }
     }
-    if output.len() != declared {
-        return Err(LzError::LengthMismatch);
+    if !reader.finished() {
+        return Err(LzError::TrailingData);
     }
     Ok(output)
 }
 
-/// Little-endian bit writer (MSB-first within each byte).
+fn reserve_output(output: &mut Vec<u8>, additional: usize, limit: usize) -> Result<(), LzError> {
+    let needed = output
+        .len()
+        .checked_add(additional)
+        .ok_or(LzError::LengthMismatch)?;
+    if needed > limit {
+        return Err(LzError::LengthMismatch);
+    }
+    if needed > output.capacity() {
+        let target = output
+            .capacity()
+            .saturating_mul(2)
+            .max(64)
+            .max(needed)
+            .min(limit);
+        output
+            .try_reserve_exact(target - output.len())
+            .map_err(|_| LzError::AllocationFailed)?;
+    }
+    Ok(())
+}
+
+/// Little-endian bit writer (LSB-first within each byte).
 struct BitWriter {
     buffer: Vec<u8>,
     bit_buffer: u64,
@@ -285,7 +317,7 @@ impl BitWriter {
     }
 }
 
-/// Little-endian bit reader (MSB-first within each byte).
+/// Little-endian bit reader (LSB-first within each byte).
 struct BitReader<'a> {
     bytes: &'a [u8],
     byte_pos: usize,
@@ -293,6 +325,14 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
+    fn finished(&self) -> bool {
+        if self.bit_pos == 0 {
+            self.byte_pos == self.bytes.len()
+        } else {
+            self.byte_pos + 1 == self.bytes.len() && self.bytes[self.byte_pos] >> self.bit_pos == 0
+        }
+    }
+
     fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
@@ -429,5 +469,57 @@ mod tests {
         // Both must round-trip identically.
         assert_eq!(decompress(&low, data.len()).unwrap(), data);
         assert_eq!(decompress(&high, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn matches_cannot_grow_past_the_declared_output() {
+        let mut writer = BitWriter::new();
+        writer.write_u32(2);
+        writer.write_bit(false);
+        writer.write_bits(b'A' as u32, 8);
+        writer.write_bit(true);
+        writer.write_bits(255, 8);
+        writer.write_bits(0, 15);
+        assert_eq!(
+            decompress(&writer.finish(), 2),
+            Err(LzError::LengthMismatch)
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_and_nonzero_padding_are_rejected() {
+        // One literal A: nine token bits, seven zero padding bits.
+        let valid = [1, 0, 0, 0, 0x82, 0];
+        assert_eq!(decompress(&valid, 1).unwrap(), b"A");
+        let mut extra = valid.to_vec();
+        extra.push(0);
+        assert_eq!(decompress(&extra, 1), Err(LzError::TrailingData));
+        for bit in 1..8 {
+            let mut bad = valid;
+            bad[5] |= 1 << bit;
+            assert_eq!(decompress(&bad, 1), Err(LzError::TrailingData));
+        }
+        for len in 0..valid.len() {
+            assert!(decompress(&valid[..len], 1).is_err());
+        }
+    }
+
+    #[test]
+    fn ring_history_roundtrips_across_repeated_window_wraps() {
+        let mut state = 0x1234_5678u32;
+        let mut data = Vec::new();
+        for index in 0..WINDOW_SIZE * 5 + 259 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push(if index > WINDOW_SIZE && index % 97 < 80 {
+                data[index - WINDOW_SIZE]
+            } else {
+                state as u8
+            });
+        }
+        for level in [1, 9, 22] {
+            assert_eq!(roundtrip(&data, level), data);
+        }
     }
 }

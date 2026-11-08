@@ -119,10 +119,16 @@ impl CompressedConfig {
         self.enforce_raw_limit(declared_raw_len)?;
         let (flags, raw_len, stored_len, stored) = parse_frame(input, self.trailing_policy())?;
         let payload = if flags & COMPRESSED != 0 {
-            let cap = raw_len
-                .checked_add(1)
-                .ok_or(Error::SizeLimit { limit: u64::MAX })?;
-            let payload = lz::decompress(stored, cap as usize)
+            let cap =
+                usize::try_from(raw_len).map_err(|_| Error::IntegerOverflow { target: "usize" })?;
+            let declared = stored.get(..4).ok_or(Error::UnexpectedEnd)?;
+            if u32::from_le_bytes(declared.try_into().expect("four-byte length")) as u64 != raw_len
+            {
+                return Err(Error::InvalidFrame(
+                    "LZ length does not match compression header",
+                ));
+            }
+            let payload = lz::decompress(stored, cap)
                 .map_err(|error| Error::Compression(error.to_string()))?;
             if payload.len() as u64 != raw_len {
                 return Err(Error::InvalidFrame(
@@ -156,13 +162,10 @@ impl CompressedConfig {
             .checked_add(stored_len)
             .ok_or(Error::InvalidFrame("compression frame size overflow"))?;
         let mut frame = Vec::new();
-        frame
-            .try_reserve_exact(frame_len)
-            .map_err(|_| Error::SizeLimit { limit: u64::MAX })?;
         frame.extend_from_slice(&header);
         let mut stored = reader.take(stored_len as u64);
         stored.read_to_end(&mut frame)?;
-        if frame.len() != HEADER_LEN + stored_len {
+        if frame.len() != frame_len {
             return Err(Error::UnexpectedEnd);
         }
         self.deserialize(&frame)

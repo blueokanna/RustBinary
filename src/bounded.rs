@@ -475,6 +475,9 @@ where
             crate::Error::ValueLimit { limit } => {
                 DecodeError::Budget(BudgetExceeded::Values { limit })
             }
+            crate::Error::DepthLimit { limit } => {
+                DecodeError::Budget(BudgetExceeded::Depth { limit })
+            }
             other => DecodeError::Codec(other),
         })?;
     if consumed != input.len() {

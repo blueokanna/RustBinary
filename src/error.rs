@@ -70,6 +70,9 @@ pub enum Error {
     WorkLimit {
         limit: u64,
     },
+    DepthLimit {
+        limit: usize,
+    },
     BufferTooSmall {
         required: usize,
         available: usize,
@@ -120,6 +123,17 @@ pub enum Error {
 }
 
 impl Error {
+    pub(crate) const fn is_resource_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::SizeLimit { .. }
+                | Self::CollectionLimit { .. }
+                | Self::ValueLimit { .. }
+                | Self::WorkLimit { .. }
+                | Self::DepthLimit { .. }
+        )
+    }
+
     /// Returns the stable responsibility category for this error.
     pub const fn category(&self) -> ErrorCategory {
         match self {
@@ -129,6 +143,7 @@ impl Error {
             | Self::CollectionLimit { .. }
             | Self::ValueLimit { .. }
             | Self::WorkLimit { .. }
+            | Self::DepthLimit { .. }
             | Self::BufferTooSmall { .. }
             | Self::SequenceMustHaveLength
             | Self::Unsupported(_) => ErrorCategory::Configuration,
@@ -181,6 +196,9 @@ impl fmt::Display for Error {
             }
             Self::ValueLimit { limit } => write!(f, "global token limit of {limit} exceeded"),
             Self::WorkLimit { limit } => write!(f, "decode byte-read limit of {limit} exceeded"),
+            Self::DepthLimit { limit } => {
+                write!(f, "codec nesting depth limit of {limit} exceeded")
+            }
             Self::BufferTooSmall {
                 required,
                 available,

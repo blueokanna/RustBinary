@@ -17,10 +17,12 @@
 //! [`nextjson::FormatEncoder`] / [`nextjson::FormatDecoder`]), replacing the
 //! former Serde dependency. The binary wire format is a type-tagged,
 //! self-describing stream: every value carries a one-byte type tag and
-//! containers are terminator-delimited, so `Option`, `Value`, untagged enums
-//! and borrowed strings all round-trip unambiguously.
+//! containers are terminator-delimited. The self-describing and CBOR profiles
+//! use null for `None`; a `Some` payload that itself encodes as null cannot be
+//! distinguished from `None`. Use the schema-guided compact profile when that
+//! distinction is required.
 //!
-//! The top-level functions and [`options`] select the strict compact profile:
+//! The top-level functions and [`options`] select the standard self-describing profile:
 //! canonical marker varints, ZigZag signed integers, bounded input, and
 //! rejected trailing bytes. [`legacy_options`] explicitly selects the old
 //! fixed-width, unbounded migration profile. Format-changing systems are
@@ -136,6 +138,7 @@ mod decoder;
 #[cfg(feature = "reconcile")]
 /// Baseline-relative differential frames for ordered state.
 pub mod delta;
+mod encode_state;
 #[cfg(feature = "encryption")]
 /// Authenticated XChaCha20-Poly1305 framing.
 pub mod encryption;
@@ -922,7 +925,7 @@ mod tests {
             options()
                 .with_depth_limit(8)
                 .deserialize::<nextjson::Value>(&deep),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 8 })
         ));
         // Serialization honors the same cap.
         let mut nested = nextjson::Value::Null;
@@ -931,7 +934,7 @@ mod tests {
         }
         assert!(matches!(
             options().with_depth_limit(8).serialize(&nested),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 8 })
         ));
         assert!(options().serialize(&nested).is_ok());
         // A huge limit is clamped to the crate maximum without OOB indexing.
@@ -955,12 +958,12 @@ mod tests {
             options()
                 .with_depth_limit(0)
                 .deserialize::<nextjson::Value>(&one),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 0 })
         ));
         let value: nextjson::Value = nextjson::Value::Array(vec![nextjson::Value::Null]);
         assert!(matches!(
             options().with_depth_limit(0).serialize(&value),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 0 })
         ));
 
         // depth_limit 1 accepts one level, rejects two.
@@ -972,7 +975,7 @@ mod tests {
             options()
                 .with_depth_limit(1)
                 .deserialize::<nextjson::Value>(&two),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 1 })
         ));
 
         // depth_limit 2 accepts two levels, rejects three.
@@ -984,7 +987,7 @@ mod tests {
             options()
                 .with_depth_limit(2)
                 .deserialize::<nextjson::Value>(&three),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 2 })
         ));
         // Serialization honors the same boundaries.
         let two_value: nextjson::Value =
@@ -992,7 +995,7 @@ mod tests {
         assert!(options().with_depth_limit(2).serialize(&two_value).is_ok());
         assert!(matches!(
             options().with_depth_limit(1).serialize(&two_value),
-            Err(Error::Custom(_))
+            Err(Error::DepthLimit { limit: 1 })
         ));
 
         // The limit clamps to the crate-wide maximum (128).

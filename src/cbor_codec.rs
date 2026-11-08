@@ -17,6 +17,7 @@ use nextjson::{FormatDecoder, FormatEncoder, Number, OptionTag, Token};
 
 use crate::{
     config::Config,
+    encode_state::{EncodeState, Kind},
     error::{Error, Result},
     tags::MAX_DEPTH,
     writer::EncodeWriter,
@@ -33,8 +34,7 @@ pub(crate) struct CborEncoder<W: EncodeWriter> {
     writer: W,
     config: Config,
     written: u64,
-    depth: usize,
-    counts: [u64; MAX_DEPTH],
+    state: EncodeState,
     wire_error: Option<Error>,
 }
 
@@ -44,8 +44,7 @@ impl<W: EncodeWriter> CborEncoder<W> {
             writer,
             config,
             written: 0,
-            depth: 0,
-            counts: [0; MAX_DEPTH],
+            state: EncodeState::new(config),
             wire_error: None,
         }
     }
@@ -56,20 +55,24 @@ impl<W: EncodeWriter> CborEncoder<W> {
                 .take()
                 .unwrap_or_else(|| Error::from_nextjson(error))
         })?;
-        if self.depth != 0 {
-            return Err(Error::Custom(
-                "encoder finished inside an unclosed container".into(),
-            ));
+        if let Some(error) = self.wire_error {
+            return Err(error);
         }
+        self.state.finish()?;
         Ok(self.written)
     }
 
     fn fail(&mut self, error: Error) -> NextjsonError {
-        self.wire_error = Some(error);
+        if self.wire_error.is_none() {
+            self.wire_error = Some(error);
+        }
         NextjsonError::custom("rustbinary cbor wire error")
     }
 
     fn emit(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.wire_error.is_some() {
+            return Err(Error::Custom("encoder already failed".into()));
+        }
         let amount =
             u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow { target: "u64" })?;
         let next = self
@@ -149,38 +152,8 @@ impl<W: EncodeWriter> CborEncoder<W> {
             .map_err(|error| self.fail(error))
     }
 
-    fn enter_container(&mut self) -> NextjsonResult<()> {
-        if self.depth >= self.config.depth_limit {
-            return Err(self.fail(Error::Custom("encoder nesting depth limit exceeded".into())));
-        }
-        self.depth += 1;
-        Ok(())
-    }
-
-    fn exit_container(&mut self) -> NextjsonResult<()> {
-        if self.depth == 0 {
-            return Err(self.fail(Error::Custom("container end without matching start".into())));
-        }
-        self.depth -= 1;
-        self.counts[self.depth] = 0;
-        self.emit(&[0xff]).map_err(|error| self.fail(error))
-    }
-
-    fn count_element(&mut self) -> NextjsonResult<()> {
-        let index = self
-            .depth
-            .checked_sub(1)
-            .ok_or_else(|| self.fail(Error::Custom("element outside any container".into())))?;
-        let count = self.counts[index]
-            .checked_add(1)
-            .ok_or_else(|| self.fail(Error::CollectionLimit { limit: u64::MAX }))?;
-        if let Some(limit) = self.config.collection_limit {
-            if count > limit {
-                return Err(self.fail(Error::CollectionLimit { limit }));
-            }
-        }
-        self.counts[index] = count;
-        Ok(())
+    fn value(&mut self) -> NextjsonResult<()> {
+        self.state.value().map_err(|error| self.fail(error))
     }
 }
 
@@ -188,46 +161,64 @@ impl<W: EncodeWriter> FormatEncoder for CborEncoder<W> {
     type Error = NextjsonError;
 
     fn begin_array(&mut self) -> NextjsonResult<()> {
-        self.enter_container()?;
+        self.state
+            .begin(Kind::Array)
+            .map_err(|error| self.fail(error))?;
         self.emit(&[0x9f]).map_err(|error| self.fail(error))
     }
 
     fn separator(&mut self) -> NextjsonResult<()> {
-        self.count_element()
+        self.state
+            .entry(Kind::Array)
+            .map_err(|error| self.fail(error))
     }
 
     fn end_array(&mut self) -> NextjsonResult<()> {
-        self.exit_container()
+        self.state
+            .end(Kind::Array)
+            .map_err(|error| self.fail(error))?;
+        self.emit(&[0xff]).map_err(|error| self.fail(error))
     }
 
     fn begin_object(&mut self) -> NextjsonResult<()> {
-        self.enter_container()?;
+        self.state
+            .begin(Kind::Object)
+            .map_err(|error| self.fail(error))?;
         self.emit(&[0xbf]).map_err(|error| self.fail(error))
     }
 
     fn key(&mut self, key: &str) -> NextjsonResult<()> {
-        self.count_element()?;
+        self.state
+            .entry(Kind::Object)
+            .map_err(|error| self.fail(error))?;
         self.write_text(key)
     }
 
     fn end_object(&mut self) -> NextjsonResult<()> {
-        self.exit_container()
+        self.state
+            .end(Kind::Object)
+            .map_err(|error| self.fail(error))?;
+        self.emit(&[0xff]).map_err(|error| self.fail(error))
     }
 
     fn write_null(&mut self) -> NextjsonResult<()> {
+        self.value()?;
         self.emit(&[0xf6]).map_err(|error| self.fail(error))
     }
 
     fn write_bool(&mut self, value: bool) -> NextjsonResult<()> {
+        self.value()?;
         self.emit(&[if value { 0xf5 } else { 0xf4 }])
             .map_err(|error| self.fail(error))
     }
 
     fn write_str(&mut self, value: &str) -> NextjsonResult<()> {
+        self.value()?;
         self.write_text(value)
     }
 
     fn write_char(&mut self, value: char) -> NextjsonResult<()> {
+        self.value()?;
         let mut buffer = [0_u8; 4];
         self.write_text(value.encode_utf8(&mut buffer))
     }
@@ -243,34 +234,41 @@ impl<W: EncodeWriter> FormatEncoder for CborEncoder<W> {
     }
 
     fn write_i64(&mut self, value: i64) -> NextjsonResult<()> {
+        self.value()?;
         self.signed(value as i128)
     }
 
     fn write_u64(&mut self, value: u64) -> NextjsonResult<()> {
+        self.value()?;
         self.unsigned(value as u128)
     }
 
     fn write_i128(&mut self, value: i128) -> NextjsonResult<()> {
+        self.value()?;
         self.signed(value)
     }
 
     fn write_u128(&mut self, value: u128) -> NextjsonResult<()> {
+        self.value()?;
         self.unsigned(value)
     }
 
     fn write_f64(&mut self, value: f64) -> NextjsonResult<()> {
+        self.value()?;
         self.emit(&[0xfb]).map_err(|error| self.fail(error))?;
         self.emit(&value.to_bits().to_be_bytes())
             .map_err(|error| self.fail(error))
     }
 
     fn write_f32(&mut self, value: f32) -> NextjsonResult<()> {
+        self.value()?;
         self.emit(&[0xfa]).map_err(|error| self.fail(error))?;
         self.emit(&value.to_bits().to_be_bytes())
             .map_err(|error| self.fail(error))
     }
 
     fn write_bytes(&mut self, value: &[u8]) -> NextjsonResult<()> {
+        self.value()?;
         self.head(2, value.len() as u64)?;
         self.emit(value).map_err(|error| self.fail(error))
     }
@@ -364,6 +362,9 @@ impl<'de> CborDecoder<'de> {
                 .take()
                 .unwrap_or_else(|| Error::from_nextjson(error))
         })?;
+        if let Some(error) = self.wire_error {
+            return Err(error);
+        }
         if self.depth != 0 {
             return Err(Error::Custom(
                 "decoder finished inside an unclosed container".into(),
@@ -380,7 +381,13 @@ impl<'de> CborDecoder<'de> {
     }
 
     fn fail(&mut self, error: Error) -> NextjsonError {
-        self.wire_error = Some(error);
+        if !self
+            .wire_error
+            .as_ref()
+            .is_some_and(Error::is_resource_limit)
+        {
+            self.wire_error = Some(error);
+        }
         NextjsonError::custom("rustbinary cbor wire error")
     }
 
@@ -512,7 +519,9 @@ impl<'de> CborDecoder<'de> {
         definite: Option<u64>,
     ) -> NextjsonResult<()> {
         if self.depth >= self.config.depth_limit {
-            return Err(self.fail(Error::Custom("decoder nesting depth limit exceeded".into())));
+            return Err(self.fail(Error::DepthLimit {
+                limit: self.config.depth_limit,
+            }));
         }
         if let Some(count) = definite {
             if let Some(limit) = self.config.collection_limit {
@@ -1066,7 +1075,13 @@ impl<'de> FormatDecoder<'de> for CborDecoder<'de> {
             *slot = 0;
         }
         self.lookahead = None;
-        self.wire_error = None;
+        if !self
+            .wire_error
+            .as_ref()
+            .is_some_and(Error::is_resource_limit)
+        {
+            self.wire_error = None;
+        }
     }
 
     fn set_expecting(&mut self, expecting: &'static str) -> Option<&'static str> {
@@ -1395,14 +1410,10 @@ mod tests {
             deep.push(0x81);
         }
         deep.push(0x00);
-        #[allow(clippy::same_item_push)]
-        for _ in 0..(crate::tags::MAX_DEPTH + 2) {
-            deep.push(0xff);
-        }
         let err = CborDecoder::new(&deep, Config::standard())
-            .decode::<Vec<u8>>()
+            .decode::<nextjson::Value>()
             .expect_err("depth limit");
-        assert!(matches!(err, Error::Custom(_)));
+        assert!(matches!(err, Error::DepthLimit { limit: 128 }));
         // Byte limit on encode.
         let err = CborEncoder::new(&mut Vec::new(), Config::standard().with_limit(2))
             .finish(&vec![1u8, 2, 3])

@@ -26,23 +26,16 @@ untagged enums, and `FormatEncoder`-driven types stay on the self-describing
 stream; static hot paths can take the compact profile. The two never change
 each other's bytes.
 
-Being self-describing buys three things the rest of the design leans on:
+The tagged stream supports dynamic values, untagged enums and borrowed strings.
+A borrowed `&str` points into the input frame. Each scalar carries a type tag;
+numeric arrays therefore use more bytes than a schema-guided representation.
+Choose the compact profile when both endpoints share a static schema.
 
-- `Option`, untagged enums, and `nextjson::Value` round-trip without any side
-  metadata.
-- A borrowed `&str` field points straight into the input frame; no copying.
-- A decoder can always tell where a value ends and whether a frame is whole.
-
-The price is a one-byte tag per value and one tag per element in a numeric
-array. That tax is real, and it is measured rather than waved away — the
-benchmark lab in this repository reports it against bincode 1, bincode 2,
-bincode-next, postcard, rkyv, and minicbor on the same data, and the numbers
-are honest about where this format loses. If your workload is a giant array of
-`f64` and nothing else, a schemaless codec will beat the *tagged stream* on
-size and speed; the compact profile closes most of that gap while keeping the
-same bounded, resource-policed decoder. If your workload is heterogeneous
-records that must round-trip unambiguously and be readable without an
-out-of-band schema, the tag tax buys you that.
+The self-describing and CBOR profiles use nextjson's null option representation:
+`Some(())`, `Some(None)` and other null-valued payloads cannot be distinguished
+from `None`. The compact profile uses explicit option tags and preserves that
+distinction. Arbitrary custom serialization shapes are part of the application's
+wire contract.
 
 The `archive` feature is **not a second stream format**. It is a separate
 storage format — an in-tree, root-first relative-pointer codec inside a

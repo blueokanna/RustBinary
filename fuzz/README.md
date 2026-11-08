@@ -1,7 +1,7 @@
 # Fuzzing
 
 Five libFuzzer targets cover arbitrary self-describing, compact and CBOR input,
-structured roundtrips, and entropy/projection frames. Frame tests also mutate
+structured roundtrips, and entropy/projection/compression frames. Frame tests also mutate
 valid encodings so format headers do not prevent exploration of their parsers.
 Each target uses finite input and collection policies. These campaigns do not
 measure peak heap usage or certify custom trait implementations.

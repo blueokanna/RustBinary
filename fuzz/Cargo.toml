@@ -1,6 +1,6 @@
 [package]
 name = "rustbinary-fuzz"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 
 [package.metadata]
@@ -8,7 +8,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rustbinary = { path = "..", features = ["derive", "compact", "cbor", "projection", "entropy"] }
+rustbinary = { path = "..", features = ["derive", "compact", "cbor", "projection", "entropy", "compression"] }
 nextjson = { version = "0.1.5", features = ["derive"] }
 
 [[bin]]

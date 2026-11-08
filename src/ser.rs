@@ -3,8 +3,8 @@
 //!
 //! The wire format is a **type-tagged self-describing** binary stream driven
 //! entirely by nextjson's format-neutral event contract. Every value carries a
-//! one-byte type tag so `Option`, `Value`, untagged enums and `peek_token`
-//! round-trip unambiguously; arrays and objects are terminator-delimited
+//! one-byte type tag for `Value`, untagged enums and `peek_token`.
+//! Options use nextjson's null representation; arrays and objects are terminator-delimited
 //! (`0xff`), which keeps the encoder fully streaming with no length patching
 //! and works for slice, vector and counting writers alike.
 //!
@@ -33,11 +33,12 @@ use alloc::vec::Vec;
 use crate::{
     canonical::{encode_varint_le, zigzag_encode},
     config::{Config, IntEncoding},
+    encode_state::{EncodeState, Kind},
     error::{Error, Result},
     tags::{
-        MARKER_U128, MARKER_U16, MARKER_U32, MARKER_U64, MAX_DEPTH, TAG_ARRAY, TAG_END, TAG_F32,
-        TAG_F64, TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TRUE,
-        TAG_U128, TAG_U64,
+        MARKER_U128, MARKER_U16, MARKER_U32, MARKER_U64, TAG_ARRAY, TAG_END, TAG_F32, TAG_F64,
+        TAG_FALSE, TAG_I128, TAG_I64, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TRUE, TAG_U128,
+        TAG_U64,
     },
     writer::{CountWriter, EncodeWriter, SliceWriter},
 };
@@ -64,8 +65,7 @@ pub(crate) fn to_writer<W: EncodeWriter, T: nextjson::NsonSerialize + ?Sized>(
         writer,
         config,
         written: 0,
-        depth: 0,
-        counts: [0; MAX_DEPTH],
+        state: EncodeState::new(config),
         wire_error: None,
     };
     nextjson::NsonSerialize::nextencode(value, &mut encoder).map_err(|error| {
@@ -74,11 +74,10 @@ pub(crate) fn to_writer<W: EncodeWriter, T: nextjson::NsonSerialize + ?Sized>(
             .take()
             .unwrap_or_else(|| Error::from_nextjson(error))
     })?;
-    if encoder.depth != 0 {
-        return Err(Error::Custom(
-            "encoder finished inside an unclosed container".into(),
-        ));
+    if let Some(error) = encoder.wire_error {
+        return Err(error);
     }
+    encoder.state.finish()?;
     Ok(encoder.written)
 }
 
@@ -103,8 +102,7 @@ struct Encoder<W> {
     writer: W,
     config: Config,
     written: u64,
-    depth: usize,
-    counts: [u64; MAX_DEPTH],
+    state: EncodeState,
     wire_error: Option<Error>,
 }
 
@@ -113,11 +111,16 @@ impl<W: EncodeWriter> Encoder<W> {
     /// the `FormatEncoder` boundary. The original is recovered by the public
     /// API in [`to_writer`].
     fn fail(&mut self, error: Error) -> NextjsonError {
-        self.wire_error = Some(error);
+        if self.wire_error.is_none() {
+            self.wire_error = Some(error);
+        }
         NextjsonError::custom("rustbinary wire error")
     }
 
     fn emit(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.wire_error.is_some() {
+            return Err(Error::Custom("encoder already failed".into()));
+        }
         let amount =
             u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow { target: "u64" })?;
         let next = self
@@ -237,40 +240,8 @@ impl<W: EncodeWriter> Encoder<W> {
             .map_err(|error| self.fail(error))
     }
 
-    fn enter_container(&mut self, tag: u8) -> NextjsonResult<()> {
-        if self.depth >= self.config.depth_limit {
-            return Err(self.fail(Error::Custom("encoder nesting depth limit exceeded".into())));
-        }
-        self.emit_tag(tag)?;
-        self.depth += 1;
-        Ok(())
-    }
-
-    fn count_element(&mut self) -> NextjsonResult<()> {
-        let index = self.depth.checked_sub(1).ok_or_else(|| {
-            self.fail(Error::Custom(
-                "container element outside any container".into(),
-            ))
-        })?;
-        let count = self.counts[index]
-            .checked_add(1)
-            .ok_or_else(|| self.fail(Error::CollectionLimit { limit: u64::MAX }))?;
-        if let Some(limit) = self.config.collection_limit {
-            if count > limit {
-                return Err(self.fail(Error::CollectionLimit { limit }));
-            }
-        }
-        self.counts[index] = count;
-        Ok(())
-    }
-
-    fn exit_container(&mut self) -> NextjsonResult<()> {
-        if self.depth == 0 {
-            return Err(self.fail(Error::Custom("container end without matching start".into())));
-        }
-        self.depth -= 1;
-        self.counts[self.depth] = 0;
-        self.emit_tag(TAG_END)
+    fn value(&mut self) -> NextjsonResult<()> {
+        self.state.value().map_err(|error| self.fail(error))
     }
 }
 
@@ -278,59 +249,82 @@ impl<W: EncodeWriter> nextjson::FormatEncoder for Encoder<W> {
     type Error = NextjsonError;
 
     fn begin_array(&mut self) -> NextjsonResult<()> {
-        self.enter_container(TAG_ARRAY)
+        self.state
+            .begin(Kind::Array)
+            .map_err(|error| self.fail(error))?;
+        self.emit_tag(TAG_ARRAY)
     }
 
     fn separator(&mut self) -> NextjsonResult<()> {
-        self.count_element()
+        self.state
+            .entry(Kind::Array)
+            .map_err(|error| self.fail(error))
     }
 
     fn end_array(&mut self) -> NextjsonResult<()> {
-        self.exit_container()
+        self.state
+            .end(Kind::Array)
+            .map_err(|error| self.fail(error))?;
+        self.emit_tag(TAG_END)
     }
 
     fn begin_object(&mut self) -> NextjsonResult<()> {
-        self.enter_container(TAG_OBJECT)
+        self.state
+            .begin(Kind::Object)
+            .map_err(|error| self.fail(error))?;
+        self.emit_tag(TAG_OBJECT)
     }
 
     fn key(&mut self, key: &str) -> NextjsonResult<()> {
-        self.count_element()?;
+        self.state
+            .entry(Kind::Object)
+            .map_err(|error| self.fail(error))?;
         self.write_str_value(key)
     }
 
     fn end_object(&mut self) -> NextjsonResult<()> {
-        self.exit_container()
+        self.state
+            .end(Kind::Object)
+            .map_err(|error| self.fail(error))?;
+        self.emit_tag(TAG_END)
     }
 
     fn write_null(&mut self) -> NextjsonResult<()> {
+        self.value()?;
         self.emit_tag(TAG_NULL)
     }
 
     fn write_bool(&mut self, value: bool) -> NextjsonResult<()> {
+        self.value()?;
         self.emit_tag(if value { TAG_TRUE } else { TAG_FALSE })
     }
 
     fn write_u64(&mut self, value: u64) -> NextjsonResult<()> {
+        self.value()?;
         self.emit_tag(TAG_U64)?;
         self.unsigned(value as u128, 8)
     }
 
     fn write_u128(&mut self, value: u128) -> NextjsonResult<()> {
+        self.value()?;
         self.emit_tag(TAG_U128)?;
         self.unsigned(value, 16)
     }
 
     fn write_i64(&mut self, value: i64) -> NextjsonResult<()> {
+        self.value()?;
         self.emit_tag(TAG_I64)?;
         self.signed(value as i128, 8)
     }
 
     fn write_i128(&mut self, value: i128) -> NextjsonResult<()> {
+        self.value()?;
         self.emit_tag(TAG_I128)?;
         self.signed(value, 16)
     }
 
     fn write_f64(&mut self, value: f64) -> NextjsonResult<()> {
+        self.value()?;
         if !value.is_finite() {
             return Err(self.fail(Error::NonFiniteFloat));
         }
@@ -339,6 +333,7 @@ impl<W: EncodeWriter> nextjson::FormatEncoder for Encoder<W> {
     }
 
     fn write_f32(&mut self, value: f32) -> NextjsonResult<()> {
+        self.value()?;
         if !value.is_finite() {
             return Err(self.fail(Error::NonFiniteFloat));
         }
@@ -347,10 +342,12 @@ impl<W: EncodeWriter> nextjson::FormatEncoder for Encoder<W> {
     }
 
     fn write_str(&mut self, value: &str) -> NextjsonResult<()> {
+        self.value()?;
         self.write_str_value(value)
     }
 
     fn write_char(&mut self, value: char) -> NextjsonResult<()> {
+        self.value()?;
         let mut buffer = [0_u8; 4];
         self.write_str_value(value.encode_utf8(&mut buffer))
     }

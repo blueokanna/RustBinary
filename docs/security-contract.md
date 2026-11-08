@@ -1,5 +1,42 @@
 # Security contract and nextjson 0.1.5 migration
 
+## nextjson integration
+
+The crates.io registry search on 2026-11-08 reported nextjson and nextjson-derive
+0.1.5 as the latest published versions. The workspace, fuzz crate and benchmark
+crate already resolve 0.1.5; this follow-up changes the adapters, not dependency
+version numbers. API review used the published crate source, since the cached
+`docs.rs/latest` page still displayed 0.1.3.
+
+The self-describing and CBOR encoders share an allocation-free event validator:
+exactly one root, matching container ends, one separator per array value and one
+value per object key. The first encoding failure remains fatal even if custom
+trait code catches it. Decoder resource failures survive checkpoint restoration;
+depth exhaustion is reported as `Error::DepthLimit` rather than a custom string.
+Checkpoints support nextjson's untagged variant retries; they do not refund
+cumulative parser work or visits.
+
+CBOR slice decoding permits borrowed definite text and native byte strings.
+Chunked strings require owned storage. `serialize_into`, `serialize_into_slice`
+and `serialized_size` share the same writer-based encoder. Preserved map order
+does not build a value tree or retain a complete output buffer. Stable map
+ordering still materializes nextjson's value model, with its representation
+and allocation limits. A failed streaming write can leave a partial output.
+
+Null-valued options follow nextjson's JSON representation in the self-describing
+and CBOR profiles: `Some(())` and `None` have the same bytes. The compact profile
+has explicit option tags. This existing format limitation is covered by a
+compatibility test; no universal roundtrip guarantee is made for arbitrary Rust
+types or custom trait implementations.
+
+LZ decompression grows storage only after reading complete tokens and checks
+match expansion before appending. It rejects mismatched inner/envelope lengths,
+extra packed bytes and nonzero final padding. Reader-based frame loading no
+longer reserves an attacker-declared body before receiving it. The compressor's
+history indices use `4 * min(input_len, 32768)` bytes, plus the existing 256 KiB
+hash table and output buffer. This is a storage reduction, not a measured
+throughput claim. Compression is not authentication.
+
 ## Parser limits
 
 The self-describing decoder and probe share their token reader and skip grammar.
@@ -92,6 +129,15 @@ audit, side-channel assessment or universal absence of bugs is claimed.
 
 ## Migration
 
+- Self-describing and CBOR encoders reject incomplete or out-of-order custom
+  event streams and preserve the first write failure. Update serializers that
+  previously omitted array separators or returned success after an encoder error.
+- Self-describing and CBOR depth failures now use `Error::DepthLimit`; bounded
+  decoding maps that variant to `BudgetExceeded::Depth`.
+- CBOR slice APIs accept borrowed targets. I/O serialization now streams and
+  may leave an output prefix on failure; do not treat an error as an atomic write.
+- LZ decoding now rejects extra packed bytes and nonzero final padding. Frames
+  emitted by the existing encoder already use zero padding and remain valid.
 - Archive mirrors, `ArchivedString` and `ArchivedVec` no longer implement
   `Copy`/`Clone`: their relative pointers are valid only at their original
   address. Keep borrowed views, or copy out application-owned field values.
@@ -125,6 +171,37 @@ audit, side-channel assessment or universal absence of bugs is claimed.
 
 ## Local validation (2026-11-08)
 
+The nextjson integration changes passed 327 all-target/all-feature tests and
+335 tests each on Rust 1.78 and in release mode, including doctests. The nine
+no-default-feature CI profiles passed: core, compact, protocol, CBOR, sync,
+bounded, projection, pipeline and archive. Formatting, Clippy with warnings
+denied, rustdoc with warnings denied, fuzz-target checking and benchmark-crate
+all-target checking passed. No benchmark throughput run or independent audit
+was performed.
+
+`tests/nextjson_contract.rs` covers event ordering, swallowed errors, resource
+exhaustion, derive attributes, borrowed CBOR, writer equivalence and option
+representation. `tests/codec_allocations.rs` measures allocations on the calling
+thread: preserved-order CBOR counting/slice/I/O encoding allocated zero times
+for the tested primitive/string/array value, truncated compression frames made
+no reservation of 4096 bytes or larger, and a 2 MiB repeated input no longer
+needed an input-sized history table.
+
+Three ASan campaigns with seed 102, maximum input length 8192 and a 30-second
+setting per target completed without reported failures:
+
+| Target | Executions | Reported seconds |
+| --- | ---: | ---: |
+| `decode_arbitrary_bytes` | 156,252 | 31 |
+| `decode_cbor_arbitrary` | 351,048 | 31 |
+| `decode_frames_arbitrary` | 14,748 | 31 |
+
+The frame target now includes compressed roundtrips, mutations and arbitrary LZ
+tokens inside valid envelopes. The 522,048 executions and tool versions are
+recorded locally in `target/fuzz-results/20261108T141712956Z/report.json`.
+
+### Earlier archive and codec validation
+
 After the archive follow-up, Windows passed 312 all-target/all-feature tests.
 Rust 1.78 and release runs passed 320 tests each, including doctests. Formatting,
 Clippy and rustdoc with warnings denied passed. The archive regression suite
@@ -137,7 +214,7 @@ and passed no-default-feature tests for core, archive, bounded and projection.
 
 Native Windows libFuzzer execution now works through `cargo +nightly fuzz run`
 with the MSVC ASan runtime on PATH. The earlier LNK1561 failure came from an
-ordinary `cargo run` attempt. The latest successful campaigns used cargo-fuzz
+ordinary `cargo run` attempt. The earlier five-target campaigns used cargo-fuzz
 0.13.2, rustc `1.102.0-nightly (f5cedb83a 2026-11-07)`, AddressSanitizer, seed
 101, a maximum input length of 8192, and a 60-second time setting per target:
 

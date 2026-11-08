@@ -112,7 +112,7 @@ fn hostile_deep_nesting_is_rejected_without_stack_overflow() {
         assert!(result.is_ok(), "depth {depth} caused a panic");
         let error = result.unwrap().unwrap_err();
         assert!(
-            matches!(error, rustbinary::Error::Custom(_)),
+            matches!(error, rustbinary::Error::DepthLimit { limit: 128 }),
             "depth {depth}: expected depth-limit error, got {error:?}"
         );
     }

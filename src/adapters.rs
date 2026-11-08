@@ -1,9 +1,9 @@
-//! Standard-library adapters around the `no_std` Compact V1 core.
+//! Standard-library adapters around the `no_std` self-describing codec.
 
 use crate::{decoder, ser, Config, EncodeWriter, Error, Result};
 use std::io::{Read, Write};
 
-struct IoWriter<W>(W);
+pub(crate) struct IoWriter<W>(pub(crate) W);
 
 impl<W: Write> EncodeWriter for IoWriter<W> {
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {

@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use nextjson::Value;
 
 use crate::cbor_codec::{CborDecoder, CborEncoder};
+use crate::writer::{CountWriter, EncodeWriter, SliceWriter};
 use crate::{Config, Error, Result};
 
 #[cfg(feature = "fingerprint")]
@@ -108,32 +109,40 @@ impl CborConfig {
     /// Encodes CBOR directly into a writer.
     ///
     /// The payload is produced by the crate's streaming CBOR encoder, so no
-    /// intermediate representation is built beyond the emitted bytes.
+    /// complete output buffer is retained. Stable map ordering still builds
+    /// its documented value tree. On failure the writer may contain a prefix;
+    /// the original I/O or codec error is returned.
     #[cfg(feature = "std")]
     pub fn serialize_into<W: Write, T: nextjson::NsonSerialize + ?Sized>(
         self,
-        mut writer: W,
+        writer: W,
         value: &T,
     ) -> Result<()> {
-        let bytes = self.encode_value(value)?;
-        writer.write_all(&bytes)?;
-        Ok(())
+        self.encode_to_writer(crate::adapters::IoWriter(writer), value)
+            .map(|_| ())
     }
 
     fn encode_value<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<Vec<u8>> {
         let mut output = Vec::new();
+        self.encode_to_writer(&mut output, value)?;
+        Ok(output)
+    }
+
+    fn encode_to_writer<W: EncodeWriter, T: nextjson::NsonSerialize + ?Sized>(
+        self,
+        writer: W,
+        value: &T,
+    ) -> Result<u64> {
         if self.deterministic {
             // Deterministic map ordering must retain and sort object keys, so
             // this mode materializes a normalized value tree first. It is
             // explicitly opt-in; the default path streams without it.
             let value = nextjson::to_value(value).map_err(cbor_error)?;
             let value = canonicalize(value)?;
-            CborEncoder::new(&mut output, self.base).finish(&value)?;
+            CborEncoder::new(writer, self.base).finish(&value)
         } else {
-            CborEncoder::new(&mut output, self.base).finish(value)?;
+            CborEncoder::new(writer, self.base).finish(value)
         }
-        self.enforce_byte_limit(output.len())?;
-        Ok(output)
     }
 
     fn enforce_byte_limit(self, length: usize) -> Result<()> {
@@ -147,18 +156,30 @@ impl CborConfig {
 
     /// Computes the exact CBOR size.
     pub fn serialized_size<T: nextjson::NsonSerialize + ?Sized>(self, value: &T) -> Result<u64> {
-        let bytes = self.encode_value(value)?;
-        Ok(bytes.len() as u64)
+        self.encode_to_writer(CountWriter::new(), value)
     }
 
-    /// Decodes one owned CBOR value from a slice.
+    /// Encodes CBOR into caller-owned storage and reports the required capacity
+    /// on overflow. Preserved map order does not allocate an output buffer.
+    pub fn serialize_into_slice<T: nextjson::NsonSerialize + ?Sized>(
+        self,
+        output: &mut [u8],
+        value: &T,
+    ) -> Result<usize> {
+        let mut writer = SliceWriter::new(output);
+        self.encode_to_writer(&mut writer, value)?;
+        writer.finish()
+    }
+
+    /// Decodes one CBOR value, borrowing definite strings and byte strings
+    /// directly from the input when the target type supports borrowing.
     ///
     /// Values are decoded straight from the input into `T` by the crate's
     /// streaming CBOR decoder: no value tree and no JSON text is materialized,
     /// and the byte/collection/depth limits are enforced inline.
-    pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de>>(
+    pub fn deserialize<'de, T: nextjson::NsonDeserialize<'de>>(
         self,
-        input: &[u8],
+        input: &'de [u8],
     ) -> Result<T> {
         self.enforce_byte_limit(input.len())?;
         CborDecoder::new(input, self.base).decode()
@@ -217,10 +238,10 @@ impl FingerprintedCborConfig {
         self.config.serialize_into(writer, value)
     }
 
-    /// Validates the CBOR schema frame and decodes its owned payload.
-    pub fn deserialize<T: for<'de> nextjson::NsonDeserialize<'de> + Fingerprint>(
+    /// Validates the CBOR schema frame and decodes its payload, allowing borrows.
+    pub fn deserialize<'de, T: nextjson::NsonDeserialize<'de> + Fingerprint>(
         self,
-        input: &[u8],
+        input: &'de [u8],
     ) -> Result<T> {
         let payload = validate_header(FRAME_MAGIC, input, self.config.fingerprint::<T>())?;
         self.config.deserialize(payload)
