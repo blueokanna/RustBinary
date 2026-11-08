@@ -2,100 +2,100 @@
 
 | field | value |
 | --- | --- |
-| OS | Linux 6.17.0-1022-azure |
-| CPU | AMD EPYC 7763 64-Core Processor |
-| Rust | rustc 1.98.0 (88d9e12ae 2026-08-18) |
-| Run | https://github.com/blueokanna/RustBinary/actions/runs/33306828690 |
-| Date (UTC) | 2026-08-30T18:34:50+08:00 |
+| OS | Linux 7.0.0-1019-azure |
+| CPU | Intel(R) Xeon(R) 6973P-C |
+| Rust | rustc 1.99.1 (58cf8f9c3 2026-10-13) |
+| Run | https://github.com/blueokanna/RustBinary/actions/runs/42486673197 |
+| Date (UTC) | 2026-11-08T21:47:58+08:00 |
 
 ## homogeneous
 
 | codec | op | time (median) | encoded bytes |
 | --- | --- | ---: | ---: |
-| bincode-next | encode | 13.2 µs | 13829 |
-| bincode-next | decode | 6.5 µs | 13829 |
-| bincode1 | encode | 9.9 µs | 14344 |
-| bincode1 | decode | 2.1 µs | 14344 |
-| bincode2 | encode | 15.3 µs | 13829 |
-| bincode2 | decode | 5.0 µs | 13829 |
-| minicbor | encode | 15.4 µs | 14795 |
-| minicbor | decode | 30.4 µs | 14795 |
-| postcard | encode | 23.7 µs | 13686 |
-| postcard | decode | 8.1 µs | 13686 |
-| rkyv | encode | 12.4 µs | 24584 |
-| rkyv | decode | 327.4 ns | 24584 |
-| rustbinary | encode | 122.7 µs | 51716 |
-| rustbinary | decode | 198.3 µs | 51716 |
-| rustbinary compact | encode | 17.7 µs | 13829 |
-| rustbinary compact | decode | 9.6 µs | 13829 |
+| bincode-next | encode | 8.0 µs | 13829 |
+| bincode-next | decode | 4.7 µs | 13829 |
+| bincode1 | encode | 4.7 µs | 14344 |
+| bincode1 | decode | 1.1 µs | 14344 |
+| bincode2 | encode | 8.1 µs | 13829 |
+| bincode2 | decode | 2.7 µs | 13829 |
+| minicbor | encode | 8.5 µs | 14795 |
+| minicbor | decode | 18.5 µs | 14795 |
+| postcard | encode | 16.2 µs | 13686 |
+| postcard | decode | 5.7 µs | 13686 |
+| rkyv | encode | 8.3 µs | 24584 |
+| rkyv | decode | 269.6 ns | 24584 |
+| rustbinary | encode | 82.0 µs | 51716 |
+| rustbinary | decode | 154.0 µs | 51716 |
+| rustbinary compact | encode | 11.7 µs | 13829 |
+| rustbinary compact | decode | 6.1 µs | 13829 |
 
 ## heterogeneous
 
 | codec | op | time (median) | encoded bytes |
 | --- | --- | ---: | ---: |
-| bincode-next | encode | 7.4 µs | 7687 |
-| bincode-next | decode | 17.4 µs | 7687 |
-| bincode1 | encode | 8.5 µs | 14344 |
-| bincode1 | decode | 15.6 µs | 14344 |
-| bincode2 | encode | 7.5 µs | 7687 |
-| bincode2 | decode | 16.2 µs | 7687 |
-| minicbor | encode | 12.5 µs | 10103 |
-| minicbor | decode | 35.0 µs | 10103 |
-| postcard | encode | 9.4 µs | 7362 |
-| postcard | decode | 16.7 µs | 7362 |
-| rustbinary | encode | 50.0 µs | 23046 |
-| rustbinary | decode | 91.5 µs | 23046 |
-| rustbinary compact | encode | 9.2 µs | 7687 |
-| rustbinary compact | decode | 20.2 µs | 7687 |
+| bincode-next | encode | 5.4 µs | 7687 |
+| bincode-next | decode | 12.5 µs | 7687 |
+| bincode1 | encode | 4.7 µs | 14344 |
+| bincode1 | decode | 10.7 µs | 14344 |
+| bincode2 | encode | 5.1 µs | 7687 |
+| bincode2 | decode | 11.9 µs | 7687 |
+| minicbor | encode | 7.4 µs | 10103 |
+| minicbor | decode | 22.5 µs | 10103 |
+| postcard | encode | 6.4 µs | 7362 |
+| postcard | decode | 11.8 µs | 7362 |
+| rustbinary | encode | 34.3 µs | 23046 |
+| rustbinary | decode | 77.2 µs | 23046 |
+| rustbinary compact | encode | 5.9 µs | 7687 |
+| rustbinary compact | decode | 14.0 µs | 7687 |
 
 ## borrowed
 
 | codec | op | time (median) | encoded bytes |
 | --- | --- | ---: | ---: |
-| bincode1 | encode | 24.3 ns | 66 |
-| bincode1 | decode | 17.5 ns | 66 |
-| minicbor | encode | 86.2 ns | 48 |
-| minicbor | decode | 35.7 ns | 48 |
-| postcard | encode | 96.2 ns | 45 |
-| postcard | decode | 22.2 ns | 45 |
-| rustbinary | encode | 180.8 ns | 66 |
-| rustbinary | decode | 139.0 ns | 66 |
-| rustbinary compact | encode | 95.1 ns | 45 |
-| rustbinary compact | decode | 22.8 ns | 45 |
+| bincode1 | encode | 23.3 ns | 66 |
+| bincode1 | decode | 14.8 ns | 66 |
+| minicbor | encode | 70.0 ns | 48 |
+| minicbor | decode | 26.4 ns | 48 |
+| postcard | encode | 74.9 ns | 45 |
+| postcard | decode | 21.4 ns | 45 |
+| rustbinary | encode | 127.8 ns | 66 |
+| rustbinary | decode | 121.6 ns | 66 |
+| rustbinary compact | encode | 73.6 ns | 45 |
+| rustbinary compact | decode | 22.4 ns | 45 |
 
 ## adversarial
 
 | codec | op | time (median) | encoded bytes |
 | --- | --- | ---: | ---: |
-| bincode-next | encode | 321.3 µs | 499997 |
-| bincode-next | decode | 532.7 µs | 499997 |
-| bincode1 | encode | 68.5 µs | 800008 |
-| bincode1 | decode | 79.3 µs | 800008 |
-| bincode2 | encode | 330.8 µs | 499997 |
-| bincode2 | decode | 282.1 µs | 499997 |
-| minicbor | encode | 277.5 µs | 499997 |
-| minicbor | decode | 568.9 µs | 499997 |
-| postcard | encode | 794.9 µs | 491367 |
-| postcard | decode | 250.2 µs | 491367 |
-| rustbinary | encode | 1.1 ms | 599994 |
-| rustbinary | decode | 2.3 ms | 599994 |
-| rustbinary compact | encode | 344.6 µs | 499997 |
-| rustbinary compact | decode | 437.9 µs | 499997 |
+| bincode-next | encode | 144.7 µs | 499997 |
+| bincode-next | decode | 212.8 µs | 499997 |
+| bincode1 | encode | 63.9 µs | 800008 |
+| bincode1 | decode | 58.3 µs | 800008 |
+| bincode2 | encode | 190.4 µs | 499997 |
+| bincode2 | decode | 94.5 µs | 499997 |
+| minicbor | encode | 112.9 µs | 499997 |
+| minicbor | decode | 222.5 µs | 499997 |
+| postcard | encode | 590.8 µs | 491367 |
+| postcard | decode | 191.6 µs | 491367 |
+| rustbinary | encode | 884.1 µs | 599994 |
+| rustbinary | decode | 1.3 ms | 599994 |
+| rustbinary compact | encode | 257.4 µs | 499997 |
+| rustbinary compact | decode | 177.3 µs | 499997 |
 
 ## schema-evolution
 
 | codec | op | time (median) | encoded bytes |
 | --- | --- | ---: | ---: |
-| bincode-next | encode-v1 | 64.3 ns | 18 |
-| bincode-next | decode-v1-as-v2 | 50.3 ns | 18 |
-| bincode1 | encode-v1 | 25.1 ns | 26 |
+| bincode-next | encode-v1 | 63.2 ns | 18 |
+| bincode-next | decode-v1-as-v2 | 30.2 ns | 18 |
+| bincode1 | encode-v1 | 15.8 ns | 26 |
 | bincode1 | decode-v1-as-v2 | error (see notes) | 26 |
-| bincode2 | encode-v1 | 66.9 ns | 18 |
+| bincode2 | encode-v1 | 67.0 ns | 18 |
 | bincode2 | decode-v1-as-v2 | error (see notes) | 18 |
-| postcard | encode-v1 | 72.7 ns | 17 |
+| postcard | encode-v1 | 69.9 ns | 17 |
 | postcard | decode-v1-as-v2 | error (see notes) | 17 |
-| rustbinary | encode-v1 | 138.3 ns | 68 |
-| rustbinary | decode-v1-as-v2 | 102.5 ns | 68 |
+| rustbinary | encode-v1 | 71.8 ns | 68 |
+| rustbinary | decode-v1-as-v2 | 57.4 ns | 68 |
 
 ## Notes
 
